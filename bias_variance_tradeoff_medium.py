@@ -193,6 +193,38 @@ for step in range(args.num_iterations + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
     
+    # Debug momentum buffer issues when they first appear
+    if muon_optimizer is not None and step == 11:
+        print0(f"=== DEBUGGING AT STEP {step} ===", console=True)
+        
+        # Check all optimizers
+        print0(f"Rank {rank}: Total optimizers: {len(optimizers)}", console=True)
+        for i, opt in enumerate(optimizers):
+            print0(f"Rank {rank}: Optimizer {i}: {opt.__class__.__name__}", console=True)
+        
+        # Check all parameter groups  
+        print0(f"Rank {rank}: Muon has {len(muon_optimizer.param_groups)} param groups", console=True)
+        total_muon_params = []
+        for i, group in enumerate(muon_optimizer.param_groups):
+            print0(f"Rank {rank}: Group {i} has {len(group['params'])} parameters", console=True)
+            total_muon_params.extend(group['params'])
+        
+        # Check distributed ownership calculation
+        print0(f"Rank {rank}: world_size={world_size}, rank={rank}", console=True)
+        expected_owned_indices = [i for i in range(len(total_muon_params))[::world_size] if i + rank < len(total_muon_params)]
+        print0(f"Rank {rank}: Should own parameter indices: {expected_owned_indices}", console=True)
+        
+        # Check which parameters actually have state
+        params_with_state = len(muon_optimizer.state)
+        print0(f"Rank {rank}: Parameters with state: {params_with_state}/{len(total_muon_params)}", console=True)
+        
+        # Check first few parameters that this rank should own
+        for idx in expected_owned_indices[:5]:  # Check first 5 owned parameters
+            param = total_muon_params[idx]
+            has_state = param in muon_optimizer.state
+            state_keys = list(muon_optimizer.state[param].keys()) if has_state else []
+            print0(f"Rank {rank}: Param {idx} (shape {param.shape}) - has_state={has_state}, keys={state_keys}", console=True)
+    
     # Assert Muon parameters owned by this rank have proper momentum state
     if muon_optimizer is not None and step > 10:
         muon_params = muon_optimizer.param_groups[0]['params']
