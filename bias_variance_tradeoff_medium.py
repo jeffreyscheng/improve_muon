@@ -77,7 +77,7 @@ for step in range(args.num_iterations + 1):
         analysis_params_pure = []
         analysis_params_momentum = []
         
-        # Get all block parameters optimized by Muon that this rank owns
+        # Get all block parameters optimized by Muon, but only analyze owned ones
         muon_params = muon_optimizer.param_groups[0]['params']
         owned_params = []
         for base_i in range(len(muon_params))[::world_size]:
@@ -85,8 +85,14 @@ for step in range(args.num_iterations + 1):
                 owned_params.append(muon_params[base_i + rank])
         
         owned_param_set = set(owned_params)
+        
+        # Get owned block parameters for analysis
         block_params = [(name, param) for name, param in model.named_parameters() 
                        if 'blocks' in name and param in owned_param_set and param.grad is not None]
+        
+        # Collect all analysis parameters first, then do collective operations
+        all_analysis_params_pure = []
+        all_analysis_params_momentum = []
         
         for name, param in block_params:
             clean_name = name.replace('module.', '').replace('_orig_mod.', '')
@@ -110,47 +116,51 @@ for step in range(args.num_iterations + 1):
                     analysis_params_pure.append((component_name, param.grad[i]))
                     analysis_params_momentum.append((component_name, momentum_grad[i].bfloat16()))
         
-        print0(f"Analyzing {len(analysis_params_pure)} parameters", console=True)
+        print0(f"Analyzing {len(analysis_params_pure)} pure and {len(analysis_params_momentum)} momentum parameters", console=True)
         
-        # Analyze pure gradients
-        for param_name, param_grad in analysis_params_pure:
-            gradients_all_gpus = [torch.zeros_like(param_grad) for _ in range(world_size)]
-            dist.all_gather(gradients_all_gpus, param_grad)
-            
+        # Synchronize all ranks before starting collective operations
+        dist.barrier()
+        
+        
+        # Collect analysis data from all ranks using the same pattern as Muon optimizer
+        futures = []
+        
+        # First collect all pure gradients using distributed pattern
+        for base_i in range(len(analysis_params_pure))[::world_size]:
+            if base_i + rank < len(analysis_params_pure):
+                param_name, param_grad = analysis_params_pure[base_i + rank]
+                gradients_all_gpus = [torch.zeros_like(param_grad) for _ in range(world_size)]
+                future = dist.all_gather(gradients_all_gpus, param_grad, async_op=True)
+                futures.append((future.get_future(), param_name, gradients_all_gpus, 'pure'))
+        
+        # Then collect all momentum gradients
+        for base_i in range(len(analysis_params_momentum))[::world_size]:
+            if base_i + rank < len(analysis_params_momentum):
+                param_name, momentum_grad = analysis_params_momentum[base_i + rank]
+                gradients_all_gpus = [torch.zeros_like(momentum_grad) for _ in range(world_size)]
+                future = dist.all_gather(gradients_all_gpus, momentum_grad, async_op=True)
+                futures.append((future.get_future(), param_name, gradients_all_gpus, 'momentum'))
+        
+        # Wait for all collectives to complete, then do analysis
+        torch.futures.collect_all([f[0] for f in futures]).wait()
+        
+        # Process results
+        for future, param_name, gradients_all_gpus, analysis_type in futures:
             for subset_size in range(1, min(8, world_size)):
                 try:
                     residual_norms = jackknife_gradient_residuals_on_subsets(
                         gradients_all_gpus, subset_size, norm="fro"
                     )
                     if master_process:
-                        bias_variance_records_pure.append({
+                        target_records = bias_variance_records_pure if analysis_type == 'pure' else bias_variance_records_momentum
+                        target_records.append({
                             'minibatch_idx': step,
                             'parameter_name': param_name,
                             'subset_size': subset_size,
                             'residual_norms': residual_norms
                         })
                 except Exception as e:
-                    print0(f"Error in pure gradient analysis for {param_name}, subset_size {subset_size}: {e}")
-        
-        # Analyze momentum gradients
-        for param_name, momentum_grad in analysis_params_momentum:
-            gradients_all_gpus = [torch.zeros_like(momentum_grad) for _ in range(world_size)]
-            dist.all_gather(gradients_all_gpus, momentum_grad)
-            
-            for subset_size in range(1, min(8, world_size)):
-                try:
-                    residual_norms = jackknife_gradient_residuals_on_subsets(
-                        gradients_all_gpus, subset_size, norm="fro"
-                    )
-                    if master_process:
-                        bias_variance_records_momentum.append({
-                            'minibatch_idx': step,
-                            'parameter_name': param_name,
-                            'subset_size': subset_size,
-                            'residual_norms': residual_norms
-                        })
-                except Exception as e:
-                    print0(f"Error in momentum gradient analysis for {param_name}, subset_size {subset_size}: {e}")
+                    print0(f"Error in {analysis_type} gradient analysis for {param_name}, subset_size {subset_size}: {e}")
     
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
