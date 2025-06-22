@@ -80,8 +80,9 @@ for step in range(args.num_iterations + 1):
         for name, param in block_params:
             clean_name = name.replace('module.', '').replace('_orig_mod.', '')
             
-            # Get momentum buffer (every Muon parameter has one)
-            momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+            # Get momentum buffer - matches Muon's internal calculation
+            state = muon_optimizer.state[param]
+            momentum_buffer = state["momentum_buffer"]
             momentum = muon_optimizer.param_groups[0]["momentum"]
             momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
             
