@@ -157,16 +157,18 @@ for step in range(args.num_iterations + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
     
-    # Assert all Muon parameters have proper momentum state
+    # Assert Muon parameters owned by this rank have proper momentum state
     if muon_optimizer is not None:
-        muon_params = set(muon_optimizer.param_groups[0]['params'])
-        for param in muon_params:
-            state = muon_optimizer.state[param]
-            assert len(state) > 0, f"Empty state for Muon parameter with shape {param.shape}"
-            assert "momentum_buffer" in state, f"Missing momentum_buffer for parameter with shape {param.shape}"
-            momentum_buffer = state["momentum_buffer"]
-            assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter with shape {param.shape}"
-            assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter with shape {param.shape}"
+        muon_params = muon_optimizer.param_groups[0]['params']
+        for base_i in range(len(muon_params))[::world_size]:
+            if base_i + rank < len(muon_params):
+                param = muon_params[base_i + rank]
+                state = muon_optimizer.state[param]
+                assert len(state) > 0, f"Empty state for Muon parameter with shape {param.shape} on rank {rank}"
+                assert "momentum_buffer" in state, f"Missing momentum_buffer for parameter with shape {param.shape} on rank {rank}"
+                momentum_buffer = state["momentum_buffer"]
+                assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter with shape {param.shape} on rank {rank}"
+                assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter with shape {param.shape} on rank {rank}"
     
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
