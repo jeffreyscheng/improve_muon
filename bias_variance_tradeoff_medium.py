@@ -62,14 +62,10 @@ for step in range(args.num_iterations + 1):
     if step % EVALUATE_TRADEOFF_EVERY == 0 and step > 0:
         print0(f"Running bias/variance analysis at step {step}", console=True)
         
-        # First, let's debug what parameters we have
-        all_params = [(name, param) for name, param in model.named_parameters() if param.ndim == 2]
+        # Get all block parameters with gradients for analysis
+        all_params = [(name, param) for name, param in model.named_parameters() if param.ndim >= 2]
         block_params = [(name, param) for name, param in all_params if 'blocks' in name]
         params_with_grad = [(name, param) for name, param in block_params if param.grad is not None]
-        
-        print0(f"Total 2D parameters: {len(all_params)}", console=True)
-        print0(f"Block parameters: {len(block_params)}", console=True) 
-        print0(f"Block parameters with gradients: {len(params_with_grad)}", console=True)
         
         # Find the Muon optimizer
         muon_optimizer = None
@@ -78,7 +74,7 @@ for step in range(args.num_iterations + 1):
                 muon_optimizer = opt
                 break
         
-        # Clean parameter names and filter for analysis
+        # Extract parameters for bias-variance analysis
         analysis_params_pure = []
         analysis_params_momentum = []
         
@@ -91,32 +87,43 @@ for step in range(args.num_iterations + 1):
                 analysis_params_pure.append((clean_name, param.grad))
                 
                 # Get momentum buffer if this param is optimized by Muon
-                if muon_optimizer is not None and param in muon_optimizer.state:
+                if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
                     momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
                     momentum = muon_optimizer.param_groups[0]["momentum"]  # Assume same momentum for all groups
                     # This is what Muon actually uses: momentum * buffer + (1-momentum) * grad
                     momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
                     analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
             
-            # Handle merged QKVO attention parameters - split into Q, K, V, O components
-            elif 'attn.qkvo_w' in clean_name:
-                base_name = clean_name.replace('qkvo_w', '')
-                # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O
-                for i, component in enumerate(['q', 'k', 'v', 'o']):
-                    component_name = f"{base_name}{component}"
-                    component_grad = param.grad[i]  # Extract the i-th component
-                    analysis_params_pure.append((component_name, component_grad))
+            # Handle attention parameters
+            elif any(param_type in clean_name for param_type in ['attn.qkvo_w', 'attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj', 'attn.c_attn', 'attn.c_proj']):
+                # Check if it's a merged QKVO parameter (3D tensor)
+                if 'attn.qkvo_w' in clean_name and param.grad.ndim == 3 and param.grad.shape[0] == 4:
+                    base_name = clean_name.replace('qkvo_w', '')
+                    # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O components
+                    for i, component in enumerate(['q', 'k', 'v', 'o']):
+                        component_name = f"{base_name}{component}"
+                        component_grad = param.grad[i]
+                        analysis_params_pure.append((component_name, component_grad))
+                        
+                        # Get momentum buffer if this param is optimized by Muon
+                        if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
+                            momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+                            momentum = muon_optimizer.param_groups[0]["momentum"]
+                            momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+                            component_momentum_grad = momentum_grad[i].bfloat16()
+                            analysis_params_momentum.append((component_name, component_momentum_grad))
+                elif param.grad.ndim == 2:
+                    # Handle individual attention parameters
+                    analysis_params_pure.append((clean_name, param.grad))
                     
                     # Get momentum buffer if this param is optimized by Muon
-                    if muon_optimizer is not None and param in muon_optimizer.state:
+                    if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
                         momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
                         momentum = muon_optimizer.param_groups[0]["momentum"]
                         momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
-                        component_momentum_grad = momentum_grad[i].bfloat16()  # Extract i-th component
-                        analysis_params_momentum.append((component_name, component_momentum_grad))
+                        analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
         
-        print0(f"Pure gradient parameters for analysis: {[name for name, _ in analysis_params_pure]}", console=True)
-        print0(f"Momentum gradient parameters for analysis: {[name for name, _ in analysis_params_momentum]}", console=True)
+        print0(f"Analyzing {len(analysis_params_pure)} pure gradient parameters and {len(analysis_params_momentum)} momentum parameters", console=True)
         
         # Analyze pure gradients
         for param_name, param_grad in analysis_params_pure:
