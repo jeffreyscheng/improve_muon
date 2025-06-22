@@ -89,8 +89,7 @@ for step in range(args.num_iterations + 1):
                 # Get momentum buffer if this param is optimized by Muon
                 if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
                     momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
-                    momentum = muon_optimizer.param_groups[0]["momentum"]  # Assume same momentum for all groups
-                    # This is what Muon actually uses: momentum * buffer + (1-momentum) * grad
+                    momentum = muon_optimizer.param_groups[0]["momentum"]
                     momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
                     analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
             
@@ -100,16 +99,24 @@ for step in range(args.num_iterations + 1):
                 if 'attn.qkvo_w' in clean_name and param.grad.ndim == 3 and param.grad.shape[0] == 4:
                     base_name = clean_name.replace('qkvo_w', '')
                     # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O components
+                    
+                    # Check if this 3D parameter has momentum buffer
+                    has_momentum = (muon_optimizer is not None and 
+                                  param in muon_optimizer.state and 
+                                  "momentum_buffer" in muon_optimizer.state[param])
+                    
+                    if has_momentum:
+                        momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+                        momentum = muon_optimizer.param_groups[0]["momentum"]
+                        momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+                    
                     for i, component in enumerate(['q', 'k', 'v', 'o']):
                         component_name = f"{base_name}{component}"
                         component_grad = param.grad[i]
                         analysis_params_pure.append((component_name, component_grad))
                         
-                        # Get momentum buffer if this param is optimized by Muon
-                        if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
-                            momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
-                            momentum = muon_optimizer.param_groups[0]["momentum"]
-                            momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+                        # Add momentum component if available
+                        if has_momentum:
                             component_momentum_grad = momentum_grad[i].bfloat16()
                             analysis_params_momentum.append((component_name, component_momentum_grad))
                 elif param.grad.ndim == 2:
@@ -124,6 +131,13 @@ for step in range(args.num_iterations + 1):
                         analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
         
         print0(f"Analyzing {len(analysis_params_pure)} pure gradient parameters and {len(analysis_params_momentum)} momentum parameters", console=True)
+        
+        # Ensure all ranks have the same parameter count (critical for NCCL)
+        param_counts = torch.tensor([len(analysis_params_pure), len(analysis_params_momentum)], device=device)
+        dist.all_reduce(param_counts, op=dist.ReduceOp.MAX)
+        if param_counts[0] != len(analysis_params_pure) or param_counts[1] != len(analysis_params_momentum):
+            print0(f"FATAL: Parameter count mismatch across ranks. Max counts: {param_counts.tolist()}, This rank: {[len(analysis_params_pure), len(analysis_params_momentum)]}", console=True)
+            return
         
         # Analyze pure gradients
         for param_name, param_grad in analysis_params_pure:
