@@ -230,13 +230,25 @@ for step in range(args.num_iterations + 1):
         muon_params = muon_optimizer.param_groups[0]['params']
         for base_i in range(len(muon_params))[::world_size]:
             if base_i + rank < len(muon_params):
-                param = muon_params[base_i + rank]
+                param_idx = base_i + rank
+                param = muon_params[param_idx]
+                print0(f"Rank {rank}: Checking param {param_idx} (shape {param.shape})", console=True)
+                
+                if param not in muon_optimizer.state:
+                    print0(f"Rank {rank}: ERROR - param {param_idx} not in optimizer state!", console=True)
+                    continue
+                    
                 state = muon_optimizer.state[param]
-                assert len(state) > 0, f"Empty state for Muon parameter with shape {param.shape} on rank {rank}"
-                assert "momentum_buffer" in state, f"Missing momentum_buffer for parameter with shape {param.shape} on rank {rank}"
+                assert len(state) > 0, f"Empty state for Muon parameter {param_idx} with shape {param.shape} on rank {rank}"
+                
+                if "momentum_buffer" not in state:
+                    print0(f"Rank {rank}: ERROR - param {param_idx} missing momentum_buffer, has keys: {list(state.keys())}", console=True)
+                    continue
+                    
                 momentum_buffer = state["momentum_buffer"]
-                assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter with shape {param.shape} on rank {rank}"
-                assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter with shape {param.shape} on rank {rank}"
+                assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter {param_idx} with shape {param.shape} on rank {rank}"
+                assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter {param_idx} with shape {param.shape} on rank {rank}"
+                print0(f"Rank {rank}: param {param_idx} OK - momentum buffer shape {momentum_buffer.shape}, non-zero: {(momentum_buffer != 0).any()}", console=True)
     
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
