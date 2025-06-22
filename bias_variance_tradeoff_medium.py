@@ -77,8 +77,44 @@ for step in range(args.num_iterations + 1):
         analysis_params_pure = []
         analysis_params_momentum = []
         
-        for name, param in block_params:
+        # Hypothesis 5: Check all optimizers
+        print0(f"Rank {rank}: Total optimizers: {len(optimizers)}", console=True)
+        for i, opt in enumerate(optimizers):
+            print0(f"Rank {rank}: Optimizer {i}: {opt.__class__.__name__}", console=True)
+        
+        # Hypothesis 4: Check all parameter groups  
+        print0(f"Rank {rank}: Muon has {len(muon_optimizer.param_groups)} param groups", console=True)
+        total_muon_params = []
+        for i, group in enumerate(muon_optimizer.param_groups):
+            print0(f"Rank {rank}: Group {i} has {len(group['params'])} parameters", console=True)
+            total_muon_params.extend(group['params'])
+        
+        # Hypothesis 1: Check distributed ownership calculation
+        print0(f"Rank {rank}: world_size={world_size}, rank={rank}", console=True)
+        expected_owned_indices = [i for i in range(len(total_muon_params))[::world_size] if i + rank < len(total_muon_params)]
+        print0(f"Rank {rank}: Should own parameter indices: {expected_owned_indices}", console=True)
+        
+        # Hypothesis 6: Check which parameters actually have state
+        params_with_state = len(muon_optimizer.state)
+        print0(f"Rank {rank}: Parameters with state: {params_with_state}/{len(total_muon_params)}", console=True)
+        
+        for name, param in block_params[:3]:  # Only check first 3 to avoid spam
             clean_name = name.replace('module.', '').replace('_orig_mod.', '')
+            
+            # Hypothesis 3: Check parameter identity
+            param_id = id(param)
+            muon_param_ids = [id(p) for p in total_muon_params]
+            id_match = param_id in muon_param_ids
+            param_idx = muon_param_ids.index(param_id) if id_match else -1
+            
+            # Hypothesis 1: Check if this rank should own this parameter
+            should_own = param_idx in expected_owned_indices if param_idx >= 0 else False
+            
+            # Check state
+            has_state = param in muon_optimizer.state
+            state_keys = list(muon_optimizer.state[param].keys()) if has_state else []
+            
+            print0(f"Rank {rank}: {clean_name} - idx={param_idx}, id_match={id_match}, should_own={should_own}, has_state={has_state}, keys={state_keys}", console=True)
             
             # Get momentum buffer - every Muon parameter must have one
             state = muon_optimizer.state[param]
