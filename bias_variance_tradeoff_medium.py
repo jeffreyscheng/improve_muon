@@ -58,16 +58,16 @@ for step in range(args.num_iterations + 1):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step, args.num_iterations)).backward()
     
+    # Get Muon optimizer (needed for both analysis and assertions)
+    muon_optimizer = None
+    for opt in optimizers:
+        if hasattr(opt, '__class__') and opt.__class__.__name__ == 'Muon':
+            muon_optimizer = opt
+            break
+    
     # Bias/variance analysis
     if step % EVALUATE_TRADEOFF_EVERY == 0 and step > 0:
         print0(f"Running bias/variance analysis at step {step}", console=True)
-        
-        # Get Muon optimizer
-        muon_optimizer = None
-        for opt in optimizers:
-            if hasattr(opt, '__class__') and opt.__class__.__name__ == 'Muon':
-                muon_optimizer = opt
-                break
         
         # Get all block parameters optimized by Muon
         muon_params = set(muon_optimizer.param_groups[0]['params']) if muon_optimizer else set()
