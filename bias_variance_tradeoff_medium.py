@@ -62,80 +62,43 @@ for step in range(args.num_iterations + 1):
     if step % EVALUATE_TRADEOFF_EVERY == 0 and step > 0:
         print0(f"Running bias/variance analysis at step {step}", console=True)
         
-        # Get all block parameters with gradients for analysis
-        all_params = [(name, param) for name, param in model.named_parameters() if param.ndim >= 2]
-        block_params = [(name, param) for name, param in all_params if 'blocks' in name]
-        params_with_grad = [(name, param) for name, param in block_params if param.grad is not None]
-        
-        # Find the Muon optimizer
+        # Get Muon optimizer
         muon_optimizer = None
         for opt in optimizers:
             if hasattr(opt, '__class__') and opt.__class__.__name__ == 'Muon':
                 muon_optimizer = opt
                 break
         
-        # Extract parameters for bias-variance analysis
+        # Get all block parameters optimized by Muon
+        muon_params = set(muon_optimizer.param_groups[0]['params']) if muon_optimizer else set()
+        block_params = [(name, param) for name, param in model.named_parameters() 
+                       if 'blocks' in name and param in muon_params and param.grad is not None]
+        
         analysis_params_pure = []
         analysis_params_momentum = []
         
-        for name, param in params_with_grad:
-            # Clean the parameter name
+        for name, param in block_params:
             clean_name = name.replace('module.', '').replace('_orig_mod.', '')
             
-            # Handle MLP parameters
+            # Get momentum buffer (every Muon parameter has one)
+            momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+            momentum = muon_optimizer.param_groups[0]["momentum"]
+            momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+            
+            # Handle MLP parameters (2D)
             if any(param_type in clean_name for param_type in ['mlp.fc_w', 'mlp.proj_w']):
                 analysis_params_pure.append((clean_name, param.grad))
-                
-                # Get momentum buffer if this param is optimized by Muon
-                if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
-                    momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
-                    momentum = muon_optimizer.param_groups[0]["momentum"]
-                    momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
-                    analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
+                analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
             
-            # Handle attention parameters
-            elif 'attn.' in clean_name:
-                # Check if it's a merged QKVO parameter (3D tensor)
-                if 'attn.qkvo_w' in clean_name and param.grad.ndim == 3 and param.grad.shape[0] == 4:
-                    base_name = clean_name.replace('qkvo_w', '')
-                    # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O components
-                    
-                    # Check if this 3D parameter has momentum buffer
-                    has_momentum = (muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param])
-                    
-                    if has_momentum:
-                        momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
-                        momentum = muon_optimizer.param_groups[0]["momentum"]
-                        momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
-                    
-                    for i, component in enumerate(['q', 'k', 'v', 'o']):
-                        component_name = f"{base_name}{component}"
-                        component_grad = param.grad[i]
-                        analysis_params_pure.append((component_name, component_grad))
-                        
-                        # Add momentum component if available
-                        if has_momentum:
-                            component_momentum_grad = momentum_grad[i].bfloat16()
-                            analysis_params_momentum.append((component_name, component_momentum_grad))
-                elif param.grad.ndim == 2:
-                    # Handle individual attention parameters
-                    analysis_params_pure.append((clean_name, param.grad))
-                    
-                    # Get momentum buffer if this param is optimized by Muon
-                    if muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param]:
-                        momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
-                        momentum = muon_optimizer.param_groups[0]["momentum"]
-                        momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
-                        analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
+            # Handle attention QKVO parameters (3D) - split into components
+            elif 'attn.qkvo_w' in clean_name and param.grad.ndim == 3:
+                base_name = clean_name.replace('qkvo_w', '')
+                for i, component in enumerate(['q', 'k', 'v', 'o']):
+                    component_name = f"{base_name}{component}"
+                    analysis_params_pure.append((component_name, param.grad[i]))
+                    analysis_params_momentum.append((component_name, momentum_grad[i].bfloat16()))
         
-        print0(f"Analyzing {len(analysis_params_pure)} pure gradient parameters and {len(analysis_params_momentum)} momentum parameters", console=True)
-        
-        # Ensure all ranks have the same parameter count (critical for NCCL)
-        param_counts = torch.tensor([len(analysis_params_pure), len(analysis_params_momentum)], device=device)
-        dist.all_reduce(param_counts, op=dist.ReduceOp.MAX)
-        if param_counts[0] != len(analysis_params_pure) or param_counts[1] != len(analysis_params_momentum):
-            print0(f"FATAL: Parameter count mismatch across ranks. Max counts: {param_counts.tolist()}, This rank: {[len(analysis_params_pure), len(analysis_params_momentum)]}", console=True)
-            continue
+        print0(f"Analyzing {len(analysis_params_pure)} parameters", console=True)
         
         # Analyze pure gradients
         for param_name, param_grad in analysis_params_pure:
@@ -155,7 +118,7 @@ for step in range(args.num_iterations + 1):
                             'residual_norms': residual_norms
                         })
                 except Exception as e:
-                    print0(f"Error in pure gradient jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
+                    print0(f"Error in pure gradient analysis for {param_name}, subset_size {subset_size}: {e}")
         
         # Analyze momentum gradients
         for param_name, momentum_grad in analysis_params_momentum:
@@ -175,8 +138,7 @@ for step in range(args.num_iterations + 1):
                             'residual_norms': residual_norms
                         })
                 except Exception as e:
-                    print0(f"Error in momentum gradient jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
-        
+                    print0(f"Error in momentum gradient analysis for {param_name}, subset_size {subset_size}: {e}")
     
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
@@ -198,7 +160,6 @@ for step in range(args.num_iterations + 1):
 
 # Save bias/variance analysis results
 if master_process:
-    # Save pure gradient analysis
     if bias_variance_records_pure:
         df_records_pure = []
         for record in bias_variance_records_pure:
@@ -214,11 +175,8 @@ if master_process:
         df_pure = pd.DataFrame(df_records_pure)
         csv_filename_pure = f"logs/{run_id_full}_bias_variance_analysis_pure.csv"
         df_pure.to_csv(csv_filename_pure, index=False)
-        print0(f"Pure gradient bias/variance analysis saved to {csv_filename_pure}")
-    else:
-        print0("No pure gradient bias/variance records to save")
+        print0(f"Pure gradient analysis saved to {csv_filename_pure}")
     
-    # Save momentum gradient analysis
     if bias_variance_records_momentum:
         df_records_momentum = []
         for record in bias_variance_records_momentum:
@@ -234,9 +192,7 @@ if master_process:
         df_momentum = pd.DataFrame(df_records_momentum)
         csv_filename_momentum = f"logs/{run_id_full}_bias_variance_analysis_momentum.csv"
         df_momentum.to_csv(csv_filename_momentum, index=False)
-        print0(f"Momentum gradient bias/variance analysis saved to {csv_filename_momentum}")
-    else:
-        print0("No momentum gradient bias/variance records to save")
+        print0(f"Momentum gradient analysis saved to {csv_filename_momentum}")
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
