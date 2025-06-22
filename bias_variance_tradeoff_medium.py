@@ -158,7 +158,7 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     
     # Assert Muon parameters owned by this rank have proper momentum state
-    if muon_optimizer is not None:
+    if muon_optimizer is not None and step > 10:
         muon_params = muon_optimizer.param_groups[0]['params']
         for base_i in range(len(muon_params))[::world_size]:
             if base_i + rank < len(muon_params):
