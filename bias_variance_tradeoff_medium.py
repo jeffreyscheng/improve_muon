@@ -77,46 +77,21 @@ for step in range(args.num_iterations + 1):
         analysis_params_pure = []
         analysis_params_momentum = []
         
-        # Hypothesis 5: Check all optimizers
-        print0(f"Rank {rank}: Total optimizers: {len(optimizers)}", console=True)
-        for i, opt in enumerate(optimizers):
-            print0(f"Rank {rank}: Optimizer {i}: {opt.__class__.__name__}", console=True)
+        # Get all block parameters optimized by Muon that this rank owns
+        muon_params = muon_optimizer.param_groups[0]['params']
+        owned_params = []
+        for base_i in range(len(muon_params))[::world_size]:
+            if base_i + rank < len(muon_params):
+                owned_params.append(muon_params[base_i + rank])
         
-        # Hypothesis 4: Check all parameter groups  
-        print0(f"Rank {rank}: Muon has {len(muon_optimizer.param_groups)} param groups", console=True)
-        total_muon_params = []
-        for i, group in enumerate(muon_optimizer.param_groups):
-            print0(f"Rank {rank}: Group {i} has {len(group['params'])} parameters", console=True)
-            total_muon_params.extend(group['params'])
+        owned_param_set = set(owned_params)
+        block_params = [(name, param) for name, param in model.named_parameters() 
+                       if 'blocks' in name and param in owned_param_set and param.grad is not None]
         
-        # Hypothesis 1: Check distributed ownership calculation
-        print0(f"Rank {rank}: world_size={world_size}, rank={rank}", console=True)
-        expected_owned_indices = [i for i in range(len(total_muon_params))[::world_size] if i + rank < len(total_muon_params)]
-        print0(f"Rank {rank}: Should own parameter indices: {expected_owned_indices}", console=True)
-        
-        # Hypothesis 6: Check which parameters actually have state
-        params_with_state = len(muon_optimizer.state)
-        print0(f"Rank {rank}: Parameters with state: {params_with_state}/{len(total_muon_params)}", console=True)
-        
-        for name, param in block_params[:3]:  # Only check first 3 to avoid spam
+        for name, param in block_params:
             clean_name = name.replace('module.', '').replace('_orig_mod.', '')
             
-            # Hypothesis 3: Check parameter identity
-            param_id = id(param)
-            muon_param_ids = [id(p) for p in total_muon_params]
-            id_match = param_id in muon_param_ids
-            param_idx = muon_param_ids.index(param_id) if id_match else -1
-            
-            # Hypothesis 1: Check if this rank should own this parameter
-            should_own = param_idx in expected_owned_indices if param_idx >= 0 else False
-            
-            # Check state
-            has_state = param in muon_optimizer.state
-            state_keys = list(muon_optimizer.state[param].keys()) if has_state else []
-            
-            print0(f"Rank {rank}: {clean_name} - idx={param_idx}, id_match={id_match}, should_own={should_own}, has_state={has_state}, keys={state_keys}", console=True)
-            
-            # Get momentum buffer - every Muon parameter must have one
+            # Get momentum buffer - guaranteed to exist for owned parameters
             state = muon_optimizer.state[param]
             momentum_buffer = state["momentum_buffer"]
             momentum = muon_optimizer.param_groups[0]["momentum"]
@@ -193,62 +168,19 @@ for step in range(args.num_iterations + 1):
         opt.step()
     model.zero_grad(set_to_none=True)
     
-    # Debug momentum buffer issues when they first appear
-    if muon_optimizer is not None and step == 11:
-        print0(f"=== DEBUGGING AT STEP {step} ===", console=True)
-        
-        # Check all optimizers
-        print0(f"Rank {rank}: Total optimizers: {len(optimizers)}", console=True)
-        for i, opt in enumerate(optimizers):
-            print0(f"Rank {rank}: Optimizer {i}: {opt.__class__.__name__}", console=True)
-        
-        # Check all parameter groups  
-        print0(f"Rank {rank}: Muon has {len(muon_optimizer.param_groups)} param groups", console=True)
-        total_muon_params = []
-        for i, group in enumerate(muon_optimizer.param_groups):
-            print0(f"Rank {rank}: Group {i} has {len(group['params'])} parameters", console=True)
-            total_muon_params.extend(group['params'])
-        
-        # Check distributed ownership calculation
-        print0(f"Rank {rank}: world_size={world_size}, rank={rank}", console=True)
-        expected_owned_indices = [i for i in range(len(total_muon_params))[::world_size] if i + rank < len(total_muon_params)]
-        print0(f"Rank {rank}: Should own parameter indices: {expected_owned_indices}", console=True)
-        
-        # Check which parameters actually have state
-        params_with_state = len(muon_optimizer.state)
-        print0(f"Rank {rank}: Parameters with state: {params_with_state}/{len(total_muon_params)}", console=True)
-        
-        # Check first few parameters that this rank should own
-        for idx in expected_owned_indices[:5]:  # Check first 5 owned parameters
-            param = total_muon_params[idx]
-            has_state = param in muon_optimizer.state
-            state_keys = list(muon_optimizer.state[param].keys()) if has_state else []
-            print0(f"Rank {rank}: Param {idx} (shape {param.shape}) - has_state={has_state}, keys={state_keys}", console=True)
     
     # Assert Muon parameters owned by this rank have proper momentum state
     if muon_optimizer is not None and step > 10:
         muon_params = muon_optimizer.param_groups[0]['params']
         for base_i in range(len(muon_params))[::world_size]:
             if base_i + rank < len(muon_params):
-                param_idx = base_i + rank
-                param = muon_params[param_idx]
-                print0(f"Rank {rank}: Checking param {param_idx} (shape {param.shape})", console=True)
-                
-                if param not in muon_optimizer.state:
-                    print0(f"Rank {rank}: ERROR - param {param_idx} not in optimizer state!", console=True)
-                    continue
-                    
+                param = muon_params[base_i + rank]
                 state = muon_optimizer.state[param]
-                assert len(state) > 0, f"Empty state for Muon parameter {param_idx} with shape {param.shape} on rank {rank}"
-                
-                if "momentum_buffer" not in state:
-                    print0(f"Rank {rank}: ERROR - param {param_idx} missing momentum_buffer, has keys: {list(state.keys())}", console=True)
-                    continue
-                    
+                assert len(state) > 0, f"Empty state for Muon parameter with shape {param.shape} on rank {rank}"
+                assert "momentum_buffer" in state, f"Missing momentum_buffer for parameter with shape {param.shape} on rank {rank}"
                 momentum_buffer = state["momentum_buffer"]
-                assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter {param_idx} with shape {param.shape} on rank {rank}"
-                assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter {param_idx} with shape {param.shape} on rank {rank}"
-                print0(f"Rank {rank}: param {param_idx} OK - momentum buffer shape {momentum_buffer.shape}, non-zero: {(momentum_buffer != 0).any()}", console=True)
+                assert momentum_buffer.numel() > 0, f"Empty momentum buffer for parameter with shape {param.shape} on rank {rank}"
+                assert (momentum_buffer != 0).any(), f"All-zero momentum buffer for parameter with shape {param.shape} on rank {rank}"
     
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
