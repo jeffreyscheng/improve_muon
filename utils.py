@@ -17,7 +17,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
+# torch._dynamo.config.compiled_autograd = True  # Disabled due to FlexAttention incompatibility
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
