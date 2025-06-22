@@ -94,16 +94,14 @@ for step in range(args.num_iterations + 1):
                     analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
             
             # Handle attention parameters
-            elif any(param_type in clean_name for param_type in ['attn.qkvo_w', 'attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj', 'attn.c_attn', 'attn.c_proj']):
+            elif 'attn.' in clean_name:
                 # Check if it's a merged QKVO parameter (3D tensor)
                 if 'attn.qkvo_w' in clean_name and param.grad.ndim == 3 and param.grad.shape[0] == 4:
                     base_name = clean_name.replace('qkvo_w', '')
                     # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O components
                     
                     # Check if this 3D parameter has momentum buffer
-                    has_momentum = (muon_optimizer is not None and 
-                                  param in muon_optimizer.state and 
-                                  "momentum_buffer" in muon_optimizer.state[param])
+                    has_momentum = (muon_optimizer is not None and param in muon_optimizer.state and "momentum_buffer" in muon_optimizer.state[param])
                     
                     if has_momentum:
                         momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
@@ -137,7 +135,7 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(param_counts, op=dist.ReduceOp.MAX)
         if param_counts[0] != len(analysis_params_pure) or param_counts[1] != len(analysis_params_momentum):
             print0(f"FATAL: Parameter count mismatch across ranks. Max counts: {param_counts.tolist()}, This rank: {[len(analysis_params_pure), len(analysis_params_momentum)]}", console=True)
-            return
+            continue
         
         # Analyze pure gradients
         for param_name, param_grad in analysis_params_pure:
@@ -179,7 +177,6 @@ for step in range(args.num_iterations + 1):
                 except Exception as e:
                     print0(f"Error in momentum gradient jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
         
-        print0(f"Completed bias/variance analysis at step {step}")
     
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
@@ -203,7 +200,6 @@ for step in range(args.num_iterations + 1):
 if master_process:
     # Save pure gradient analysis
     if bias_variance_records_pure:
-        print0("Saving pure gradient bias/variance analysis results...")
         df_records_pure = []
         for record in bias_variance_records_pure:
             for i, norm_val in enumerate(record['residual_norms']):
@@ -224,7 +220,6 @@ if master_process:
     
     # Save momentum gradient analysis
     if bias_variance_records_momentum:
-        print0("Saving momentum gradient bias/variance analysis results...")
         df_records_momentum = []
         for record in bias_variance_records_momentum:
             for i, norm_val in enumerate(record['residual_norms']):
