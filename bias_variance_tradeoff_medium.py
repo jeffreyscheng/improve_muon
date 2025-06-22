@@ -14,7 +14,8 @@ log_system_info(print0, code)
 args = Hyperparameters()
 model, optimizers, opt2params = create_model_and_optimizers(args, rank, world_size)
 model = torch.compile(model, dynamic=False)
-bias_variance_records = []
+bias_variance_records_pure = []
+bias_variance_records_momentum = []
 warmup_kernels(model, optimizers, args)
 
 torch.cuda.reset_peak_memory_stats()
@@ -60,15 +61,67 @@ for step in range(args.num_iterations + 1):
     # Bias/variance analysis
     if step % EVALUATE_TRADEOFF_EVERY == 0 and step > 0:
         print0(f"Running bias/variance analysis at step {step}", console=True)
-        named_matrix_params = [
-            (name.replace('module.', '').replace('_orig_mod.', '').replace('weight', '').strip('.'), param)
-            for name, param in model.named_parameters()
-            if param.ndim == 2 and param.grad is not None and 'blocks' in name
-        ]
         
-        for param_name, param in named_matrix_params:
-            gradients_all_gpus = [torch.zeros_like(param.grad) for _ in range(world_size)]
-            dist.all_gather(gradients_all_gpus, param.grad)
+        # First, let's debug what parameters we have
+        all_params = [(name, param) for name, param in model.named_parameters() if param.ndim == 2]
+        block_params = [(name, param) for name, param in all_params if 'blocks' in name]
+        params_with_grad = [(name, param) for name, param in block_params if param.grad is not None]
+        
+        print0(f"Total 2D parameters: {len(all_params)}", console=True)
+        print0(f"Block parameters: {len(block_params)}", console=True) 
+        print0(f"Block parameters with gradients: {len(params_with_grad)}", console=True)
+        
+        # Find the Muon optimizer
+        muon_optimizer = None
+        for opt in optimizers:
+            if hasattr(opt, '__class__') and opt.__class__.__name__ == 'Muon':
+                muon_optimizer = opt
+                break
+        
+        # Clean parameter names and filter for analysis
+        analysis_params_pure = []
+        analysis_params_momentum = []
+        
+        for name, param in params_with_grad:
+            # Clean the parameter name
+            clean_name = name.replace('module.', '').replace('_orig_mod.', '')
+            
+            # Handle MLP parameters
+            if any(param_type in clean_name for param_type in ['mlp.fc_w', 'mlp.proj_w']):
+                analysis_params_pure.append((clean_name, param.grad))
+                
+                # Get momentum buffer if this param is optimized by Muon
+                if muon_optimizer is not None and param in muon_optimizer.state:
+                    momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+                    momentum = muon_optimizer.param_groups[0]["momentum"]  # Assume same momentum for all groups
+                    # This is what Muon actually uses: momentum * buffer + (1-momentum) * grad
+                    momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+                    analysis_params_momentum.append((clean_name, momentum_grad.bfloat16()))
+            
+            # Handle merged QKVO attention parameters - split into Q, K, V, O components
+            elif 'attn.qkvo_w' in clean_name:
+                base_name = clean_name.replace('qkvo_w', '')
+                # qkvo_w has shape (4, hdim, dim) - split into Q, K, V, O
+                for i, component in enumerate(['q', 'k', 'v', 'o']):
+                    component_name = f"{base_name}{component}"
+                    component_grad = param.grad[i]  # Extract the i-th component
+                    analysis_params_pure.append((component_name, component_grad))
+                    
+                    # Get momentum buffer if this param is optimized by Muon
+                    if muon_optimizer is not None and param in muon_optimizer.state:
+                        momentum_buffer = muon_optimizer.state[param]["momentum_buffer"]
+                        momentum = muon_optimizer.param_groups[0]["momentum"]
+                        momentum_grad = momentum * momentum_buffer + (1 - momentum) * param.grad.float()
+                        component_momentum_grad = momentum_grad[i].bfloat16()  # Extract i-th component
+                        analysis_params_momentum.append((component_name, component_momentum_grad))
+        
+        print0(f"Pure gradient parameters for analysis: {[name for name, _ in analysis_params_pure]}", console=True)
+        print0(f"Momentum gradient parameters for analysis: {[name for name, _ in analysis_params_momentum]}", console=True)
+        
+        # Analyze pure gradients
+        for param_name, param_grad in analysis_params_pure:
+            gradients_all_gpus = [torch.zeros_like(param_grad) for _ in range(world_size)]
+            dist.all_gather(gradients_all_gpus, param_grad)
             
             for subset_size in range(1, min(8, world_size)):
                 try:
@@ -76,14 +129,35 @@ for step in range(args.num_iterations + 1):
                         gradients_all_gpus, subset_size, norm="fro"
                     )
                     if master_process:
-                        bias_variance_records.append({
+                        bias_variance_records_pure.append({
                             'minibatch_idx': step,
                             'parameter_name': param_name,
                             'subset_size': subset_size,
                             'residual_norms': residual_norms
                         })
                 except Exception as e:
-                    print0(f"Error in jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
+                    print0(f"Error in pure gradient jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
+        
+        # Analyze momentum gradients
+        for param_name, momentum_grad in analysis_params_momentum:
+            gradients_all_gpus = [torch.zeros_like(momentum_grad) for _ in range(world_size)]
+            dist.all_gather(gradients_all_gpus, momentum_grad)
+            
+            for subset_size in range(1, min(8, world_size)):
+                try:
+                    residual_norms = jackknife_gradient_residuals_on_subsets(
+                        gradients_all_gpus, subset_size, norm="fro"
+                    )
+                    if master_process:
+                        bias_variance_records_momentum.append({
+                            'minibatch_idx': step,
+                            'parameter_name': param_name,
+                            'subset_size': subset_size,
+                            'residual_norms': residual_norms
+                        })
+                except Exception as e:
+                    print0(f"Error in momentum gradient jackknife analysis for {param_name}, subset_size {subset_size}: {e}")
+        
         print0(f"Completed bias/variance analysis at step {step}")
     
     opt2futures = {
@@ -105,26 +179,48 @@ for step in range(args.num_iterations + 1):
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 # Save bias/variance analysis results
-if master_process and bias_variance_records:
-    print0("Saving bias/variance analysis results...")
-    df_records = []
-    for record in bias_variance_records:
-        for i, norm_val in enumerate(record['residual_norms']):
-            df_records.append({
-                'minibatch_idx': record['minibatch_idx'],
-                'parameter_name': record['parameter_name'],
-                'subset_size': record['subset_size'],
-                'subset_idx': i,
-                'residual_norm': norm_val
-            })
-    
-    if df_records:
-        df = pd.DataFrame(df_records)
-        csv_filename = f"logs/{run_id_full}_bias_variance_analysis.csv"
-        df.to_csv(csv_filename, index=False)
-        print0(f"Bias/variance analysis saved to {csv_filename}")
+if master_process:
+    # Save pure gradient analysis
+    if bias_variance_records_pure:
+        print0("Saving pure gradient bias/variance analysis results...")
+        df_records_pure = []
+        for record in bias_variance_records_pure:
+            for i, norm_val in enumerate(record['residual_norms']):
+                df_records_pure.append({
+                    'minibatch_idx': record['minibatch_idx'],
+                    'parameter_name': record['parameter_name'],
+                    'subset_size': record['subset_size'],
+                    'subset_idx': i,
+                    'residual_norm': norm_val
+                })
+        
+        df_pure = pd.DataFrame(df_records_pure)
+        csv_filename_pure = f"logs/{run_id_full}_bias_variance_analysis_pure.csv"
+        df_pure.to_csv(csv_filename_pure, index=False)
+        print0(f"Pure gradient bias/variance analysis saved to {csv_filename_pure}")
     else:
-        print0("No bias/variance records to save")
+        print0("No pure gradient bias/variance records to save")
+    
+    # Save momentum gradient analysis
+    if bias_variance_records_momentum:
+        print0("Saving momentum gradient bias/variance analysis results...")
+        df_records_momentum = []
+        for record in bias_variance_records_momentum:
+            for i, norm_val in enumerate(record['residual_norms']):
+                df_records_momentum.append({
+                    'minibatch_idx': record['minibatch_idx'],
+                    'parameter_name': record['parameter_name'],
+                    'subset_size': record['subset_size'],
+                    'subset_idx': i,
+                    'residual_norm': norm_val
+                })
+        
+        df_momentum = pd.DataFrame(df_records_momentum)
+        csv_filename_momentum = f"logs/{run_id_full}_bias_variance_analysis_momentum.csv"
+        df_momentum.to_csv(csv_filename_momentum, index=False)
+        print0(f"Momentum gradient bias/variance analysis saved to {csv_filename_momentum}")
+    else:
+        print0("No momentum gradient bias/variance records to save")
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
     f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
