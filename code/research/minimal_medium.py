@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read()
 
-from utils import *
+from code.research.utils import *
 
 run_id, rank, world_size, device, master_process = setup_distributed_training()
 print0, run_id_full, logfile = setup_logging(run_id, master_process)

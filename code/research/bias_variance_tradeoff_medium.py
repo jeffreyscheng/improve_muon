@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read()
 
-from utils import *
+from code.research.utils import *
 import pandas as pd
 
 EVALUATE_TRADEOFF_EVERY = 100
