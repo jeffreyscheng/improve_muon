@@ -39,7 +39,7 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) ->
         blocks = G.view(*G.shape[:-1], num_blocks, m).transpose(-3, -2)
         assert blocks.shape[-3] == num_blocks
         assert blocks.shape[-2] == blocks.shape[-1]
-        return torch.stack([zeropower_via_tanh(block, alpha, eps) for block in blocks], dim=-3).view(*G.shape[:-2], n, m)
+        return torch.stack([zeropower_via_tanh(block, alpha, eps) for block in blocks], dim=-3).view(*G.shape[:-2], m, n)
 
 @torch.compile
 def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
