@@ -1,1 +1,0 @@
-# PROCESSED - Content moved to /math/presentable/orthogonalization_theory.md
