@@ -21,10 +21,22 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) ->
     # Check if matrix is square
     if G.size(-2) == G.size(-1):
         # Square matrix - original implementation
-        eye = torch.eye(G.size(-1), device=G.device, dtype=G.dtype)
-        E = torch.linalg.matrix_exp(2 * alpha * G)
-        Y = torch.linalg.solve(E + eye, E - eye)
-        return Y / math.tanh(alpha + eps)
+        Gram = G.T @ G                                 # one GEMM
+
+        # 2. Symmetric eigendecomposition
+        lam, V = torch.linalg.eigh(Gram.to(torch.float64))
+
+        # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
+        sqrtlam = torch.sqrt(lam.clamp_min(eps))
+        phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
+        phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
+
+        # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
+        Vphi = V * phi                  # scale columns (cheap, n² ops)
+        Y    = G @ Vphi                 # GEMM 1
+        F    = Y @ V.T                  # GEMM 2
+
+        return F.to(dtype=G.dtype)
     else:
         # Rectangular matrix - split into square blocks
         m, n = G.size(-2), G.size(-1)
