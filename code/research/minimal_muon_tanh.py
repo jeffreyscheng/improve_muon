@@ -8,7 +8,7 @@ import math
 # -----------------------------------------------------------------------------
 # Muon optimizer with tanh-based orthogonalization
 
-def zeropower_via_tanh(G: Tensor, alpha: float = 20., eps: float = 1e-7) -> Tensor:
+def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
     """
     Computes the zeroth power / orthogonalization of G using tanh approximation.
     Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
