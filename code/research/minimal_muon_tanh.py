@@ -33,9 +33,10 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) ->
             return zeropower_via_tanh(G.transpose(-2, -1), alpha, eps).transpose(-2, -1)
         
         assert n > m, f"Matrix dimension {n} must be greater than {m} for rectangular matrix handling"
-        assert n % m == 0, f"Matrix dimension {m} must be divisible by {n} for rectangular matrix handling"
+        assert n % m == 0, f"Matrix dimension {n} must be divisible by {m} for rectangular matrix handling"
         num_blocks = n // m
-        blocks = G.view(*G.shape[:-2], num_blocks, m, m)
+        # Split along the column dimension, then transpose to get blocks of shape (num_blocks, m, m)
+        blocks = G.view(*G.shape[:-1], num_blocks, m).transpose(-2, -1)
         assert blocks.shape[-3] == num_blocks
         assert blocks.shape[-2] == blocks.shape[-1]
         return torch.stack([zeropower_via_tanh(block, alpha, eps) for block in blocks], dim=-3).view(*G.shape[:-2], n, m)
