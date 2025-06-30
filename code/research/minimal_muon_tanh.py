@@ -13,13 +13,50 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 20., eps: float = 1e-7) -> Tens
     Computes the zeroth power / orthogonalization of G using tanh approximation.
     Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
     Implementation based on whiten_grad function.
+    
+    Handles rectangular matrices by splitting them into square blocks.
     """
     assert G.ndim >= 2
-    # G: [B, d, d] gradient batch (square assumed)
-    eye = torch.eye(G.size(-1), device=G.device, dtype=G.dtype)
-    E = torch.linalg.matrix_exp(2 * alpha * G)
-    Y = torch.linalg.solve(E + eye, E - eye)
-    return Y / math.tanh(alpha + eps)  # eps avoids /0 if alpha tiny
+    
+    # Check if matrix is square
+    if G.size(-2) == G.size(-1):
+        # Square matrix - original implementation
+        eye = torch.eye(G.size(-1), device=G.device, dtype=G.dtype)
+        E = torch.linalg.matrix_exp(2 * alpha * G)
+        Y = torch.linalg.solve(E + eye, E - eye)
+        return Y / math.tanh(alpha + eps)
+    else:
+        # Rectangular matrix - split into square blocks
+        m, n = G.size(-2), G.size(-1)
+        
+        # Determine how to split: larger dimension must be divisible by smaller
+        if m > n:
+            assert m % n == 0, f"Matrix dimension {m} must be divisible by {n} for rectangular matrix handling"
+            num_blocks = m // n
+            # Split along first dimension: [m, n] -> [num_blocks, n, n]
+            blocks = G.view(*G.shape[:-2], num_blocks, n, n)
+            orthogonalized_blocks = []
+            for i in range(num_blocks):
+                block = blocks[..., i, :, :]
+                eye = torch.eye(n, device=G.device, dtype=G.dtype)
+                E = torch.linalg.matrix_exp(2 * alpha * block)
+                Y = torch.linalg.solve(E + eye, E - eye)
+                orthogonalized_blocks.append(Y / math.tanh(alpha + eps))
+            return torch.stack(orthogonalized_blocks, dim=-3).view(*G.shape[:-2], m, n)
+        else:
+            assert n % m == 0, f"Matrix dimension {n} must be divisible by {m} for rectangular matrix handling"
+            num_blocks = n // m
+            # Split along second dimension: [m, n] -> [m, num_blocks, m]
+            blocks = G.view(*G.shape[:-1], num_blocks, m).transpose(-2, -1)
+            orthogonalized_blocks = []
+            for i in range(num_blocks):
+                block = blocks[..., i, :, :]
+                eye = torch.eye(m, device=G.device, dtype=G.dtype)
+                E = torch.linalg.matrix_exp(2 * alpha * block)
+                Y = torch.linalg.solve(E + eye, E - eye)
+                orthogonalized_blocks.append(Y / math.tanh(alpha + eps))
+            result = torch.stack(orthogonalized_blocks, dim=-3).transpose(-2, -1)
+            return result.view(*G.shape[:-2], m, n)
 
 @torch.compile
 def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
