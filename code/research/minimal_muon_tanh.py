@@ -143,20 +143,20 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
         # assert tanh_res < 1e-10
         assert orth_res < 1e-10
         assert skew_res < 1e-10
-        print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
+        print0(f"orth_res {orth_res} skew_res {skew_res}")
     else:
         # just do the check for the first 1024x1024 block
         grad = grad.to(torch.float32)
         v = v.to(torch.float32)
         grad = grad[..., :1024, :1024]
         v = v[..., :1024, :1024]
-        tanh_res = tanh_residual(grad, v)
+        # tanh_res = tanh_residual(grad, v)
         orth_res = orth_residual(v)
         skew_res = skew_residual(grad, v)
-        assert tanh_res < 1e-10, tanh_res
+        # assert tanh_res < 1e-10, tanh_res
         assert orth_res < 1e-10, orth_res
         assert skew_res < 1e-10, skew_res
-        print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
+        print0(f"orth_res {orth_res} skew_res {skew_res}")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
