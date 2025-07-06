@@ -133,6 +133,9 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
 
     # checks for square matrices
     if grad.shape[-2] == grad.shape[-1]:
+        grad = grad.to(torch.float32)
+        v = v.to(torch.float32)
+        
         tanh_res = tanh_residual(grad, v)
         orth_res = orth_residual(v)
         skew_res = skew_residual(grad, v)
