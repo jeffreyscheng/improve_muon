@@ -153,9 +153,9 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
         tanh_res = tanh_residual(grad, v)
         orth_res = orth_residual(v)
         skew_res = skew_residual(grad, v)
-        # assert tanh_res < 1e-10
-        # assert orth_res < 1e-10
-        # assert skew_res < 1e-10
+        assert tanh_res < 1e-10, tanh_res
+        assert orth_res < 1e-10, orth_res
+        assert skew_res < 1e-10, skew_res
         print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
