@@ -11,26 +11,26 @@ import math
 
 def matrix_tanh(A: torch.Tensor, *, tol: float = 0.5):
     """
-    Backward-stable tanh(A) for a general square matrix A.
-    No gradients are recorded.
+    Back-stable tanh(A) for a stack of square matrices [..., n, n].
+    Works with torch.compile; no grads recorded.
     """
     dtype, device = A.dtype, A.device
     n = A.shape[-1]
     I = torch.eye(n, dtype=dtype, device=device)
 
-    # 1. scaling
-    one_norm = torch.linalg.matrix_norm(A, ord=1)
-    s = int(torch.ceil(torch.log2(torch.clamp(one_norm / tol, min=1))).item())
+    # 1. scaling (batch-aware)
+    one_norm = torch.linalg.matrix_norm(A, ord=1)          # [...,]
+    s = int(torch.ceil(torch.log2(torch.clamp(one_norm / tol, min=1.0))).max().item())
     B = A / (2.0 ** s)
 
     # 2. core evaluation via expm
     E = torch.matrix_exp(2.0 * B)
-    Y = torch.linalg.solve(E + I, E - I)     # (E - I)*(E + I)^{-1}
+    Y = torch.linalg.solve(E + I, E - I)                   # (E-I)(E+I)^{-1}
 
     # 3. unsquaring
     for _ in range(s):
         Y2 = Y @ Y
-        Y = torch.linalg.solve(I + Y2, 2.0 * Y)
+        Y  = torch.linalg.solve(I + Y2, 2.0 * Y)
 
     return Y
 
