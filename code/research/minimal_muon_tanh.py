@@ -8,54 +8,69 @@ import math
 # -----------------------------------------------------------------------------
 # Muon optimizer with tanh-based orthogonalization
 
+def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
+    """
+    Computes the zeroth power / orthogonalization of a square matrix G using tanh approximation.
+    Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
+    """
+    assert G.ndim >= 2
+    assert G.size(-2) == G.size(-1), "Matrix must be square"
+    
+    Gram = G.T @ G                                 # one GEMM
+
+    # 2. Symmetric eigendecomposition
+    lam, V = torch.linalg.eigh(Gram.to(torch.float64))
+
+    G = G.to(torch.bfloat16)
+    lam = lam.to(torch.bfloat16)
+    V = V.to(torch.bfloat16)
+
+    # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
+    sqrtlam = torch.sqrt(lam.clamp_min(eps))
+    phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
+    phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
+
+    # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
+    Vphi = V * phi                  # scale columns (cheap, n² ops)
+    Y    = G @ Vphi                 # GEMM 1
+    F    = Y @ V.T                  # GEMM 2
+
+    return F.to(dtype=G.dtype)
+
 def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
     """
     Computes the zeroth power / orthogonalization of G using tanh approximation.
-    Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
-    Implementation based on whiten_grad function.
-    
-    Handles rectangular matrices by splitting them into square blocks.
+    Handles 3 specific matrix shapes: 1024x1024, 1024x4096, and 4096x1024.
     """
     assert G.ndim >= 2
+    m, n = G.size(-2), G.size(-1)
     
-    # Check if matrix is square
-    if G.size(-2) == G.size(-1):
-        # Square matrix - original implementation
-        Gram = G.T @ G                                 # one GEMM
-
-        # 2. Symmetric eigendecomposition
-        lam, V = torch.linalg.eigh(Gram.to(torch.float64))
-
-        G = G.to(torch.bfloat16)
-        lam = lam.to(torch.bfloat16)
-        V = V.to(torch.bfloat16)
-
-        # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
-        sqrtlam = torch.sqrt(lam.clamp_min(eps))
-        phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
-        phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
-
-        # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
-        Vphi = V * phi                  # scale columns (cheap, n² ops)
-        Y    = G @ Vphi                 # GEMM 1
-        F    = Y @ V.T                  # GEMM 2
-
-        return F.to(dtype=G.dtype)
+    # Case 1: Square matrix (1024x1024)
+    if m == n:
+        return zeropower_via_tanh_square(G, alpha, eps)
+    
+    # Case 2: Wide matrix (1024x4096) - split into 4 blocks along columns
+    elif m == 1024 and n == 4096:
+        # Split into 4 blocks of 1024x1024
+        blocks = G.view(*G.shape[:-1], 4, 1024)  # (..., 1024, 4, 1024)
+        block0 = zeropower_via_tanh_square(blocks[..., 0, :], alpha, eps)
+        block1 = zeropower_via_tanh_square(blocks[..., 1, :], alpha, eps)
+        block2 = zeropower_via_tanh_square(blocks[..., 2, :], alpha, eps)
+        block3 = zeropower_via_tanh_square(blocks[..., 3, :], alpha, eps)
+        return torch.stack([block0, block1, block2, block3], dim=-2).view(*G.shape[:-1], 4096)
+    
+    # Case 3: Tall matrix (4096x1024) - split into 4 blocks along rows
+    elif m == 4096 and n == 1024:
+        # Split into 4 blocks of 1024x1024
+        blocks = G.view(*G.shape[:-2], 4, 1024, 1024)  # (..., 4, 1024, 1024)
+        block0 = zeropower_via_tanh_square(blocks[..., 0, :, :], alpha, eps)
+        block1 = zeropower_via_tanh_square(blocks[..., 1, :, :], alpha, eps)
+        block2 = zeropower_via_tanh_square(blocks[..., 2, :, :], alpha, eps)
+        block3 = zeropower_via_tanh_square(blocks[..., 3, :, :], alpha, eps)
+        return torch.stack([block0, block1, block2, block3], dim=-3).view(*G.shape[:-2], 4096, 1024)
+    
     else:
-        # Rectangular matrix - split into square blocks
-        m, n = G.size(-2), G.size(-1)
-
-        if n < m:
-            return zeropower_via_tanh(G.transpose(-2, -1), alpha, eps).transpose(-2, -1)
-        
-        assert n > m, f"Matrix dimension {n} must be greater than {m} for rectangular matrix handling"
-        assert n % m == 0, f"Matrix dimension {n} must be divisible by {m} for rectangular matrix handling"
-        num_blocks = n // m
-        # Split along the column dimension, then transpose to get blocks of shape (num_blocks, m, m)
-        blocks = G.view(*G.shape[:-1], num_blocks, m).transpose(-3, -2)
-        assert blocks.shape[-3] == num_blocks
-        assert blocks.shape[-2] == blocks.shape[-1]
-        return torch.stack([zeropower_via_tanh(block, alpha, eps) for block in blocks], dim=-3).view(*G.shape[:-2], m, n)
+        raise ValueError(f"Unsupported matrix shape: {m}x{n}. Only 1024x1024, 1024x4096, and 4096x1024 are supported.")
 
 @torch.compile
 def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
