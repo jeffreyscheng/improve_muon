@@ -146,6 +146,8 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
         print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
     else:
         # just do the check for the first 1024x1024 block
+        grad = grad.to(torch.float32)
+        v = v.to(torch.float32)
         grad = grad[..., :1024, :1024]
         v = v[..., :1024, :1024]
         tanh_res = tanh_residual(grad, v)
