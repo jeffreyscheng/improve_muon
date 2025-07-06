@@ -32,7 +32,7 @@ def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1
     phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
 
     # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
-    Vphi = V * phi                  # scale columns (cheap, n² ops)
+    Vphi = V * phi.unsqueeze(-1)    # scale columns (cheap, n² ops) - explicit broadcasting
     Y    = G @ Vphi                 # GEMM 1
     F    = Y @ V.mT                 # GEMM 2
 
