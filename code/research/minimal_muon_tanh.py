@@ -55,18 +55,6 @@ def skew_residual(G, Z):
 def zeropower_via_tanh_square(G, alpha=128.0):
     tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
     tanh_alpha_G = matrix_tanh(alpha * G)
-
-    # checks
-    tanh_res = tanh_residual(alpha * G, tanh_alpha_G)
-    orth_res = orth_residual(tanh_alpha_G)
-    skew_res = skew_residual(G, tanh_alpha_G)
-
-    assert tanh_res < 1e-10
-    assert orth_res < 1e-10
-    assert skew_res < 1e-10
-
-    print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
-
     return (tanh_alpha_G / tanh_alpha).to(torch.bfloat16)
 
 
@@ -100,6 +88,7 @@ def zeropower_via_tanh_square(G, alpha=128.0):
 
 #     return F.to(dtype=G.dtype)
 
+@torch.compile
 def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0) -> Tensor:
     """
     Computes the zeroth power / orthogonalization of G using tanh approximation.
@@ -135,12 +124,22 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0) -> Tensor:
     else:
         raise ValueError(f"Unsupported matrix shape: {m}x{n}. Only 1024x1024, 1024x4096, and 4096x1024 are supported.")
 
-@torch.compile
+# @torch.compile
 def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_tanh(momentum * momentum_buffer + (1 - momentum) * grad)
+
+    # checks
+    tanh_res = tanh_residual(grad, v)
+    orth_res = orth_residual(v)
+    skew_res = skew_residual(grad, v)
+
+    assert tanh_res < 1e-10
+    assert orth_res < 1e-10
+    assert skew_res < 1e-10
+    print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
