@@ -131,15 +131,16 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
     v = zeropower_via_tanh(momentum * momentum_buffer + (1 - momentum) * grad)
 
-    # checks
-    tanh_res = tanh_residual(grad, v)
-    orth_res = orth_residual(v)
-    skew_res = skew_residual(grad, v)
+    # checks for square matrices
+    if grad.shape[-2] == grad.shape[-1]:
+        tanh_res = tanh_residual(grad, v)
+        orth_res = orth_residual(v)
+        skew_res = skew_residual(grad, v)
 
-    assert tanh_res < 1e-10
-    assert orth_res < 1e-10
-    assert skew_res < 1e-10
-    print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
+        assert tanh_res < 1e-10
+        assert orth_res < 1e-10
+        assert skew_res < 1e-10
+        print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
