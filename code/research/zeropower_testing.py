@@ -1,7 +1,7 @@
 # =============================================================================
 # ZEROPOWER BACKEND SELECTION - CHANGE THIS LINE TO SWITCH METHODS
 # =============================================================================
-ZEROPOWER_METHOD = "newton_schulz"  # Options: "newton_schulz", "svd_polar", "tanh_element", "tanh_matrix"
+ZEROPOWER_METHOD = "svd_polar"  # Options: "newton_schulz", "svd_polar", "tanh_element", "tanh_matrix"
 
 import sys
 with open(sys.argv[0]) as f:
@@ -69,8 +69,10 @@ def zeropower_via_svd_polar(G: Tensor) -> Tensor:
             X = X.mT
             was_transposed = True
         
-        U, S, V = torch.svd(X)
-        result = U @ V.T
+        # Use modern linalg.svd instead of deprecated torch.svd
+        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        # Note: torch.linalg.svd returns Vh (V hermitian), not V
+        result = U @ Vh
         
         if was_transposed:
             result = result.mT
