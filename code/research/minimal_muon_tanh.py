@@ -70,7 +70,7 @@ def zeropower_via_tanh_square(G, alpha=128.0):
 
 #     return F.to(dtype=G.dtype)
 
-def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
+def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0) -> Tensor:
     """
     Computes the zeroth power / orthogonalization of G using tanh approximation.
     Handles 3 specific matrix shapes: 1024x1024, 1024x4096, and 4096x1024.
@@ -80,26 +80,26 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) ->
     
     # Case 1: Square matrix (1024x1024)
     if m == n:
-        return zeropower_via_tanh_square(G, alpha, eps)
+        return zeropower_via_tanh_square(G, alpha)
     
     # Case 2: Wide matrix (1024x4096) - split into 4 blocks along columns
     elif m == 1024 and n == 4096:
         # Split into 4 blocks of 1024x1024
         blocks = G.view(*G.shape[:-1], 4, 1024)  # (..., 1024, 4, 1024)
-        block0 = zeropower_via_tanh_square(blocks[..., 0, :], alpha, eps)
-        block1 = zeropower_via_tanh_square(blocks[..., 1, :], alpha, eps)
-        block2 = zeropower_via_tanh_square(blocks[..., 2, :], alpha, eps)
-        block3 = zeropower_via_tanh_square(blocks[..., 3, :], alpha, eps)
+        block0 = zeropower_via_tanh_square(blocks[..., 0, :], alpha)
+        block1 = zeropower_via_tanh_square(blocks[..., 1, :], alpha)
+        block2 = zeropower_via_tanh_square(blocks[..., 2, :], alpha)
+        block3 = zeropower_via_tanh_square(blocks[..., 3, :], alpha)
         return torch.stack([block0, block1, block2, block3], dim=-2).view(*G.shape[:-1], 4096)
     
     # Case 3: Tall matrix (4096x1024) - split into 4 blocks along rows
     elif m == 4096 and n == 1024:
         # Split into 4 blocks of 1024x1024
         blocks = G.view(*G.shape[:-2], 4, 1024, 1024)  # (..., 4, 1024, 1024)
-        block0 = zeropower_via_tanh_square(blocks[..., 0, :, :], alpha, eps)
-        block1 = zeropower_via_tanh_square(blocks[..., 1, :, :], alpha, eps)
-        block2 = zeropower_via_tanh_square(blocks[..., 2, :, :], alpha, eps)
-        block3 = zeropower_via_tanh_square(blocks[..., 3, :, :], alpha, eps)
+        block0 = zeropower_via_tanh_square(blocks[..., 0, :, :], alpha)
+        block1 = zeropower_via_tanh_square(blocks[..., 1, :, :], alpha)
+        block2 = zeropower_via_tanh_square(blocks[..., 2, :, :], alpha)
+        block3 = zeropower_via_tanh_square(blocks[..., 3, :, :], alpha)
         return torch.stack([block0, block1, block2, block3], dim=-3).view(*G.shape[:-2], 4096, 1024)
     
     else:
