@@ -98,8 +98,9 @@ def zeropower_via_classic_newton_schulz(G: Tensor, num_iters: int = 15) -> Tenso
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     
     # Classic Newton-Schulz iteration: f(x) = 1.5x - 0.5x^3
+    # For non-square matrices: X^3 = X @ X.T @ X
     for _ in range(num_iters):
-        X = 1.5 * X - 0.5 * X @ X @ X
+        X = 1.5 * X - 0.5 * X @ X.mT @ X
 
     if G.size(-2) > G.size(-1):
         X = X.mT
