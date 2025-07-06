@@ -135,7 +135,7 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
     if grad.shape[-2] == grad.shape[-1]:
         grad = grad.to(torch.float32)
         v = v.to(torch.float32)
-        
+
         tanh_res = tanh_residual(grad, v)
         orth_res = orth_residual(v)
         skew_res = skew_residual(grad, v)
@@ -144,6 +144,7 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
         assert orth_res < 1e-10
         assert skew_res < 1e-10
         print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
+        raise ValueError("ooh lala")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
