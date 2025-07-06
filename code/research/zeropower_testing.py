@@ -62,8 +62,19 @@ def zeropower_via_svd_polar(G: Tensor) -> Tensor:
     SVD-based polar decomposition for orthogonalization.
     """
     try:
-        U, S, V = torch.svd(G.float())
+        # Handle non-square matrices like Newton-Schulz does
+        was_transposed = False
+        X = G.float()
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+            was_transposed = True
+        
+        U, S, V = torch.svd(X)
         result = U @ V.T
+        
+        if was_transposed:
+            result = result.mT
+            
         return result.to(G.dtype)
     except Exception:
         # Fallback to Newton-Schulz if SVD fails
