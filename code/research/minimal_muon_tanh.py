@@ -25,9 +25,8 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) ->
 
         # 2. Symmetric eigendecomposition
         lam, V = torch.linalg.eigh(Gram.to(torch.float64))
-
-        print(f"lam {lam.dtype} V {V.dtype} G {G.dtype}")
-
+        lam = lam.to(torch.float32)
+        V = V.to(torch.float32)
         # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
         sqrtlam = torch.sqrt(lam.clamp_min(eps))
         phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
