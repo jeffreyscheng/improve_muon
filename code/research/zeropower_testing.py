@@ -464,9 +464,26 @@ def setup_distributed_training():
     master_process = (rank == 0)
     return run_id, rank, world_size, device, master_process
 
-def setup_logging(run_id, master_process):
+def setup_logging(run_id, master_process, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams):
     if master_process:
-        run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
+        # Create descriptive filename with hyperparameters
+        def format_hyperparams(hyperparams):
+            if not hyperparams:
+                return ""
+            # Extract key hyperparameters for filename
+            parts = []
+            if "num_iters" in hyperparams:
+                parts.append(f"iters{hyperparams['num_iters']}")
+            if "alpha" in hyperparams:
+                parts.append(f"alpha{hyperparams['alpha']}")
+            return "_" + "_".join(parts) if parts else ""
+        
+        mlp_suffix = format_hyperparams(mlp_hyperparams)
+        attn_suffix = format_hyperparams(attn_hyperparams)
+        
+        config_str = f"mlp_{mlp_method}{mlp_suffix}_attn_{attn_method}{attn_suffix}"
+        run_id_full = f"{run_id:03d}_{config_str}_{uuid.uuid4().hex[:8]}"
+        
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id_full}.txt"
         print(logfile)
@@ -612,7 +629,7 @@ zeropower_func_attn = get_zeropower_function(attn_method, attn_hyperparams)
 
 # Setup
 run_id, rank, world_size, device, master_process = setup_distributed_training()
-print0, run_id_full, logfile = setup_logging(run_id, master_process)
+print0, run_id_full, logfile = setup_logging(run_id, master_process, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams)
 log_system_info(print0, code, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams)
 
 args = Hyperparameters()
