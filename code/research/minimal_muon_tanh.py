@@ -34,9 +34,36 @@ def matrix_tanh(A: torch.Tensor, *, tol: float = 0.5):
 
     return Y
 
+def tanh_residual(A, Y):
+    E2 = torch.matrix_exp(2.0 * A)
+    delta = (E2 + torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)) @ Y - (E2 - torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
+    return torch.linalg.matrix_norm(delta) / torch.linalg.matrix_norm(E2 - torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
+
+def orth_residual(Z):
+    """‖Zᵀ Z − I‖_F"""
+    n = Z.shape[-1]
+    I = torch.eye(n, dtype=Z.dtype, device=Z.device)
+    return torch.linalg.matrix_norm(Z.transpose(-2, -1) @ Z - I)
+
+def skew_residual(G, Z):
+    """‖Gᵀ Z − Zᵀ G‖_F"""
+    return torch.linalg.matrix_norm(
+        G.transpose(-2, -1) @ Z - Z.transpose(-2, -1) @ G
+    )
+
+
 def zeropower_via_tanh_square(G, alpha=128.0):
     tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
-    return (matrix_tanh(alpha * G) / tanh_alpha).to(torch.bfloat16)
+    tanh_alpha_G = matrix_tanh(alpha * G)
+
+    # checks
+    tanh_res = tanh_residual(alpha * G, tanh_alpha_G)
+    orth_res = orth_residual(tanh_alpha_G)
+    skew_res = skew_residual(G, tanh_alpha_G)
+
+    print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
+
+    return (tanh_alpha_G / tanh_alpha).to(torch.bfloat16)
 
 
 # def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
