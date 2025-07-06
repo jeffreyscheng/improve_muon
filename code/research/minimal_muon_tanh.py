@@ -16,7 +16,8 @@ def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1
     assert G.ndim >= 2
     assert G.size(-2) == G.size(-1), "Matrix must be square"
     
-    Gram = G.T @ G                                 # one GEMM
+    # Use .mT (matrix transpose) like the original Newton-Schulz implementation
+    Gram = G.mT @ G                                 # one GEMM
 
     # 2. Symmetric eigendecomposition
     lam, V = torch.linalg.eigh(Gram.to(torch.float64))
@@ -33,7 +34,7 @@ def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1
     # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
     Vphi = V * phi                  # scale columns (cheap, n² ops)
     Y    = G @ Vphi                 # GEMM 1
-    F    = Y @ V.T                  # GEMM 2
+    F    = Y @ V.mT                 # GEMM 2
 
     return F.to(dtype=G.dtype)
 
