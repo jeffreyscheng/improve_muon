@@ -61,7 +61,10 @@ def zeropower_via_tanh_square(G, alpha=128.0):
     orth_res = orth_residual(tanh_alpha_G)
     skew_res = skew_residual(G, tanh_alpha_G)
 
-    torch._dynamo.graph_break()
+    assert tanh_res < 1e-10
+    assert orth_res < 1e-10
+    assert skew_res < 1e-10
+
     print0(f"tanh_res {tanh_res} orth_res {orth_res} skew_res {skew_res}")
 
     return (tanh_alpha_G / tanh_alpha).to(torch.bfloat16)
