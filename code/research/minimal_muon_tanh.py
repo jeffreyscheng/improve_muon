@@ -34,23 +34,6 @@ def matrix_tanh(A: torch.Tensor, *, tol: float = 0.5):
 
     return Y
 
-def tanh_residual(A, Y):
-    E2 = torch.matrix_exp(2.0 * A)
-    delta = (E2 + torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)) @ Y - (E2 - torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-    return torch.linalg.matrix_norm(delta) / torch.linalg.matrix_norm(E2 - torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-
-def orth_residual(Z):
-    """‖Zᵀ Z − I‖_F"""
-    n = Z.shape[-1]
-    I = torch.eye(n, dtype=Z.dtype, device=Z.device)
-    return torch.linalg.matrix_norm(Z.transpose(-2, -1) @ Z - I)
-
-def skew_residual(G, Z):
-    """‖Gᵀ Z − Zᵀ G‖_F"""
-    return torch.linalg.matrix_norm(
-        G.transpose(-2, -1) @ Z - Z.transpose(-2, -1) @ G
-    )
-
 
 def zeropower_via_tanh_square(G, alpha=128.0):
     tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
@@ -115,12 +98,9 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0) -> Tensor:
     elif m == 4096 and n == 1024:
         # Split into 4 blocks of 1024x1024
         blocks = G.view(*G.shape[:-2], 4, 1024, 1024)  # (..., 4, 1024, 1024)
-        block0 = zeropower_via_tanh_square(blocks[..., 0, :, :], alpha)
-        block1 = zeropower_via_tanh_square(blocks[..., 1, :, :], alpha)
-        block2 = zeropower_via_tanh_square(blocks[..., 2, :, :], alpha)
-        block3 = zeropower_via_tanh_square(blocks[..., 3, :, :], alpha)
-        return torch.stack([block0, block1, block2, block3], dim=-3).view(*G.shape[:-2], 4096, 1024)
-    
+        singular_values = torch.linalg.svdvals(blocks[..., 0, :, :])
+        assert max(singular_values) < 1.0 + 1e-10, max(singular_values)
+        assert min(singular_values) > 1.0 - 1e-10, min(singular_values)
     else:
         raise ValueError(f"Unsupported matrix shape: {m}x{n}. Only 1024x1024, 1024x4096, and 4096x1024 are supported.")
 
