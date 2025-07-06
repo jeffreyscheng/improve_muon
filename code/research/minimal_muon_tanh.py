@@ -35,9 +35,8 @@ def matrix_tanh(A: torch.Tensor, *, tol: float = 0.5):
     return Y
 
 def zeropower_via_tanh_square(G, alpha=128.0):
-    G = G.to(torch.bfloat16)
     tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
-    return matrix_tanh(alpha * G) / tanh_alpha.to(G.dtype)
+    return (matrix_tanh(alpha * G) / tanh_alpha).to(torch.bfloat16)
 
 
 # def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
