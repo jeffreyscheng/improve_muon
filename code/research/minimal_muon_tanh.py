@@ -8,35 +8,67 @@ import math
 # -----------------------------------------------------------------------------
 # Muon optimizer with tanh-based orthogonalization
 
-def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
-    """
-    Computes the zeroth power / orthogonalization of a square matrix G using tanh approximation.
-    Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
-    """
-    assert G.ndim >= 2
-    assert G.size(-2) == G.size(-1), "Matrix must be square"
-    
-    # Use .mT (matrix transpose) like the original Newton-Schulz implementation
-    Gram = G.mT @ G                                 # one GEMM
 
-    # 2. Symmetric eigendecomposition
-    lam, V = torch.linalg.eigh(Gram.to(torch.float64))
+def matrix_tanh(A: torch.Tensor, *, tol: float = 0.5):
+    """
+    Backward-stable tanh(A) for a general square matrix A.
+    No gradients are recorded.
+    """
+    dtype, device = A.dtype, A.device
+    n = A.shape[-1]
+    I = torch.eye(n, dtype=dtype, device=device)
 
+    # 1. scaling
+    one_norm = torch.linalg.matrix_norm(A, ord=1)
+    s = int(torch.ceil(torch.log2(torch.clamp(one_norm / tol, min=1))).item())
+    B = A / (2.0 ** s)
+
+    # 2. core evaluation via expm
+    E = torch.matrix_exp(2.0 * B)
+    Y = torch.linalg.solve(E + I, E - I)     # (E - I)*(E + I)^{-1}
+
+    # 3. unsquaring
+    for _ in range(s):
+        Y2 = Y @ Y
+        Y = torch.linalg.solve(I + Y2, 2.0 * Y)
+
+    return Y
+
+def zeropower_via_tanh_square(G, alpha=128.0):
     G = G.to(torch.bfloat16)
-    lam = lam.to(torch.bfloat16)
-    V = V.to(torch.bfloat16)
+    tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
+    return matrix_tanh(alpha * G) / tanh_alpha.to(G.dtype)
 
-    # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
-    sqrtlam = torch.sqrt(lam.clamp_min(eps))
-    phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
-    phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
 
-    # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
-    Vphi = V * phi.unsqueeze(-1)    # scale columns (cheap, n² ops) - explicit broadcasting
-    Y    = G @ Vphi                 # GEMM 1
-    F    = Y @ V.mT                 # GEMM 2
+# def zeropower_via_tanh_square(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
+#     """
+#     Computes the zeroth power / orthogonalization of a square matrix G using tanh approximation.
+#     Uses the approximation sign(x) = tanh(alpha * x) / tanh(alpha).
+#     """
+#     assert G.ndim >= 2
+#     assert G.size(-2) == G.size(-1), "Matrix must be square"
+    
+#     # Use .mT (matrix transpose) like the original Newton-Schulz implementation
+#     Gram = G.mT @ G                                 # one GEMM
 
-    return F.to(dtype=G.dtype)
+#     # 2. Symmetric eigendecomposition
+#     lam, V = torch.linalg.eigh(Gram.to(torch.float64))
+
+#     G = G.to(torch.bfloat16)
+#     lam = lam.to(torch.bfloat16)
+#     V = V.to(torch.bfloat16)
+
+#     # 3. Scalar map  φ(λ) = tanh(alpha√λ)/(√λ tanh alpha)
+#     sqrtlam = torch.sqrt(lam.clamp_min(eps))
+#     phi = torch.tanh(alpha * sqrtlam) / (sqrtlam * math.tanh(alpha))
+#     phi = torch.where(lam < eps, torch.full_like(phi, alpha), phi)
+
+#     # 4. Assemble  V diag(φ) Vᵀ  without an extra GEMM
+#     Vphi = V * phi.unsqueeze(-1)    # scale columns (cheap, n² ops) - explicit broadcasting
+#     Y    = G @ Vphi                 # GEMM 1
+#     F    = Y @ V.mT                 # GEMM 2
+
+#     return F.to(dtype=G.dtype)
 
 def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0, eps: float = 1e-7) -> Tensor:
     """
