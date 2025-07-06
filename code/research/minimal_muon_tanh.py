@@ -128,7 +128,7 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
         v = v.to(torch.float32)
         grad = grad[..., :1024, :1024]
         v = v[..., :1024, :1024]
-        singular_values = torch.linalg.svdvals(v[..., 0, :, :])
+        singular_values = torch.linalg.svdvals(v)
         assert max(singular_values) < 1.0 + 1e-10, max(singular_values)
         assert min(singular_values) > 1.0 - 1e-10, min(singular_values)
         print0(f"max singular value {max(singular_values)} min singular value {min(singular_values)}")
