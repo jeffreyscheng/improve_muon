@@ -1,9 +1,12 @@
 # =============================================================================
-# ZEROPOWER BACKEND SELECTION - CHANGE THIS LINE TO SWITCH METHODS
+# ZEROPOWER BACKEND SELECTION - CAN BE OVERRIDDEN BY CLI
 # =============================================================================
-ZEROPOWER_METHOD = "svd_polar"  # Options: "newton_schulz", "svd_polar", "tanh_element", "tanh_matrix"
+DEFAULT_ZEROPOWER_METHOD = "newton_schulz"  # Options: "newton_schulz", "svd_polar", "classic_newton_schulz", "tanh_matrix"
+DEFAULT_ZEROPOWER_HYPERPARAMS = {}
 
 import sys
+import argparse
+import json
 with open(sys.argv[0]) as f:
     code = f.read()
 
@@ -82,21 +85,34 @@ def zeropower_via_svd_polar(G: Tensor) -> Tensor:
         # Fallback to Newton-Schulz if SVD fails
         return zeropower_via_newtonschulz5(G)
 
-def zeropower_via_tanh_element(G: Tensor, alpha: float = 100.0) -> Tensor:
+def zeropower_via_classic_newton_schulz(G: Tensor, num_iters: int = 15) -> Tensor:
     """
-    Element-wise tanh approximation: tanh(alpha * G) / tanh(alpha).
+    Classic Newton-Schulz iteration using f(x) = 1.5x - 0.5x^3.
     """
-    tanh_alpha = torch.tanh(torch.tensor(alpha, dtype=G.dtype, device=G.device))
-    return torch.tanh(alpha * G) / tanh_alpha
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    
+    # Classic Newton-Schulz iteration: f(x) = 1.5x - 0.5x^3
+    for _ in range(num_iters):
+        X = 1.5 * X - 0.5 * X @ X @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
 
 def zeropower_via_tanh_matrix(G: Tensor, alpha: float = 10.0) -> Tensor:
     """
     Matrix tanh approximation (simplified version to avoid hangs).
-    Falls back to element-wise for safety.
+    Falls back to Newton-Schulz for safety.
     """
-    # For now, use element-wise tanh to avoid the hanging issues we discovered
+    # For now, fallback to Newton-Schulz to avoid the hanging issues we discovered
     # This can be improved with a proper safe matrix tanh implementation
-    return zeropower_via_tanh_element(G, alpha)
+    return zeropower_via_newtonschulz5(G)
 
 # =============================================================================
 # ZEROPOWER BACKEND REGISTRY AND SELECTOR
@@ -105,47 +121,60 @@ def zeropower_via_tanh_matrix(G: Tensor, alpha: float = 10.0) -> Tensor:
 ZEROPOWER_BACKENDS = {
     "newton_schulz": zeropower_via_newtonschulz5,
     "svd_polar": zeropower_via_svd_polar,
-    "tanh_element": zeropower_via_tanh_element,
+    "classic_newton_schulz": zeropower_via_classic_newton_schulz,
     "tanh_matrix": zeropower_via_tanh_matrix,
 }
 
-def get_zeropower_function():
-    """Get the currently selected zeropower function."""
-    if ZEROPOWER_METHOD not in ZEROPOWER_BACKENDS:
+def get_zeropower_function(method: str, hyperparams: dict):
+    """Get the zeropower function with hyperparameters applied."""
+    if method not in ZEROPOWER_BACKENDS:
         available = ", ".join(ZEROPOWER_BACKENDS.keys())
-        raise ValueError(f"Unknown zeropower method '{ZEROPOWER_METHOD}'. Available: {available}")
-    return ZEROPOWER_BACKENDS[ZEROPOWER_METHOD]
+        raise ValueError(f"Unknown zeropower method '{method}'. Available: {available}")
+    
+    base_func = ZEROPOWER_BACKENDS[method]
+    
+    # Create a wrapper that applies hyperparameters
+    def zeropower_with_hyperparams(G: Tensor) -> Tensor:
+        return base_func(G, **hyperparams)
+    
+    return zeropower_with_hyperparams
 
-# Set the global zeropower function
-zeropower_func = get_zeropower_function()
+# Global variables to be set by CLI parsing
+ZEROPOWER_METHOD = DEFAULT_ZEROPOWER_METHOD
+ZEROPOWER_HYPERPARAMS = DEFAULT_ZEROPOWER_HYPERPARAMS
+zeropower_func = None  # Will be set after CLI parsing
 
 # =============================================================================
 # CONFIGURABLE MUON OPTIMIZER
 # =============================================================================
 
-@torch.compile
-def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
-    assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
-    grad = grad.float()
-    momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
-    v = zeropower_func(momentum * momentum_buffer + (1 - momentum) * grad)
+def make_update_function(zeropower_function):
+    """Create an update function with a specific zeropower function."""
+    @torch.compile
+    def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor, grad: Tensor, momentum: Tensor, eff_lr: Tensor, eff_weight_decay: Tensor):
+        assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
+        grad = grad.float()
+        momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
+        v = zeropower_function(momentum * momentum_buffer + (1 - momentum) * grad)
 
-    acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
-    acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
-    acc_m_u32.view(torch.float32).add_(other=v, alpha=-eff_lr)
-    acc_bf16_view_u16.copy_((acc_m_u32 >> 16).to(torch.uint16))
-    mantissa.copy_(acc_m_u32.to(torch.uint16))
+        acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
+        acc_m_u32.view(torch.float32).add_(other=v, alpha=-eff_lr)
+        acc_bf16_view_u16.copy_((acc_m_u32 >> 16).to(torch.uint16))
+        mantissa.copy_(acc_m_u32.to(torch.uint16))
+    return update
 
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by configurable zeropower method.
     
-    This version allows switching between different orthogonalization backends
-    by changing the ZEROPOWER_METHOD variable at the top of this file.
+    This version accepts a zeropower function in the constructor, allowing
+    different optimizers to use different orthogonalization methods.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
+    def __init__(self, params, zeropower_function, lr=0.02, weight_decay=0.01, momentum=0.95, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
+        self.update_func = make_update_function(zeropower_function)
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         super().__init__(params, defaults)
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
@@ -164,7 +193,7 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
                         state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
-                    update(
+                    self.update_func(
                         p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
                         p.grad, momentum,
                         eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
@@ -453,16 +482,18 @@ def setup_logging(run_id, master_process):
     
     return print0, run_id_full, logfile
 
-def log_system_info(print0, code):
+def log_system_info(print0, code, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams):
     print0(code)
     print0("="*100)
     print0(f"Running Python {sys.version}")
     print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-    print0(f"ZEROPOWER METHOD: {ZEROPOWER_METHOD}")
+    print0(f"ZEROPOWER METHOD: {ZEROPOWER_METHOD} (hyperparams: {ZEROPOWER_HYPERPARAMS})")
+    print0(f"MLP METHOD: {mlp_method} (hyperparams: {mlp_hyperparams})")
+    print0(f"ATTENTION METHOD: {attn_method} (hyperparams: {attn_hyperparams})")
     print0(nvidia_smi())
     print0("="*100)
 
-def create_model_and_optimizers(args, rank, world_size):
+def create_model_and_optimizers(args, rank, world_size, zeropower_func_mlp, zeropower_func_attn):
     model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=16, num_heads=8, model_dim=1024,
                            max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
     for m in model.modules():
@@ -471,10 +502,24 @@ def create_model_and_optimizers(args, rank, world_size):
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
 
+    # Separate MLP and attention parameters
+    mlp_matrix_params = []
+    attn_matrix_params = []
+    
+    for block in model.blocks:
+        # MLP parameters
+        mlp_matrix_params.extend([p for p in block.mlp.parameters() if p.ndim >= 2])
+        # Attention parameters
+        if block.attn is not None:
+            attn_matrix_params.extend([p for p in block.attn.parameters() if p.ndim >= 2])
+    
+    # Sort by size for efficiency
+    mlp_matrix_params = sorted(mlp_matrix_params, key=lambda x: x.size(), reverse=True)
+    attn_matrix_params = sorted(attn_matrix_params, key=lambda x: x.size(), reverse=True)
+
     embed_params = [*model.embed.parameters(), *model.value_embeds.parameters()]
     scalar_params = [model.scalars]
     head_params: list[nn.Parameter] = [model.lm_head_w]
-    hidden_matrix_params = sorted((p for p in model.blocks.parameters() if p.ndim >= 2), key=lambda x: x.size(), reverse=True)
 
     adam_param_groups = [
         dict(params=head_params, lr=1/320), 
@@ -482,8 +527,9 @@ def create_model_and_optimizers(args, rank, world_size):
         dict(params=scalar_params, lr=0.015)
     ]
     optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
-    optimizer2 = Muon(hidden_matrix_params, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
-    optimizers = [optimizer1, optimizer2]
+    optimizer2 = Muon(mlp_matrix_params, zeropower_func_mlp, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+    optimizer3 = Muon(attn_matrix_params, zeropower_func_attn, lr=0.025, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2, optimizer3]
 
     opt2params = {opt: [p for group in opt.param_groups for p in group["params"]] for opt in optimizers}
     for opt in optimizers:
@@ -509,16 +555,67 @@ def warmup_kernels(model, optimizers, args):
     del initial_state
 
 # =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+
+def parse_args():
+    """Parse command line arguments for zeropower backend selection."""
+    parser = argparse.ArgumentParser(description='Zeropower Testing with Flexible Backends')
+    parser.add_argument('--zeropower-method', default=DEFAULT_ZEROPOWER_METHOD, 
+                        choices=list(ZEROPOWER_BACKENDS.keys()),
+                        help='Zeropower backend method')
+    parser.add_argument('--zeropower-hyperparams', default='{}', type=str,
+                        help='JSON string of hyperparameters for zeropower method')
+    parser.add_argument('--mlp-method', default=None,
+                        choices=list(ZEROPOWER_BACKENDS.keys()),
+                        help='Zeropower method for MLP layers (defaults to main method)')
+    parser.add_argument('--mlp-hyperparams', default='{}', type=str,
+                        help='JSON string of hyperparameters for MLP zeropower method')
+    parser.add_argument('--attn-method', default=None,
+                        choices=list(ZEROPOWER_BACKENDS.keys()),
+                        help='Zeropower method for attention layers (defaults to main method)')
+    parser.add_argument('--attn-hyperparams', default='{}', type=str,
+                        help='JSON string of hyperparameters for attention zeropower method')
+    
+    args = parser.parse_args()
+    
+    # Parse hyperparameters
+    try:
+        main_hyperparams = json.loads(args.zeropower_hyperparams)
+        mlp_hyperparams = json.loads(args.mlp_hyperparams) 
+        attn_hyperparams = json.loads(args.attn_hyperparams)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in hyperparameters: {e}")
+    
+    # Set defaults for MLP and attention if not specified
+    mlp_method = args.mlp_method or args.zeropower_method
+    attn_method = args.attn_method or args.zeropower_method
+    
+    # Use main hyperparams as base, then override with layer-specific ones
+    mlp_hyperparams = {**main_hyperparams, **mlp_hyperparams}
+    attn_hyperparams = {**main_hyperparams, **attn_hyperparams}
+    
+    return args.zeropower_method, main_hyperparams, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams
+
+# =============================================================================
 # MAIN TRAINING LOOP
 # =============================================================================
+
+# Parse CLI arguments
+ZEROPOWER_METHOD, ZEROPOWER_HYPERPARAMS, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams = parse_args()
+
+# Create zeropower functions
+zeropower_func = get_zeropower_function(ZEROPOWER_METHOD, ZEROPOWER_HYPERPARAMS)
+zeropower_func_mlp = get_zeropower_function(mlp_method, mlp_hyperparams)
+zeropower_func_attn = get_zeropower_function(attn_method, attn_hyperparams)
 
 # Setup
 run_id, rank, world_size, device, master_process = setup_distributed_training()
 print0, run_id_full, logfile = setup_logging(run_id, master_process)
-log_system_info(print0, code)
+log_system_info(print0, code, mlp_method, mlp_hyperparams, attn_method, attn_hyperparams)
 
 args = Hyperparameters()
-model, optimizers, opt2params = create_model_and_optimizers(args, rank, world_size)
+model, optimizers, opt2params = create_model_and_optimizers(args, rank, world_size, zeropower_func_mlp, zeropower_func_attn)
 model = torch.compile(model, dynamic=False)
 warmup_kernels(model, optimizers, args)
 
@@ -568,10 +665,12 @@ for step in range(args.num_iterations + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step, args.num_iterations, args.cooldown_frac)
-    if len(optimizers) > 1:  # Handle Muon momentum warmup
-        for group in optimizers[1].param_groups:
-            frac = min(step / 300, 1)
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    # Handle Muon momentum warmup for MLP and attention optimizers
+    for opt_idx in [1, 2]:  # optimizer1 is AdamW, optimizer2 is MLP Muon, optimizer3 is Attention Muon
+        if opt_idx < len(optimizers):
+            for group in optimizers[opt_idx].param_groups:
+                frac = min(step / 300, 1)
+                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
         opt.step()
