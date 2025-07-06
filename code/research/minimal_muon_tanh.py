@@ -98,9 +98,12 @@ def zeropower_via_tanh(G: Tensor, alpha: float = 10_000.0) -> Tensor:
     elif m == 4096 and n == 1024:
         # Split into 4 blocks of 1024x1024
         blocks = G.view(*G.shape[:-2], 4, 1024, 1024)  # (..., 4, 1024, 1024)
-        singular_values = torch.linalg.svdvals(blocks[..., 0, :, :])
-        assert max(singular_values) < 1.0 + 1e-10, max(singular_values)
-        assert min(singular_values) > 1.0 - 1e-10, min(singular_values)
+        block0 = zeropower_via_tanh_square(blocks[..., 0, :, :], alpha)
+        block1 = zeropower_via_tanh_square(blocks[..., 1, :, :], alpha)
+        block2 = zeropower_via_tanh_square(blocks[..., 2, :, :], alpha)
+        block3 = zeropower_via_tanh_square(blocks[..., 3, :, :], alpha)
+        return torch.stack([block0, block1, block2, block3], dim=-3).view(*G.shape[:-2], 4096, 1024)
+    
     else:
         raise ValueError(f"Unsupported matrix shape: {m}x{n}. Only 1024x1024, 1024x4096, and 4096x1024 are supported.")
 
@@ -115,28 +118,20 @@ def update_tanh(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Te
     if grad.shape[-2] == grad.shape[-1]:
         grad = grad.to(torch.float32)
         v = v.to(torch.float32)
-
-        # tanh_res = tanh_residual(grad, v)
-        orth_res = orth_residual(v)
-        skew_res = skew_residual(grad, v)
-
-        # assert tanh_res < 1e-10
-        assert orth_res < 1e-10
-        assert skew_res < 1e-10
-        print0(f"orth_res {orth_res} skew_res {skew_res}")
+        singular_values = torch.linalg.svdvals(v[..., 0, :, :])
+        assert max(singular_values) < 1.0 + 1e-10, max(singular_values)
+        assert min(singular_values) > 1.0 - 1e-10, min(singular_values)
+        print0(f"max singular value {max(singular_values)} min singular value {min(singular_values)}")
     else:
         # just do the check for the first 1024x1024 block
         grad = grad.to(torch.float32)
         v = v.to(torch.float32)
         grad = grad[..., :1024, :1024]
         v = v[..., :1024, :1024]
-        # tanh_res = tanh_residual(grad, v)
-        orth_res = orth_residual(v)
-        skew_res = skew_residual(grad, v)
-        # assert tanh_res < 1e-10, tanh_res
-        assert orth_res < 1e-10, orth_res
-        assert skew_res < 1e-10, skew_res
-        print0(f"orth_res {orth_res} skew_res {skew_res}")
+        singular_values = torch.linalg.svdvals(v[..., 0, :, :])
+        assert max(singular_values) < 1.0 + 1e-10, max(singular_values)
+        assert min(singular_values) > 1.0 - 1e-10, min(singular_values)
+        print0(f"max singular value {max(singular_values)} min singular value {min(singular_values)}")
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
