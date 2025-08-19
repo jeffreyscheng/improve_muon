@@ -1,0 +1,99 @@
+# minimal_medium.py (after refactoring) - 12 crispy functional lines
+from empirical.research.training.training_core import *
+from empirical.research.training.zeropower import get_zeropower_function
+from empirical.research.analysis.online_logging import svd_logging, serialize_model_checkpoint
+
+args = Hyperparameters()
+loggers = [svd_logging, serialize_model_checkpoint]
+model, optimizers, train_loader = create_gpt_with_muon(
+    args=args,
+    zeropower_fn=get_zeropower_function("newton_schulz", {})
+)
+
+for step, (inputs, targets) in enumerate(train_loader):
+    if should_validate(step, args): validate_and_log(model, step, args, optimizers)
+    if step >= args.num_iterations: break
+    
+    loss = train_step(model, inputs, targets, step, args)
+    optimize_step(model, optimizers, step, args)
+    if should_log(step): run_loggers(loggers, model, optimizers, step)
+
+# Final cleanup - access the global print function
+from empirical.research.training.training_core import _global_print0
+_global_print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+import torch.distributed as dist
+dist.destroy_process_group()
+====================================================================================================
+Running Python 3.12.7 (main, Aug  9 2025, 06:38:32) [GCC 13.2.0]
+Running PyTorch 2.7.0.dev20250208+cu126 compiled for CUDA 12.6
+Sat Aug  9 07:55:10 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.133.20             Driver Version: 570.133.20     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:03:00.0 Off |                  Off |
+| N/A   35C    P0            134W /  700W |    7746MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:04:00.0 Off |                  Off |
+| N/A   31C    P0            119W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:05:00.0 Off |                  Off |
+| N/A   33C    P0            122W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:06:00.0 Off |                  Off |
+| N/A   30C    P0            118W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:07:00.0 Off |                  Off |
+| N/A   34C    P0            123W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:08:00.0 Off |                  Off |
+| N/A   31C    P0            127W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:09:00.0 Off |                  Off |
+| N/A   34C    P0            128W /  700W |    3455MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                  Off |
+| N/A   30C    P0            119W /  700W |    3215MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A              73      C   /usr/local/bin/python                  3398MiB |
+|    0   N/A  N/A              74      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              75      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              76      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              77      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              78      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              79      C   /usr/local/bin/python                   614MiB |
+|    0   N/A  N/A              80      C   /usr/local/bin/python                   614MiB |
+|    1   N/A  N/A              74      C   /usr/local/bin/python                  3446MiB |
+|    2   N/A  N/A              75      C   /usr/local/bin/python                  3446MiB |
+|    3   N/A  N/A              76      C   /usr/local/bin/python                  3446MiB |
+|    4   N/A  N/A              77      C   /usr/local/bin/python                  3446MiB |
+|    5   N/A  N/A              78      C   /usr/local/bin/python                  3446MiB |
+|    6   N/A  N/A              79      C   /usr/local/bin/python                  3446MiB |
+|    7   N/A  N/A              80      C   /usr/local/bin/python                  3206MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+inductor_output_code: /tmp/torchinductor_root/xl/cxl77erih7cqxdycdvejkf4mp6daucqwmw657vryvzzucc7hsfm5.py
+inductor_output_code: /tmp/torchinductor_root/p2/cp2czdrsakea5pfhcu3uawayeipf3lw5seylw3ff4yuqhbpzlp2s.py
+inductor_output_code: /tmp/torchinductor_root/q3/cq3lmmdr5unq2wermlndq5z7moojfdbv4jfbewplbbpgnegwfbjl.py
+inductor_output_code: /tmp/torchinductor_root/ta/ctabhoqlrppgbmkgmowzhvam747axe4p2tck7tpspaurnuk5qg4g.py
+inductor_output_code: /tmp/torchinductor_root/5e/c5edvoruxt4yhflabbilqyw6xybevddq6otmrqltcq42mmbyndy6.py
