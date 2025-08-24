@@ -27,15 +27,19 @@ def get_weight_matrix_iterator(model, only_hidden: bool = True) -> GPTLayerPrope
         if len(parts) >= 2 and parts[0] == "blocks":
             layer_num = int(parts[1])
             if "attn" in name:
-                if "c_attn" in name:
-                    # For attention, we need to determine Q/K/V from the parameter itself
+                if "qkvo_w" in name:
+                    # For attention, we need to determine Q/K/V/O from the parameter itself
                     return "Attention", layer_num  # Will be split later
-                elif "c_proj" in name:
+                elif "c_proj" in name:  # Keep for backward compatibility
                     return "Attention O", layer_num
             elif "mlp" in name:
-                if "c_fc" in name:
+                if "fc_w" in name:
                     return "MLP Input", layer_num
-                elif "c_proj" in name:
+                elif "proj_w" in name:
+                    return "MLP Output", layer_num
+                elif "c_fc" in name:  # Keep for backward compatibility
+                    return "MLP Input", layer_num
+                elif "c_proj" in name:  # Keep for backward compatibility
                     return "MLP Output", layer_num
         return "Unknown", -1
     
@@ -47,8 +51,19 @@ def get_weight_matrix_iterator(model, only_hidden: bool = True) -> GPTLayerPrope
                 "embed" not in name):
                 param_type, layer_num = extract_layer_info(name)
                 if param_type != "Unknown":
-                    if param_type == "Attention" and "c_attn" in name:
-                        # Split c_attn into Q, K, V
+                    if param_type == "Attention" and "qkvo_w" in name:
+                        # Split qkvo_w into Q, K, V, O (shape: [4, 1024, 1024])
+                        weight = param.data  # shape: [4, d_model, d_model]
+                        q_weight = weight[0]  # Q: [d_model, d_model]
+                        k_weight = weight[1]  # K: [d_model, d_model] 
+                        v_weight = weight[2]  # V: [d_model, d_model]
+                        o_weight = weight[3]  # O: [d_model, d_model]
+                        result[("Attention Q", layer_num)] = q_weight
+                        result[("Attention K", layer_num)] = k_weight
+                        result[("Attention V", layer_num)] = v_weight
+                        result[("Attention O", layer_num)] = o_weight
+                    elif param_type == "Attention" and "c_attn" in name:
+                        # Keep backward compatibility for old format
                         weight = param.data
                         d_model = weight.shape[1]
                         q_weight = weight[:d_model, :]
@@ -63,8 +78,19 @@ def get_weight_matrix_iterator(model, only_hidden: bool = True) -> GPTLayerPrope
         for name, param in model.named_parameters():
             param_type, layer_num = extract_layer_info(name)
             if param_type != "Unknown":
-                if param_type == "Attention" and "c_attn" in name:
-                    # Split c_attn into Q, K, V
+                if param_type == "Attention" and "qkvo_w" in name:
+                    # Split qkvo_w into Q, K, V, O (shape: [4, 1024, 1024])
+                    weight = param.data  # shape: [4, d_model, d_model]
+                    q_weight = weight[0]  # Q: [d_model, d_model]
+                    k_weight = weight[1]  # K: [d_model, d_model] 
+                    v_weight = weight[2]  # V: [d_model, d_model]
+                    o_weight = weight[3]  # O: [d_model, d_model]
+                    result[("Attention Q", layer_num)] = q_weight
+                    result[("Attention K", layer_num)] = k_weight
+                    result[("Attention V", layer_num)] = v_weight
+                    result[("Attention O", layer_num)] = o_weight
+                elif param_type == "Attention" and "c_attn" in name:
+                    # Keep backward compatibility for old format
                     weight = param.data
                     d_model = weight.shape[1]
                     q_weight = weight[:d_model, :]
