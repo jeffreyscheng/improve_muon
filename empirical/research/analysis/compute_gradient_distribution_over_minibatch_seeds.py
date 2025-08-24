@@ -4,7 +4,10 @@ Compute gradient distributions over multiple minibatch SGD seeds for noise model
 This script performs the expensive computation once per training run, saving results to CSV files.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 compute_gradient_distribution_over_minibatch_seeds.py checkpoint_run_name
+    torchrun --standalone --nproc_per_node=8 compute_gradient_distribution_over_minibatch_seeds.py <run_id> [--testing] [--force]
+    
+Example:
+    torchrun --standalone --nproc_per_node=8 compute_gradient_distribution_over_minibatch_seeds.py 000_2db40055-63ed-48dd-bb98-8cccdb78a501
 """
 
 import os
@@ -25,9 +28,44 @@ import numpy as np
 import pandas as pd
 
 # Import all dependencies at top level
-from empirical.research.training.training_core import setup_distributed_training, get_window_size_blocks, Hyperparameters
+from empirical.research.training.training_core import setup_distributed_training, get_window_size_blocks, Hyperparameters, warmup_kernels
 from empirical.research.analysis.offline_logging import deserialize_model_checkpoint, compute_singular_values, compute_stable_rank
 from empirical.research.analysis.map import get_weight_matrix_iterator, get_research_log_path
+
+
+def precompile_svd_kernels(device: torch.device, rank: int):
+    """Precompile SVD kernels for all expected tensor shapes to avoid compilation overhead during analysis."""
+    if rank == 0:
+        print("Precompiling SVD kernels for expected tensor shapes...")
+    
+    # Expected shapes for GPT(vocab_size, 16, 8, 1024, context_len):
+    # - Attention Q/K/V/O: (1024, 1024) 
+    # - MLP Input: (4096, 1024)
+    # - MLP Output: (1024, 4096)
+    shapes = [(1024, 1024), (4096, 1024), (1024, 4096)]
+    
+    start_time = time.time()
+    for i, shape in enumerate(shapes):
+        if rank == 0:
+            print(f"  Compiling SVD kernel {i+1}/{len(shapes)}: {shape}")
+        
+        # Create dummy tensor and trigger compilation
+        dummy = torch.randn(shape, device=device, dtype=torch.float32, requires_grad=False)
+        with torch.no_grad():
+            _, _, _ = torch.linalg.svd(dummy, full_matrices=False)
+        
+        # Clean up
+        del dummy
+        torch.cuda.empty_cache()
+    
+    # Ensure all ranks complete compilation before proceeding
+    if dist.is_initialized():
+        dist.barrier()
+    
+    if rank == 0:
+        compile_time = time.time() - start_time
+        print(f"SVD kernel precompilation completed in {compile_time:.1f}s")
+        print("All ranks synchronized - ready for analysis")
 
 
 def extract_step_from_checkpoint_path(checkpoint_path: Path) -> int:
@@ -64,6 +102,10 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     
     # Compile model like training does
     model = torch.compile(model, dynamic=False)
+    
+    # Warmup kernels like training does to coordinate compilation across ranks
+    args = Hyperparameters()
+    warmup_kernels(model, [], args)  # No optimizers needed for analysis
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
@@ -368,11 +410,9 @@ def save_step_to_csvs(step: int, step_data: dict, sv_output_dir: Path, sr_output
     pd.DataFrame(sr_cache_data).to_csv(sr_output_dir / f"step_{step:06d}.csv", index=False)
 
 
-def find_all_checkpoints() -> list[tuple[int, str]]:
+def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     """Find all checkpoint files and return sorted list of (step, filepath) tuples."""
     checkpoints_dir = Path("research_logs/checkpoints")
-    # Filter for the specific successful sharp cutoff run
-    run_id = "000_e37b459d-3a35-48d2-b102-a33ac52584c6"
     checkpoint_pattern = str(checkpoints_dir / run_id / "model_step_*.pt")
     checkpoint_files = glob.glob(checkpoint_pattern)
     
@@ -401,13 +441,22 @@ def main():
     training_core._global_print0 = lambda s, console=False: print(s) if rank == 0 else None
     
     # Parse arguments
-    run_name = sys.argv[1] if len(sys.argv) >= 2 else "gradient_noise_run"
-    testing = len(sys.argv) >= 3 and sys.argv[2] == "--testing"
+    if len(sys.argv) < 2:
+        print("Usage: python compute_gradient_distribution_over_minibatch_seeds.py <run_id> [--testing] [--force]")
+        print("Example: python compute_gradient_distribution_over_minibatch_seeds.py 000_2db40055-63ed-48dd-bb98-8cccdb78a501")
+        sys.exit(1)
+    
+    run_id = sys.argv[1]
+    run_name = run_id  # Use run_id as run_name for output directories
+    testing = "--testing" in sys.argv
     force_recompute = "--force" in sys.argv
     num_minibatches = 8
     
     # Find all checkpoints
-    selected_checkpoints = find_all_checkpoints()
+    selected_checkpoints = find_all_checkpoints(run_id)
+    
+    # Precompile SVD kernels to avoid compilation overhead during analysis
+    precompile_svd_kernels(device, rank)
     
     # NOTE: Checkpoint 0 often has NaN/None gradients that break computation
     # Starting from checkpoint 1 avoids this issue.
