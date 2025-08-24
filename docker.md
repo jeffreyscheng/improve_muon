@@ -289,3 +289,32 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=6710886
 - Training runs create cached kernels
 - Analysis scripts reuse same kernels
 - Eliminates redundant FlexAttention compilation
+
+## Critical for Distributed Analysis
+
+**Problem**: Running analysis scripts on the host (without Docker cache mount) causes compilation explosion:
+- Each of 8 ranks tries to compile the same kernels simultaneously
+- Creates 200+ torch inductor compile workers
+- Leads to distributed deadlocks and process explosion
+- Makes analysis scripts unusable
+
+**Solution**: Always use Docker with persistent cache mount for analysis:
+```bash
+# WRONG - runs on host, causes compilation chaos
+torchrun --standalone --nproc_per_node=8 analysis_script.py
+
+# CORRECT - uses persistent cache, coordinates compilation properly
+docker run --gpus all --rm \
+  -v $(pwd):/workspace \
+  -v $(pwd)/torch_compile_cache:/tmp/torchinductor_root \
+  -w /workspace \
+  -e PYTHONPATH=/workspace \
+  nanogpt-archived \
+  torchrun --standalone --nproc_per_node=8 analysis_script.py
+```
+
+**Why this works:**
+- All 8 ranks share the same compilation cache directory
+- Cached kernels from training are reused immediately
+- No redundant compilation across ranks
+- Proper file system coordination prevents race conditions
