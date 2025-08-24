@@ -26,7 +26,7 @@ import pandas as pd
 
 # Import all dependencies at top level
 from empirical.research.training.training_core import setup_distributed_training, get_window_size_blocks, Hyperparameters
-from empirical.research.analysis.offline_logging import deserialize_model_checkpoint, split_qkv_weight, compute_singular_values, compute_stable_rank, categorize_parameter
+from empirical.research.analysis.offline_logging import deserialize_model_checkpoint, compute_singular_values, compute_stable_rank
 from empirical.research.analysis.map import get_weight_matrix_iterator, get_research_log_path
 
 
@@ -83,15 +83,17 @@ def extract_model_analysis_distributed(model, use_gradients: bool = True, accumu
     world_size = dist.get_world_size()
     
     # Get all parameters (model is replicated on all ranks like training)
-    all_params = list(get_weight_matrix_iterator(model, only_hidden=True))
+    layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
+    all_params = list(layer_properties.items())
     
     # Distribute SVD computation work across ranks, not the parameters themselves
     all_param_splits = []
-    for param_name, param in all_params:
+    for (param_type, layer_num), param in all_params:
         if use_gradients:
+            param_key = (param_type, layer_num)
             if accumulated_gradients is not None:
                 # Use accumulated gradients if provided
-                tensor = accumulated_gradients.get(param_name, None)
+                tensor = accumulated_gradients.get(param_key, None)
                 if tensor is None:
                     continue
             else:
@@ -102,9 +104,8 @@ def extract_model_analysis_distributed(model, use_gradients: bool = True, accumu
         else:
             tensor = param
         
-        split_tensors = split_qkv_weight(param_name, tensor)
-        for split_name, split_tensor in split_tensors.items():
-            all_param_splits.append((split_name, split_tensor))
+        # No need to split - already handled by get_weight_matrix_iterator
+        all_param_splits.append(((param_type, layer_num), tensor))
     
     # Distribute SVD work across ranks
     splits_per_rank = len(all_param_splits) // world_size
@@ -117,14 +118,14 @@ def extract_model_analysis_distributed(model, use_gradients: bool = True, accumu
     
     # Process my assigned SVD computations
     local_results = {}
-    for split_name, split_tensor in my_splits:
+    for (param_type, layer_num), tensor in my_splits:
         # Use GPU SVD instead of CPU numpy
-        tensor_f32 = split_tensor.detach().to(torch.float32)
+        tensor_f32 = tensor.detach().to(torch.float32)
         try:
             _, s, _ = torch.linalg.svd(tensor_f32, full_matrices=False)
             sv = s.cpu().numpy()
             stable_rank = compute_stable_rank(sv)
-            local_results[split_name] = {'sv': sv, 'stable_rank': stable_rank}
+            local_results[(param_type, layer_num)] = {'sv': sv, 'stable_rank': stable_rank}
         except Exception:
             pass
     
@@ -158,7 +159,7 @@ def compute_c_with_mean_truth_distributed(my_gradient_dict, rank, world_size):
     """
     c_estimates = {}
     
-    for param_name, my_gradient in my_gradient_dict.items():
+    for param_key, my_gradient in my_gradient_dict.items():
         try:
             # All-reduce to compute mean gradient across ranks
             mean_gradient = my_gradient.clone()
@@ -177,61 +178,29 @@ def compute_c_with_mean_truth_distributed(my_gradient_dict, rank, world_size):
             cv = torch.abs(torch.einsum('nr,nr->r', V, V0))  # (r,)
             c_estimate = cu * cv  # (r,)
             
-            c_estimates[param_name] = c_estimate.cpu().numpy()
+            c_estimates[param_key] = c_estimate.cpu().numpy()
             
         except Exception as e:
-            print(f"Error computing C for {param_name}: {e}")
+            print(f"Error computing C for {param_key}: {e}")
             r = min(my_gradient.shape)
-            c_estimates[param_name] = np.zeros(r)
+            c_estimates[param_key] = np.zeros(r)
     
     return c_estimates
-
-
-
-def compute_c_estimates_for_param(gradient_matrices, param_name):
-    """Compute the actual C estimates for a parameter using the provided functions."""
-    try:
-        # Stack gradients: (B, m, n) 
-        G = np.stack(gradient_matrices, axis=0)
-        
-        # Use the exact functions provided
-        c_pairwise = estimate_c_pairwise_signsync(G)
-        c_mean_truth_per_batch = estimate_c_with_mean_truth(G)  # Shape: (B, r)
-        c_jackknife_per_batch = estimate_c_jackknife(G)        # Shape: (B, r)
-        
-        # Average across batches for the per-batch estimators
-        c_mean_truth = np.mean(c_mean_truth_per_batch, axis=0)
-        c_jackknife = np.mean(c_jackknife_per_batch, axis=0)
-        
-        return {
-            'c_pairwise_signsync': c_pairwise,
-            'c_with_mean_truth': c_mean_truth, 
-            'c_jackknife': c_jackknife
-        }
-    except Exception as e:
-        print(f"Error computing C estimates for {param_name}: {e}")
-        # Return zeros of appropriate length
-        min_dim = min(G.shape[1], G.shape[2]) if len(gradient_matrices) > 0 else 10
-        return {
-            'c_pairwise_signsync': np.zeros(min_dim),
-            'c_with_mean_truth': np.zeros(min_dim),
-            'c_jackknife': np.zeros(min_dim)
-        }
-
 
 def aggregate_singular_values_and_stable_ranks(all_gradient_results, weight_results, c_estimates_dict=None):
     """Aggregate singular values and stable rank statistics across minibatches."""
     param_data = {}
     
-    all_param_names = set()
+    all_param_keys = set()
     for mb_grads in all_gradient_results:
-        all_param_names.update(mb_grads.keys())
+        all_param_keys.update(mb_grads.keys())
     
-    for param_name in all_param_names:
-        param_type, layer_num = categorize_parameter(param_name)
+    for param_key in all_param_keys:
+        # param_key is already a tuple (param_type, layer_num)
+        param_type, layer_num = param_key
         
-        sv_arrays = [mb_grads[param_name]['sv'] for mb_grads in all_gradient_results if param_name in mb_grads]
-        stable_ranks = [mb_grads[param_name]['stable_rank'] for mb_grads in all_gradient_results if param_name in mb_grads]
+        sv_arrays = [mb_grads[param_key]['sv'] for mb_grads in all_gradient_results if param_key in mb_grads]
+        stable_ranks = [mb_grads[param_key]['stable_rank'] for mb_grads in all_gradient_results if param_key in mb_grads]
         
         min_len = min(len(sv) for sv in sv_arrays)
         aligned_svs = [sv[:min_len] for sv in sv_arrays]
@@ -239,17 +208,16 @@ def aggregate_singular_values_and_stable_ranks(all_gradient_results, weight_resu
         
         key = (param_type, layer_num)
         param_data[key] = {
-            'means': np.mean(aligned_svs_array, axis=0),
-            'stds': np.std(aligned_svs_array, axis=0),
-            'weight_stable_rank': weight_results[param_name]['stable_rank'],
+            'gradient_singular_values': aligned_svs_array,  # 8x1024 ndarray of all gradient SVs
+            'weight_stable_rank': weight_results[param_key]['stable_rank'],
             'gradient_stable_rank_mean': np.mean(stable_ranks),
             'gradient_stable_rank_std': np.std(stable_ranks)
         }
         
         # Add C estimates if provided
-        if c_estimates_dict and param_name in c_estimates_dict:
+        if c_estimates_dict and param_key in c_estimates_dict:
             # Only c_with_mean_truth now
-            param_data[key]['c_with_mean_truth'] = c_estimates_dict[param_name]
+            param_data[key]['c_with_mean_truth'] = c_estimates_dict[param_key]
     
     return param_data
 
@@ -270,8 +238,9 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
     
     # Initialize momentum buffers for accumulated gradient computation
     momentum_buffers = {}
-    for param_name, param in get_weight_matrix_iterator(model, only_hidden=True):
-        momentum_buffers[param_name] = torch.zeros_like(param, dtype=torch.float32)
+    layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
+    for (param_type, layer_num), param in layer_properties.items():
+        momentum_buffers[(param_type, layer_num)] = torch.zeros_like(param, dtype=torch.float32)
     
     # Get momentum value for this step (matches training_core.py logic)
     frac = step / args.num_iterations
@@ -313,29 +282,29 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         
         # Update momentum buffers and compute accumulated gradients (like Muon does)
         accumulated_gradients = {}
-        all_params = list(get_weight_matrix_iterator(model, only_hidden=True))
-        for param_name, param in all_params:
+        layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
+        for (param_type, layer_num), param in layer_properties.items():
             if param.grad is None:
                 continue
             
             # Update momentum buffer: momentum_buffer = momentum * momentum_buffer + (1 - momentum) * grad
             grad_f32 = param.grad.float()
-            momentum_buffers[param_name] = momentum_value * momentum_buffers[param_name] + (1 - momentum_value) * grad_f32
+            param_key = (param_type, layer_num)
+            momentum_buffers[param_key] = momentum_value * momentum_buffers[param_key] + (1 - momentum_value) * grad_f32
             
             # Compute accumulated gradient: accumulated_grad = momentum * momentum_buffer + (1 - momentum) * grad
             # This matches exactly what Muon does in zeropower.py:199
-            accumulated_grad = momentum_value * momentum_buffers[param_name] + (1 - momentum_value) * grad_f32
-            accumulated_gradients[param_name] = accumulated_grad
+            accumulated_grad = momentum_value * momentum_buffers[param_key] + (1 - momentum_value) * grad_f32
+            accumulated_gradients[param_key] = accumulated_grad
         
         # Store accumulated gradient for C computation if this is my assigned minibatch
         if mb_idx == rank and mb_idx < world_size:
             if rank == 0:
                 print(f"    Storing accumulated gradients for C estimation on rank {rank}")
-            for param_name, accumulated_grad in accumulated_gradients.items():
-                split_tensors = split_qkv_weight(param_name, accumulated_grad)
-                for split_name, split_tensor in split_tensors.items():
-                    # Keep accumulated gradient on GPU in float32
-                    my_gradient_dict[split_name] = split_tensor.detach().to(torch.float32)
+            for param_key, accumulated_grad in accumulated_gradients.items():
+                # No need to split - already handled by get_weight_matrix_iterator
+                # Keep accumulated gradient on GPU in float32
+                my_gradient_dict[param_key] = accumulated_grad.detach().to(torch.float32)
         
         if rank == 0:
             print(f"    Rank {rank}: Extracting accumulated gradients for mb {mb_idx}")

@@ -7,7 +7,7 @@ import torch.distributed as dist
 import time
 import copy
 from torch.nn import Parameter, Module
-from .map import get_weight_matrix_iterator, apply_fn_to_all_weights, get_research_log_path
+from .map import get_weight_matrix_iterator, apply_fn_to_all_layers, get_research_log_path
 
 def is_logging_step_piecewise_log(step: int, total_steps: int) -> bool:
     """Determine if we should serialize the model at this step.
@@ -171,7 +171,8 @@ def compute_gradient_singular_values(model, data_loader, num_minibatches: int, r
             # Extract gradients using weight iterator
             batch_gradients = {}
             
-            for name, param in get_weight_matrix_iterator(model, only_hidden=True):
+            layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
+            for (param_type, layer_num), param in layer_properties.items():
                 if param.grad is not None:
                     grad = param.grad.clone().detach()
                     
@@ -179,15 +180,14 @@ def compute_gradient_singular_values(model, data_loader, num_minibatches: int, r
                     if dist.is_initialized():
                         dist.all_reduce(grad, op=dist.ReduceOp.AVG)
                     
-                    # Split QKV if needed
-                    split_grads = split_qkv_weight(name, grad)
-                    for split_name, split_grad in split_grads.items():
-                        batch_gradients[split_name] = split_grad.to(torch.bfloat16)
-                        
-                        # Accumulate for average
-                        if split_name not in gradient_sums:
-                            gradient_sums[split_name] = torch.zeros_like(split_grad, dtype=torch.bfloat16)
-                        gradient_sums[split_name] += split_grad.to(torch.bfloat16)
+                    # Store gradient with proper key
+                    key_name = f"{param_type}_layer_{layer_num}"
+                    batch_gradients[key_name] = grad.to(torch.bfloat16)
+                    
+                    # Accumulate for average
+                    if key_name not in gradient_sums:
+                        gradient_sums[key_name] = torch.zeros_like(grad, dtype=torch.bfloat16)
+                    gradient_sums[key_name] += grad.to(torch.bfloat16)
             
             all_gradients.append(batch_gradients)
             
@@ -230,10 +230,11 @@ def compute_gradient_singular_values(model, data_loader, num_minibatches: int, r
                 _, S_i, _ = torch.linalg.svd(aligned_grad, full_matrices=False)
                 S_avg = avg_svds[name][1]
                 
-                # Extract layer number and weight type
-                parts = name.split('_')
+                # Extract layer number and weight type from our naming scheme
+                # name format: "{param_type}_layer_{layer_num}"
+                parts = name.split('_layer_')
+                weight_name = parts[0] if len(parts) > 0 else name
                 layer_num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
-                weight_name = '_'.join(parts[2:]) if len(parts) > 2 else name
                 
                 # Record singular values
                 min_size = min(len(S_i), len(S_avg))

@@ -64,7 +64,7 @@ def dummy_logging(
     Just log the norm of each weight.
     """
     run_name = other_state["run_name"]
-    apply_fn_to_all_weights(model, calculate_weight_norm, run_name)
+    apply_fn_to_all_layers(model, calculate_weight_norm, run_name)
 
 def svd_logging(
     model,
@@ -75,10 +75,10 @@ def svd_logging(
     Log the singular values of each weight matrix.
     """
     run_name = other_state["run_name"]
-    apply_fn_to_all_weights(model, calculate_singular_values, run_name)
+    apply_fn_to_all_layers(model, calculate_singular_values, run_name)
 
-def calculate_singular_values(named_param: NamedParameter, run_name: str):
-    name, weight = named_param
+def calculate_singular_values(key: tuple[str, int], weight: Parameter | np.ndarray, run_name: str):
+    param_type, layer_num = key
     
     # Only compute SVD for 2D matrices
     if weight.dim() != 2:
@@ -91,15 +91,15 @@ def calculate_singular_values(named_param: NamedParameter, run_name: str):
     # Convert to numpy for saving
     singular_values_np = singular_values.cpu().numpy()
     
-    log_path = get_research_log_path("svd", run_name, "singular_values_{weight_name}.npy", weight_name=name)
+    log_path = get_research_log_path("svd", run_name, "singular_values_{param_type}_layer_{layer_num}.npy", param_type=param_type, layer_num=layer_num)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Save as numpy array
     np.save(log_path, singular_values_np)
 
-def calculate_weight_norm(named_param: NamedParameter, run_name: str):
-    name, weight = named_param
-    log_path = get_research_log_path("norm_test", "dummy", "norm_{weight_name}.txt", weight_name=name)
+def calculate_weight_norm(key: tuple[str, int], weight: Parameter | np.ndarray, run_name: str):
+    param_type, layer_num = key
+    log_path = get_research_log_path("norm_test", "dummy", "norm_{param_type}_layer_{layer_num}.txt", param_type=param_type, layer_num=layer_num)
     with open(log_path, "w") as f:
         f.write(f"{weight.norm()}\n")
 

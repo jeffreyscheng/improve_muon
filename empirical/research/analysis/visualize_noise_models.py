@@ -16,13 +16,110 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from math import erf
 import matplotlib.pyplot as plt
 import imageio.v2 as imageio
 
 from empirical.research.analysis.map import get_research_log_path
-from scipy.optimize import curve_fit
+
+from empirical.research.training.zeropower import NEWTON_SCHULZ_QUINTIC_COEFFICIENTS
 
 PARAM_TYPES = ['Attention Q', 'Attention K', 'Attention V', 'Attention O', 'MLP Input', 'MLP Output']
+# Note: we no longer use the SVHT constant; we estimate the bulk edge directly from the spectrum.
+
+
+def newton_schulz_quintic_function(x):
+    out = x
+    for a, b, c in NEWTON_SCHULZ_QUINTIC_COEFFICIENTS:
+        out = a * out + b * (out **3) + c * (out ** 5)
+    return out
+
+
+def _std_normal_cdf(z: np.ndarray) -> np.ndarray:
+    """Standard normal CDF using vectorized math.erf; stable for small arrays."""
+    z = np.asarray(z, dtype=float)
+    return 0.5 * (1.0 + np.vectorize(erf)(z / np.sqrt(2.0)))
+
+
+def _robust_log_edge_params(edges: np.ndarray) -> tuple[float, float]:
+    """
+    Robust fit of lognormal edge dispersion:
+      mu = median(log(edges)), sigma = 1.4826 * MAD(log(edges))
+    Returns (mu, sigma) with a small floor on sigma.
+    """
+    e = np.asarray(edges, dtype=float)
+    e = e[np.isfinite(e) & (e > 0)]
+    if e.size == 0:
+        return 0.0, 0.25  # fallback: neutral scale, mild dispersion
+    x = np.log(e)
+    mu = float(np.median(x))
+    mad = float(np.median(np.abs(x - mu)))
+    sigma = max(1.4826 * mad, 1e-6)
+    return mu, sigma
+
+
+def c_pred_mixture_lognormal(s: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    """
+    Smooth prediction c(s) = E_tau[[1-(tau/s)^2]_+] for ln(tau)~N(mu, sigma^2).
+    Closed form:
+      Phi((ln s - mu)/sigma) - exp(2mu+2sigma^2)/s^2 * Phi((ln s - mu - 2sigma^2)/sigma)
+    Returns values in [0,1].
+    """
+    s = np.asarray(s, dtype=float)
+    sp = np.maximum(s, 1e-30)
+    inv_sig = 1.0 / max(sigma, 1e-12)
+    Phi1 = _std_normal_cdf((np.log(sp) - mu) * inv_sig)
+    Phi2 = _std_normal_cdf((np.log(sp) - mu - 2.0 * sigma * sigma) * inv_sig)
+    c = Phi1 - np.exp(2.0 * mu + 2.0 * sigma * sigma) * Phi2 / (sp * sp)
+    return np.clip(c, 0.0, 1.0)
+
+
+def _estimate_bulk_edge_from_spectrum(
+    s: np.ndarray,
+    *,
+    beta: float = 1.0,
+    lower_frac: float = 0.8,
+    quantile: float = 0.99
+) -> float:
+    """
+    Robust bulk-edge estimator (SVD-only, no model fit):
+      1) sort singulars ascending
+      2) keep the lower `lower_frac` mass (discard potential spikes)
+      3) take the `quantile` as the bulk edge in s-units.
+    For beta=1, the natural-unit edge is 2; here we use the edge in observed units.
+    """
+    if s.size == 0:
+        return 0.0
+    s_sorted = np.sort(np.asarray(s, dtype=float))
+    k = max(1, int(np.floor(lower_frac * s_sorted.size)))
+    s_bulk = s_sorted[:k]
+    edge = float(np.quantile(s_bulk, quantile))
+    if not np.isfinite(edge) or edge <= 0:
+        edge = float(np.nanmax(s_sorted)) if s_sorted.size else 0.0
+    return max(edge, 1e-12)
+
+
+def c_pred_square(s: np.ndarray, edge: float | None = None) -> np.ndarray:
+    """
+    Predict c_i for the square case (beta=1) from observed singular values s.
+    Normalization uses a robust bulk edge estimated from the spectrum (no SVHT constants):
+      y = s * 2 / edge,  c = 0 if y<=2, else t=((y^2-2)+sqrt((y^2-2)^2-4))/2,  c=1-1/t.
+    If `edge` is None, it is estimated from s via _estimate_bulk_edge_from_spectrum. Returns values in [0,1].
+    """
+    if s.size == 0:
+        return s.copy()
+    if edge is None or not np.isfinite(edge) or edge <= 0:
+        edge = _estimate_bulk_edge_from_spectrum(s)
+    if edge <= 0:
+        return np.zeros_like(s, dtype=float)
+    y = (np.asarray(s, dtype=float) * 2.0) / edge
+    c = np.zeros_like(y)
+    mask = y > 2.0
+    if np.any(mask):
+        z = y[mask]**2 - 2.0
+        t = (z + np.sqrt(np.maximum(z*z - 4.0, 0.0))) / 2.0
+        c[mask] = 1.0 - 1.0 / np.maximum(t, 1e-12)
+    return np.clip(c, 0.0, 1.0)
 
 
 def load_singular_values_data(sv_dir: Path) -> dict:
@@ -82,165 +179,7 @@ def load_stable_rank_data(sr_dir: Path) -> dict:
     return results
 
 
-def _ls_fit_alpha_tau(x, y, iters: int = 60):
-    """
-    Log-space Gauss–Newton fit for:
-        Y = 0.5 * log( alpha^2 * e^{2X} + tau^2 ),  with X=log(x), Y=log(y).
-    Optimizes u=log(alpha), v=log(tau) to minimize sum (Y - r(u,v;X))^2.
-    Returns (alpha_hat, tau_hat).
-    """
-    x = np.asarray(x); y = np.asarray(y)
-    m = (x > 0) & (y > 0)
-    x = x[m]; y = y[m]
-    if x.size < 2:
-        return 0.0, 0.0
-    # Transform to log space (clip away denorms)
-    X = np.log(np.clip(x, 1e-300, None))
-    Y = np.log(np.clip(y, 1e-300, None))
-    n = X.size
 
-    # Heuristic initialization: alpha from high-x, tau from low-x
-    q_hi, q_lo = 0.7, 0.3
-    thr_hi = np.quantile(x, q_hi)
-    thr_lo = np.quantile(x, q_lo)
-    hi = x >= thr_hi
-    lo = x <= thr_lo
-    alpha0 = np.median(y[hi] / x[hi]) if hi.sum() >= 2 else (y / x).mean()
-    tau0   = np.median(y[lo])         if lo.sum() >= 2 else y.min()
-    alpha0 = float(max(alpha0, 1e-12))
-    tau0   = float(max(tau0,   1e-12))
-    u = np.log(alpha0); v = np.log(tau0)
-
-    # Gauss–Newton updates in (u,v). For r = 0.5*logaddexp(A,B) with A=2u+2X, B=2v:
-    # dr/du = softmax(A,B),  dr/dv = softmax(B,A).
-    for _ in range(iters):
-        A = 2.0*u + 2.0*X
-        B = 2.0*v + 0.0*X
-        r = 0.5 * np.logaddexp(A, B)
-        resid = Y - r
-        # softmax weights; numerically stable
-        wA = 1.0 / (1.0 + np.exp(B - A))  # contribution of the alpha*e^{X} branch
-        wB = 1.0 - wA                     # contribution of the tau branch
-        # Gradients of sum(resid^2)
-        gu = -2.0 * np.sum(resid * wA)
-        gv = -2.0 * np.sum(resid * wB)
-        # Gauss–Newton diagonal Hessian approx (sum of jac^2)
-        Hu = 2.0 * np.sum(wA**2) + 1e-12
-        Hv = 2.0 * np.sum(wB**2) + 1e-12
-        # Update
-        u -= gu / Hu
-        v -= gv / Hv
-    alpha = float(np.exp(u))
-    tau   = float(np.exp(v))
-    return alpha, tau
-
-
-def _local_gaps_from_singulars(s):
-    """
-    Given a 1D array of descending singular means s, return local gaps g of same length:
-      g[0]=s0-s1, g[-1]=s_{n-2}-s_{n-1}, interior = min(forward/backward diffs)
-    """
-    s = np.asarray(s)
-    if s.size <= 1:
-        return np.zeros_like(s)
-    d = s[:-1] - s[1:]
-    g = np.empty_like(s)
-    g[0] = d[0]
-    g[1:-1] = np.minimum(d[:-1], d[1:])
-    g[-1] = d[-1]
-    return np.clip(g, 0.0, None)
-
-
-def _fit_alpha_beta(x, y, gap, iters: int = 60):
-    """
-    Log-space Gauss–Newton fit (pooled per param_type, per frame):
-        log(y^2) ≈ logaddexp( 2*log(alpha) + 2*log(x),
-                              2*log(beta)  - 2*log(gap) ).
-    Optimizes u=log(alpha), v=log(beta) to minimize sum (Z - r(u,v))^2,
-    where Z=2*log(y) and r=logaddexp(2u + 2log(x), 2v - 2log(gap)).
-    Returns (alpha_hat, beta_hat).
-    """
-    x = np.asarray(x); y = np.asarray(y); gap = np.asarray(gap)
-    m = (x > 0) & (y > 0) & (gap > 0)
-    x = x[m]; y = y[m]; gap = gap[m]
-    if x.size < 2:
-        return 0.0, 0.0
-    # Stable logs
-    LX = 2.0 * np.log(np.clip(x,   1e-300, None))   # log(x^2)
-    LV = -2.0 * np.log(np.clip(gap, 1e-300, None))  # log(1/gap^2)
-    Z  = 2.0 * np.log(np.clip(y,   1e-300, None))   # log(y^2)
-    # Heuristic init: α≈median(y/x) on high-x; β≈median(y*gap) on low-x
-    q_hi, q_lo = 0.7, 0.3
-    thr_hi = np.quantile(x, q_hi);  thr_lo = np.quantile(x, q_lo)
-    hi = x >= thr_hi;                lo = x <= thr_lo
-    alpha0 = np.median(y[hi] / x[hi]) if hi.sum() >= 2 else (y / x).mean()
-    beta0  = np.median(y[lo] * gap[lo]) if lo.sum() >= 2 else (y * gap).mean()
-    alpha0 = float(max(alpha0, 1e-12));  beta0 = float(max(beta0, 1e-12))
-    u = np.log(alpha0);  v = np.log(beta0)
-    # Gauss–Newton in (u,v)
-    for _ in range(iters):
-        A = 2.0*u + LX                  # α-branch
-        B = 2.0*v + LV                  # β/gap branch
-        r = np.logaddexp(A, B)          # model prediction: log(y^2)
-        resid = Z - r
-        # soft assignments per point
-        wA = 1.0 / (1.0 + np.exp(B - A))
-        wB = 1.0 - wA
-        # dr/du, dr/dv
-        drdu = 2.0 * wA
-        drdv = 2.0 * wB
-        # gradients & GN Hessians of sum(resid^2)
-        gu = -2.0 * np.sum(resid * drdu)
-        gv = -2.0 * np.sum(resid * drdv)
-        Hu = 2.0 * np.sum(drdu**2) + 1e-12
-        Hv = 2.0 * np.sum(drdv**2) + 1e-12
-        u -= gu / Hu
-        v -= gv / Hv
-    return float(np.exp(u)), float(np.exp(v))
-
-
-def sigmoid(ln_s, a, b):
-    """Sigmoid function: C = 1 / (1 + exp(-a * (ln_s - b)))"""
-    return 1.0 / (1.0 + np.exp(-a * (ln_s - b)))
-
-
-def fit_sigmoid_to_c_estimates(means, c_vals):
-    """Fit sigmoid to C estimates vs ln(mean singular values).
-    
-    Args:
-        means: Mean singular values
-        c_vals: C estimates
-        
-    Returns:
-        (a, b): Sigmoid parameters, or (None, None) if fitting fails
-    """
-    try:
-        # Filter out invalid values
-        valid_mask = (means > 0) & (c_vals > 0) & (c_vals < 1) & np.isfinite(means) & np.isfinite(c_vals)
-        if np.sum(valid_mask) < 3:  # Need at least 3 points
-            return None, None
-            
-        means_valid = means[valid_mask]
-        c_vals_valid = c_vals[valid_mask]
-        
-        # Convert to log space
-        ln_s = np.log(means_valid)
-        
-        # Initial guess: b around ln(1e-3) = -6.9, a positive to give sigmoid shape
-        # C=0.5 happens around ln(s)=1e-3, so b should be around ln(1e-3) = -6.9
-        initial_b = np.log(1e-3)
-        initial_a = 1.0  # Positive slope
-        
-        # Fit sigmoid
-        popt, _ = curve_fit(sigmoid, ln_s, c_vals_valid, 
-                          p0=[initial_a, initial_b],
-                          bounds=([-10, -20], [10, 5]),  # Reasonable bounds
-                          maxfev=1000)
-        
-        return float(popt[0]), float(popt[1])
-        
-    except Exception as e:
-        return None, None
 
 
 def fit_noise_models_to_data(sv_data: dict, sr_data: dict) -> dict:
@@ -257,35 +196,39 @@ def fit_noise_models_to_data(sv_data: dict, sr_data: dict) -> dict:
         for key in sv_data[step].keys():
             if key in sr_data[step]:
                 step_data[key] = {**sv_data[step][key], **sr_data[step][key]}
+                # Add c_i prediction from mean singular values (square case, beta=1)
+                means = step_data[key].get('means', None)
+                if isinstance(means, np.ndarray) and means.size > 0:
+                    edge = _estimate_bulk_edge_from_spectrum(means)  # robust bulk edge from that layer's spectrum
+                    step_data[key]['c_pred_from_means'] = c_pred_square(means, edge=edge)
+                else:
+                    step_data[key]['c_pred_from_means'] = np.array([], dtype=float)
+
+        # --- Mixture model (lognormal edge) per param_type at this step ---
+        # 1) collect per-layer bulk edges per param_type
+        edges_by_pt: dict[str, list[float]] = defaultdict(list)
+        for (param_type, layer_num), layer_data in step_data.items():
+            means = layer_data.get('means', None)
+            if isinstance(means, np.ndarray) and means.size > 0:
+                edges_by_pt[param_type].append(_estimate_bulk_edge_from_spectrum(means))
+        # 2) fit (mu,sigma) robustly for each param_type
+        ms_by_pt: dict[str, tuple[float, float]] = {
+            pt: _robust_log_edge_params(np.array(e_list)) for pt, e_list in edges_by_pt.items()
+        }
+        # 3) produce mixture predictions for each layer of that param_type
+        for (param_type, layer_num), layer_data in step_data.items():
+            means = layer_data.get('means', None)
+            if isinstance(means, np.ndarray) and means.size > 0 and param_type in ms_by_pt:
+                mu, sigma = ms_by_pt[param_type]
+                layer_data['mixture_mu'] = mu
+                layer_data['mixture_sigma'] = sigma
+                layer_data['c_pred_mixture_from_means'] = c_pred_mixture_lognormal(means, mu, sigma)
+            else:
+                layer_data['mixture_mu'] = float('nan')
+                layer_data['mixture_sigma'] = float('nan')
+                layer_data['c_pred_mixture_from_means'] = np.array([], dtype=float)
         
-        # Fit alpha, beta per param_type (pooled across layers)
-        for ptype in PARAM_TYPES:
-            xs, ys, gs = [], [], []
-            keys = [(pt, ln) for (pt, ln) in step_data.keys() if pt == ptype]
-            for key in keys:
-                m = step_data[key]['means']
-                s = step_data[key]['stds']
-                g = _local_gaps_from_singulars(m)
-                xs.append(m); ys.append(s); gs.append(g)
-            if not xs:
-                continue
-            x_all = np.concatenate(xs); y_all = np.concatenate(ys); g_all = np.concatenate(gs)
-            alpha_hat, beta_hat = _fit_alpha_beta(x_all, y_all, g_all)
-            for key in keys:
-                step_data[key]['alpha'] = alpha_hat
-                step_data[key]['beta'] = beta_hat
-                # legacy tau derived from typical gap (for backward compat only)
-                g_typ = float(np.median(_local_gaps_from_singulars(step_data[key]['means'])))
-                step_data[key]['tau'] = (beta_hat / g_typ) if g_typ > 0 else None
         
-        # Fit sigmoid parameters per layer for C estimates
-        for key in step_data.keys():
-            if 'c_with_mean_truth' in step_data[key]:
-                means = step_data[key]['means']
-                c_vals = step_data[key]['c_with_mean_truth']
-                sigmoid_a, sigmoid_b = fit_sigmoid_to_c_estimates(means, c_vals)
-                step_data[key]['sigmoid_a'] = sigmoid_a
-                step_data[key]['sigmoid_b'] = sigmoid_b
         
         results[step] = step_data
     
@@ -305,11 +248,10 @@ def save_fitted_noise_models(fitted_data: dict, output_dir: Path):
                 'layer_num': layer_num,
                 'means': json.dumps(layer_data['means'].tolist()),
                 'stds': json.dumps(layer_data['stds'].tolist()),
-                'tau': layer_data.get('tau', None),
-                'alpha': layer_data.get('alpha', None),
-                'beta': layer_data.get('beta', None),
-                'sigmoid_a': layer_data.get('sigmoid_a', None),
-                'sigmoid_b': layer_data.get('sigmoid_b', None),
+                'c_pred_from_means': json.dumps(layer_data.get('c_pred_from_means', np.array([], dtype=float)).tolist()),
+                'c_pred_mixture_from_means': json.dumps(layer_data.get('c_pred_mixture_from_means', np.array([], dtype=float)).tolist()),
+                'mixture_mu': layer_data.get('mixture_mu', float('nan')),
+                'mixture_sigma': layer_data.get('mixture_sigma', float('nan')),
             })
         
         pd.DataFrame(csv_data).to_csv(output_dir / f"step_{step:06d}.csv", index=False)
@@ -403,36 +345,22 @@ def create_subplot_grid(param_types: list, figsize: tuple, data_fn, plot_fn, tit
     plt.close()
 
 
-def create_frame_with_fit(step: int, param_data: dict, axis_ranges: dict, output_dir: Path):
-    """Std vs Mean with fitted envelope using alpha & beta: y ≈ sqrt((alpha*x)^2 + (beta/g_typ)^2)."""
+def create_frame_with_scatter(step: int, param_data: dict, axis_ranges: dict, output_dir: Path):
+    """Std vs Mean scatter plots without fitted curves."""
     param_types = PARAM_TYPES
     def get_frame_data(param_type):
         return [(layer_num, data) for (p_type, layer_num), data in param_data.items() if p_type == param_type and layer_num >= 0]
-    def plot_std_mean_fit(ax, param_type, layer_data_list, viridis, max_layers):
+    def plot_std_mean_scatter(ax, param_type, layer_data_list, viridis, max_layers):
         ax.set_xscale('log'); ax.set_yscale('log')
         ax.set_xlabel('Mean Singular Value'); ax.set_ylabel('Std Singular Value')
-        ax.set_title(f'{param_type} (fit)')
+        ax.set_title(f'{param_type}')
         ax.grid(True, alpha=0.3)
         rng = axis_ranges[param_type]; ax.set_xlim(rng['x_min'], rng['x_max']); ax.set_ylim(rng['y_min'], rng['y_max'])
-        alpha_hat = None; beta_hat = None
-        g_all = []
         for layer_num, data in layer_data_list:
             color = viridis(layer_num / (max_layers - 1))
             ax.scatter(data['means'], data['stds'], alpha=0.08, s=15, c=[color])
-            alpha_hat = data.get('alpha', alpha_hat)
-            beta_hat  = data.get('beta',  beta_hat)
-            g_all.append(_local_gaps_from_singulars(np.asarray(data['means'])))
-        g_all = np.concatenate(g_all) if len(g_all)>0 else np.array([])
-        g_typ = float(np.median(g_all[g_all>0])) if g_all.size>0 and np.any(g_all>0) else None
-        if alpha_hat is not None and beta_hat is not None and rng['x_min'] > 0 and g_typ:
-            xfit = np.logspace(np.log10(rng['x_min']), np.log10(rng['x_max']), 200)
-            yfit = np.sqrt((alpha_hat * xfit)**2 + (beta_hat / g_typ)**2)
-            ax.plot(xfit, yfit, linewidth=1.5)
-        if alpha_hat is not None and beta_hat is not None:
-            ax.text(0.02, 0.98, f"α={alpha_hat:.2e}\\nβ={beta_hat:.2e}",
-                    transform=ax.transAxes, ha='left', va='top', fontsize=9)
-    frame_path = output_dir / f"frame_fit_{step:06d}.png"
-    create_subplot_grid(param_types, (20, 10), get_frame_data, plot_std_mean_fit, f'Std–Mean with Fit - Step {step}', frame_path)
+    frame_path = output_dir / f"frame_scatter_{step:06d}.png"
+    create_subplot_grid(param_types, (20, 10), get_frame_data, plot_std_mean_scatter, f'Std–Mean Scatter - Step {step}', frame_path)
     return str(frame_path)
 
 
@@ -562,10 +490,6 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
             ax.set_xlim(global_x_min, global_x_max)
             ax.set_ylim(global_c_min, global_c_max)
             
-            # Collect sigmoid parameters for averaging
-            valid_a_vals = []
-            valid_b_vals = []
-            
             for layer_num, data in layer_data_list:
                 color = viridis(layer_num / (max_layers - 1))
                 means = data['means']
@@ -573,26 +497,6 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
                 min_len = min(len(means), len(c_vals))
                 if min_len > 0:
                     ax.scatter(means[:min_len], c_vals[:min_len], alpha=0.16, s=15, c=[color])
-                
-                # Plot fitted sigmoid if available
-                if 'sigmoid_a' in data and 'sigmoid_b' in data and data['sigmoid_a'] is not None and data['sigmoid_b'] is not None:
-                    # Create smooth curve from global x bounds
-                    x_curve = np.logspace(np.log10(global_x_min), np.log10(global_x_max), 200)
-                    ln_s_curve = np.log(x_curve)
-                    y_curve = sigmoid(ln_s_curve, data['sigmoid_a'], data['sigmoid_b'])
-                    ax.plot(x_curve, y_curve, color=color, linewidth=1.5, alpha=0.8)
-                    
-                    valid_a_vals.append(data['sigmoid_a'])
-                    valid_b_vals.append(data['sigmoid_b'])
-            
-            # Add equation text with average parameters
-            if valid_a_vals and valid_b_vals:
-                avg_a = np.mean(valid_a_vals)
-                avg_b = np.mean(valid_b_vals)
-                equation_text = f'$C = \\frac{{1}}{{1 + e^{{-{avg_a:.1f}(\\ln s - {avg_b:.1f})}}}}$'
-                ax.text(0.95, 0.05, equation_text, transform=ax.transAxes, 
-                       ha='right', va='bottom', fontsize=8, 
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
         
         frame_path = output_dir / f"frame_c_estimates_{step:06d}.png"
         create_subplot_grid(param_types, (18, 10), get_c_data_for_step, plot_c_estimates_frame, 
@@ -622,10 +526,6 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
             ax.set_xlim(global_x_min, global_x_max)
             ax.set_ylim(0, 1)  # C estimates are bounded [0, 1]
             
-            # Collect sigmoid parameters for averaging
-            valid_a_vals = []
-            valid_b_vals = []
-            
             for layer_num, data in layer_data_list:
                 color = viridis(layer_num / (max_layers - 1))
                 means = data['means']
@@ -633,26 +533,31 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
                 min_len = min(len(means), len(c_vals))
                 if min_len > 0:
                     ax.scatter(means[:min_len], c_vals[:min_len], alpha=0.16, s=15, c=[color])
-                
-                # Plot fitted sigmoid if available
-                if 'sigmoid_a' in data and 'sigmoid_b' in data and data['sigmoid_a'] is not None and data['sigmoid_b'] is not None:
-                    # Create smooth curve from global x bounds
-                    x_curve = np.logspace(np.log10(global_x_min), np.log10(global_x_max), 200)
-                    ln_s_curve = np.log(x_curve)
-                    y_curve = sigmoid(ln_s_curve, data['sigmoid_a'], data['sigmoid_b'])
-                    ax.plot(x_curve, y_curve, color=color, linewidth=1.5, alpha=0.8)
-                    
-                    valid_a_vals.append(data['sigmoid_a'])
-                    valid_b_vals.append(data['sigmoid_b'])
             
-            # Add equation text with average parameters
-            if valid_a_vals and valid_b_vals:
-                avg_a = np.mean(valid_a_vals)
-                avg_b = np.mean(valid_b_vals)
-                equation_text = f'$C = \\frac{{1}}{{1 + e^{{-{avg_a:.1f}(\\ln s - {avg_b:.1f})}}}}$'
-                ax.text(0.95, 0.05, equation_text, transform=ax.transAxes, 
-                       ha='right', va='bottom', fontsize=8, 
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+            # --- Predicted c(s) with lognormal edge mixture; semilog x, solid black ---
+            # Fit (mu, sigma) from per-layer bulk edges of this param_type at this step
+            edges = []
+            for _, d in layer_data_list:
+                m = d.get('means', None)
+                if isinstance(m, np.ndarray) and m.size > 0:
+                    edges.append(_estimate_bulk_edge_from_spectrum(m))
+            if len(edges) > 0:
+                mu, sigma = _robust_log_edge_params(np.array(edges))
+                x_pred = np.logspace(np.log10(global_x_min), np.log10(global_x_max), 400)
+                c_curve = c_pred_mixture_lognormal(x_pred, mu, sigma)
+                ax.plot(x_pred, c_curve, 'k-', linewidth=2, alpha=0.95, label='Predicted c (mixture)')
+
+            # (Optional) keep the bulk-edge single-edge curve for comparison:
+            # edge = _estimate_bulk_edge_from_spectrum(np.concatenate([d['means'] for _, d in layer_data_list]))
+            # ax.plot(x_pred, c_pred_square(x_pred, edge=edge), 'k-.', lw=1.5, alpha=0.6, label='Predicted c (bulk-edge)')
+            
+            # Add Newton-Schulz quintics function curve
+            x_ns = np.logspace(np.log10(global_x_min), np.log10(global_x_max), 200)
+            y_ns = newton_schulz_quintic_function(x_ns)
+            ax.plot(x_ns, y_ns, 'k--', linewidth=2, alpha=0.8, label='Newton-Schulz Quintics')
+            
+            # Add legend for Newton-Schulz curve
+            ax.legend(loc='upper left', fontsize=8)
         
         frame_path = output_dir / f"frame_c_estimates_linear_{step:06d}.png"
         create_subplot_grid(param_types, (18, 10), get_c_data_for_step, plot_c_estimates_frame_linear, 
@@ -682,10 +587,6 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
             ax.set_xlim(0, 1)
             ax.set_ylim(0, 1)
             
-            # Collect sigmoid parameters for averaging
-            valid_a_vals = []
-            valid_b_vals = []
-            
             for layer_num, data in layer_data_list:
                 color = viridis(layer_num / (max_layers - 1))
                 means = data['means']
@@ -693,28 +594,6 @@ def create_c_estimates_plots(all_results: dict, output_dir: Path):
                 min_len = min(len(means), len(c_vals))
                 if min_len > 0:
                     ax.scatter(means[:min_len], c_vals[:min_len], alpha=0.16, s=15, c=[color])
-                
-                # Plot fitted curve if available - in linear space this is just C vs s directly
-                if 'sigmoid_a' in data and 'sigmoid_b' in data and data['sigmoid_a'] is not None and data['sigmoid_b'] is not None:
-                    # Create curve from 0 to 1
-                    s_curve = np.linspace(0.001, 1.0, 200)  # Start slightly above 0 for log
-                    ln_s_curve = np.log(s_curve)
-                    c_curve = sigmoid(ln_s_curve, data['sigmoid_a'], data['sigmoid_b'])
-                    ax.plot(s_curve, c_curve, color=color, linewidth=1.5, alpha=0.8)
-                    
-                    valid_a_vals.append(data['sigmoid_a'])
-                    valid_b_vals.append(data['sigmoid_b'])
-            
-            # Add equation text with average parameters in simplified power-law form
-            if valid_a_vals and valid_b_vals:
-                avg_a = np.mean(valid_a_vals)
-                avg_b = np.mean(valid_b_vals)
-                # Convert to power-law form: C = s^a / (s^a + exp(-a*b))
-                k = np.exp(-avg_a * avg_b)
-                equation_text = f'$C = \\frac{{s^{{{avg_a:.1f}}}}}{{s^{{{avg_a:.1f}}} + {k:.3f}}}$'
-                ax.text(0.95, 0.05, equation_text, transform=ax.transAxes, 
-                       ha='right', va='bottom', fontsize=8, 
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
         
         frame_path = output_dir / f"frame_c_estimates_linear_linear_{step:06d}.png"
         create_subplot_grid(param_types, (18, 10), get_c_data_for_step, plot_c_estimates_frame_linear_linear, 
@@ -798,15 +677,15 @@ def main():
     # Compute axis ranges for consistent plotting
     axis_ranges = compute_axis_ranges(fitted_data)
     
-    # Create GIFs with fitted curves
+    # Create GIFs with scatter plots
     frame_paths_fit = []
     for step in sorted(fitted_data.keys()):
         step_vis_dir = vis_output_dir / f"step_{step:06d}"
         step_vis_dir.mkdir(exist_ok=True)
-        frame_paths_fit.append(create_frame_with_fit(step, fitted_data[step], axis_ranges, step_vis_dir))
+        frame_paths_fit.append(create_frame_with_scatter(step, fitted_data[step], axis_ranges, step_vis_dir))
     
     print(f"Creating GIF with {len(frame_paths_fit)} frames at {fps} fps...")
-    create_gif_from_frames(frame_paths_fit, vis_output_dir / "std_mean_with_fit.gif", fps)
+    create_gif_from_frames(frame_paths_fit, vis_output_dir / "std_mean_scatter.gif", fps)
     
     # Clean up intermediate frame files
     print("Cleaning up intermediate frame files...")

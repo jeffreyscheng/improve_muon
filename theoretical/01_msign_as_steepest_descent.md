@@ -34,7 +34,7 @@ $$
 &=\max_{\Vert\Delta W\Vert_2=1} \sum_{i=1}^r \sigma_i \text{tr}\left(v_i u_i^T \Delta W\right)\tag{Distribute + linearity of trace}\\
 &=\max_{\Vert\Delta W\Vert_2=1} \sum_{i=1}^r \sigma_i u_i^T \Delta W v_i\\
 &\leq \max_{\Vert\Delta W\Vert_2=1} \sum_{i=1}^r \sigma_i\\
-&=\Vert \Delta W\Vert_*
+&=\Vert G\Vert_*
 \end{aligned}
 $$
 
