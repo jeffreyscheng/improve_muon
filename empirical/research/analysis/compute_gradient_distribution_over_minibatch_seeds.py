@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Compute gradient distributions over multiple minibatch SGD seeds for noise model analysis.
-This script performs the expensive computation once per training run, saving results to CSV files.
+Functional gradient distribution analysis over multiple minibatch seeds.
+This script uses a clean functional programming approach with GPTLayerProperty transformations
+to compute gradient distributions, SVDs, basis similarities, and spectral projection coefficients.
+
+Key Features:
+- Functional programming approach with composable transformations
+- Distributed computation with parameter sharding
+- Basis cosine similarity and spectral projection coefficient analysis
+- Stable rank computation for both gradients and weights
+- Clean separation of mathematical operations and data flow
 
 Usage:
     torchrun --standalone --nproc_per_node=8 compute_gradient_distribution_over_minibatch_seeds.py <run_id> [--testing] [--force]
@@ -28,9 +36,15 @@ import numpy as np
 import pandas as pd
 
 # Import all dependencies at top level
-from empirical.research.training.training_core import setup_distributed_training, get_window_size_blocks, Hyperparameters, warmup_kernels
-from empirical.research.analysis.offline_logging import deserialize_model_checkpoint, compute_singular_values, compute_stable_rank
-from empirical.research.analysis.map import get_weight_matrix_iterator, get_research_log_path
+from empirical.research.training.training_core import (
+    setup_distributed_training, get_window_size_blocks, Hyperparameters, 
+    warmup_kernels, distributed_data_generator
+)
+from empirical.research.analysis.offline_logging import compute_stable_rank
+from empirical.research.analysis.map import (
+    get_weight_matrices, get_research_log_path, get_accumulated_gradient_matrices,
+    combine_layer_properties, gather_layer_properties_to_rank_zero, apply_stable_rank
+)
 
 
 def precompile_svd_kernels(device: torch.device, rank: int):
@@ -103,9 +117,16 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     # Compile model like training does
     model = torch.compile(model, dynamic=False)
     
-    # Warmup kernels like training does to coordinate compilation across ranks
-    args = Hyperparameters()
-    warmup_kernels(model, [], args)  # No optimizers needed for analysis
+    # Lightweight warmup for analysis - use small sequence to avoid OOM
+    small_seq_len = 128  # Much smaller than training's 8192
+    vocab_size = args.vocab_size
+    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
+    sliding_window_blocks = 1  # Minimal sliding window
+    
+    # Single warmup pass
+    model(inputs.to(torch.int32), targets, sliding_window_blocks).backward()
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()  # Clear memory after warmup
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
@@ -113,301 +134,366 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     return model
 
 
-def create_real_data_loader(args, rank: int, world_size: int):
-    """Create real training data loader using FineWeb dataset."""
-    from empirical.research.training.training_core import distributed_data_generator
-    return distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+"""
+SVD and Mathematical Functions for Gradient Analysis
+"""
 
-
-def extract_model_analysis_distributed(model, use_gradients: bool = True, accumulated_gradients: dict = None):
-    """Extract analysis from model parameters using distributed GPU SVD."""
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    
-    # Get all parameters (model is replicated on all ranks like training)
-    layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
-    all_params = list(layer_properties.items())
-    
-    # Distribute SVD computation work across ranks, not the parameters themselves
-    all_param_splits = []
-    for (param_type, layer_num), param in all_params:
-        if use_gradients:
-            param_key = (param_type, layer_num)
-            if accumulated_gradients is not None:
-                # Use accumulated gradients if provided
-                tensor = accumulated_gradients.get(param_key, None)
-                if tensor is None:
-                    continue
-            else:
-                # Use raw gradients from param.grad
-                tensor = param.grad
-                if tensor is None:
-                    continue
-        else:
-            tensor = param
+def apply_batched_svd(layer_properties) -> tuple:
+    """Apply SVD to each batched tensor (batch×n×m) in the GPTLayerProperty."""
+    def compute_batched_svd(key, tensor):
+        if tensor.ndim != 3:
+            raise ValueError(f"Expected 3D tensor for batched SVD, got {tensor.ndim}D for {key}")
         
-        # No need to split - already handled by get_weight_matrix_iterator
-        all_param_splits.append(((param_type, layer_num), tensor))
+        batch_size = tensor.shape[0]
+        U_list, S_list, Vh_list = [], [], []
+        
+        for i in range(batch_size):
+            U_i, S_i, Vh_i = torch.linalg.svd(tensor[i].float(), full_matrices=False)
+            U_list.append(U_i)
+            S_list.append(S_i)
+            Vh_list.append(Vh_i)
+        
+        U = torch.stack(U_list, dim=0)  # batch×n×n
+        S = torch.stack(S_list, dim=0)  # batch×min(n,m)
+        Vh = torch.stack(Vh_list, dim=0)  # batch×m×m
+        
+        return U, S, Vh
     
-    # Distribute SVD work across ranks
-    splits_per_rank = len(all_param_splits) // world_size
-    start_idx = rank * splits_per_rank
-    end_idx = start_idx + splits_per_rank if rank < world_size - 1 else len(all_param_splits)
-    my_splits = all_param_splits[start_idx:end_idx]
+    U_prop, S_prop, Vh_prop = {}, {}, {}
+    
+    for key, tensor in layer_properties.items():
+        U, S, Vh = compute_batched_svd(key, tensor)
+        U_prop[key] = U
+        S_prop[key] = S
+        Vh_prop[key] = Vh
+    
+    return U_prop, S_prop, Vh_prop
+
+
+def apply_svd(layer_properties) -> tuple:
+    """Apply SVD to each matrix (n×m) in the GPTLayerProperty."""
+    def compute_svd(key, tensor):
+        if tensor.ndim != 2:
+            raise ValueError(f"Expected 2D tensor for SVD, got {tensor.ndim}D for {key}")
+        
+        U, S, Vh = torch.linalg.svd(tensor.float(), full_matrices=False)
+        return U, S, Vh
+    
+    U_prop, S_prop, Vh_prop = {}, {}, {}
+    
+    for key, tensor in layer_properties.items():
+        U, S, Vh = compute_svd(key, tensor)
+        U_prop[key] = U
+        S_prop[key] = S
+        Vh_prop[key] = Vh
+    
+    return U_prop, S_prop, Vh_prop
+
+
+def compute_basis_cosine_similarity(batched_basis: torch.Tensor, reference_basis: torch.Tensor) -> torch.Tensor:
+    """Compute cosine similarity between each batched basis and reference basis."""
+    # Ensure same device and dtype
+    batched_basis = batched_basis.to(reference_basis.device).to(reference_basis.dtype)
+    
+    # Compute inner products: batch×k×k @ k×k -> batch×k×k
+    # We want the diagonal elements, which are the inner products of corresponding columns
+    inner_products = torch.bmm(batched_basis.transpose(-2, -1), reference_basis.unsqueeze(0).expand(batched_basis.shape[0], -1, -1))
+    
+    # Extract diagonal elements (inner products of corresponding basis vectors)
+    cosines = torch.diagonal(inner_products, dim1=-2, dim2=-1)  # batch×k
+    
+    # Return absolute values (cosine similarity)
+    return torch.abs(cosines)
+
+
+def compute_spectral_projection_coefficients(left_cosines: torch.Tensor, right_cosines: torch.Tensor) -> torch.Tensor:
+    """Compute spectral projection coefficients as element-wise products."""
+    # Take minimum rank to get valid spectral coefficients
+    min_rank = min(left_cosines.shape[-1], right_cosines.shape[-1])
+    
+    # Truncate to minimum rank and compute element-wise product
+    left_truncated = left_cosines[..., :min_rank].abs()
+    right_truncated = right_cosines[..., :min_rank].abs()
+    
+    return left_truncated * right_truncated
+
+
+def compute_basis_similarities_and_spectral_coeffs(per_gradient_U, per_gradient_Vh, average_gradient_U, average_gradient_Vh) -> tuple:
+    """Compute basis similarities and spectral projection coefficients."""
+    # Compute left cosine similarities
+    left_cosines = combine_layer_properties(
+        compute_basis_cosine_similarity,
+        per_gradient_U,
+        average_gradient_U
+    )
+    
+    # Compute right cosine similarities (need to transpose Vh to get column vectors)
+    right_cosines = combine_layer_properties(
+        lambda batched_vh, ref_vh: compute_basis_cosine_similarity(
+            batched_vh.transpose(-2, -1),  # Convert to column-major
+            ref_vh.transpose(-2, -1)       # Convert to column-major
+        ),
+        per_gradient_Vh,
+        average_gradient_Vh
+    )
+    
+    # Compute spectral projection coefficients
+    spectral_coeffs = combine_layer_properties(
+        compute_spectral_projection_coefficients,
+        left_cosines,
+        right_cosines
+    )
+    
+    return left_cosines, right_cosines, spectral_coeffs
+
+
+def compute_gradient_singular_value_std(per_minibatch_singular_values, average_gradient_singular_values):
+    """Compute standard deviation of singular values across minibatches."""
+    def compute_std(batched_sv, avg_sv):
+        # Compute standard deviation across batch dimension
+        return batched_sv.std(dim=0, unbiased=True)
+    
+    return combine_layer_properties(compute_std, per_minibatch_singular_values, average_gradient_singular_values)
+
+
+def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatches: int, momentum_buffers: dict, momentum_value: float, step: int):
+    """Compute per-minibatch gradients with momentum accumulation."""
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    device = next(model.parameters()).device
+    
+    args = Hyperparameters()
+    
+    # Get all parameters that we'll need for sharding
+    all_layer_properties = get_weight_matrices(model, only_hidden=True)
+    all_param_keys = list(all_layer_properties.keys())
+    
+    # Shard parameters across ranks
+    params_per_rank = len(all_param_keys) // world_size
+    start_idx = rank * params_per_rank
+    end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
+    my_param_keys = set(all_param_keys[start_idx:end_idx])
     
     if rank == 0:
-        print(f"    Distributed {len(all_param_splits)} SVD computations across {world_size} ranks ({len(my_splits)} per rank)")
+        print(f"    Rank {rank}: Processing {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
     
-    # Process my assigned SVD computations
-    local_results = {}
-    for (param_type, layer_num), tensor in my_splits:
-        # Use GPU SVD instead of CPU numpy
-        tensor_f32 = tensor.detach().to(torch.float32)
-        try:
-            _, s, _ = torch.linalg.svd(tensor_f32, full_matrices=False)
-            sv = s.cpu().numpy()
-            stable_rank = compute_stable_rank(sv)
-            local_results[(param_type, layer_num)] = {'sv': sv, 'stable_rank': stable_rank}
-        except Exception:
-            pass
+    # Collect gradients for my assigned parameters across all minibatches
+    per_minibatch_gradients = {}
     
-    # Gather all results on rank 0
-    all_results = [None] * world_size
-    dist.all_gather_object(all_results, local_results)
+    for mb_idx in range(num_minibatches):
+        if rank == 0:
+            print(f"    Processing minibatch {mb_idx + 1}/{num_minibatches}")
+        
+        # Forward and backward pass
+        model.zero_grad()
+        model.train()
+        
+        inputs, targets = next(data_loader)
+        window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(device)
+        
+        loss = model(inputs, targets, window_size_blocks)
+        loss.backward()
+        
+        # Synchronize gradients across ranks (like in training)
+        for param in model.parameters():
+            if param.grad is not None:
+                if dist.is_initialized():
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        
+        # Update momentum buffers and get accumulated gradients
+        accumulated_gradients = get_accumulated_gradient_matrices(model, momentum_buffers, momentum_value)
+        
+        # Store gradients for my assigned parameters
+        for param_key, grad_tensor in accumulated_gradients.items():
+            if param_key in my_param_keys:
+                if param_key not in per_minibatch_gradients:
+                    # Initialize tensor to store all minibatches: num_minibatches×n×m
+                    per_minibatch_gradients[param_key] = torch.zeros(
+                        (num_minibatches,) + grad_tensor.shape,
+                        dtype=grad_tensor.dtype,
+                        device=grad_tensor.device
+                    )
+                
+                # Store this minibatch's gradient
+                per_minibatch_gradients[param_key][mb_idx] = grad_tensor.detach()
+        
+        # Clear gradients to save memory
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
     
     if rank == 0:
-        # Merge results from all ranks
-        merged_results = {}
-        for rank_results in all_results:
-            merged_results.update(rank_results)
-        return merged_results
+        print(f"    Rank {rank}: Collected gradients for {len(per_minibatch_gradients)} parameters")
     
-    return {}
+    return per_minibatch_gradients
 
 
-def compute_c_with_mean_truth_distributed(my_gradient_dict, rank, world_size):
-    """
-    Distributed computation of C estimates with mean truth using accumulated gradients.
-    Each rank stores one minibatch accumulated gradient, we compute mean across ranks, 
-    then each rank computes C for its accumulated gradient vs the mean.
+def convert_to_record_format(
+    average_gradient_singular_values,
+    per_minibatch_gradient_singular_values, 
+    gradient_singular_value_standard_deviations,
+    spectral_projection_coefficients,
+    per_minibatch_gradient_stable_rank,
+    weight_matrix_stable_rank
+) -> dict:
+    """Convert functional computation results back to the record format expected by CSV output."""
+    records = {}
     
-    Args:
-        my_gradient_dict: Dict of {param_name: accumulated_gradient_tensor} for this rank's minibatch
-        rank: Current rank
-        world_size: Total number of ranks
+    # Get all keys (should be the same across all inputs on rank 0)
+    all_keys = set(average_gradient_singular_values.keys())
     
-    Returns:
-        c_estimates_dict: Dict of {param_name: c_values_array} 
-    """
-    c_estimates = {}
-    
-    for param_key, my_gradient in my_gradient_dict.items():
-        try:
-            # All-reduce to compute mean gradient across ranks
-            mean_gradient = my_gradient.clone()
-            dist.all_reduce(mean_gradient, op=dist.ReduceOp.AVG)
-            
-            # Compute SVD of mean gradient (truth) 
-            U0, _, V0h = torch.linalg.svd(mean_gradient, full_matrices=False)
-            V0 = V0h.T
-            
-            # Compute SVD of my gradient
-            U, _, Vh = torch.linalg.svd(my_gradient, full_matrices=False) 
-            V = Vh.T
-            
-            # Compute C estimate: |<u, u0>| * |<v, v0>|
-            cu = torch.abs(torch.einsum('mr,mr->r', U, U0))  # (r,)
-            cv = torch.abs(torch.einsum('nr,nr->r', V, V0))  # (r,)
-            c_estimate = cu * cv  # (r,)
-            
-            c_estimates[param_key] = c_estimate.cpu().numpy()
-            
-        except Exception as e:
-            print(f"Error computing C for {param_key}: {e}")
-            r = min(my_gradient.shape)
-            c_estimates[param_key] = np.zeros(r)
-    
-    return c_estimates
-
-def aggregate_singular_values_and_stable_ranks(all_gradient_results, weight_results, c_estimates_dict=None):
-    """Aggregate singular values and stable rank statistics across minibatches."""
-    param_data = {}
-    
-    all_param_keys = set()
-    for mb_grads in all_gradient_results:
-        all_param_keys.update(mb_grads.keys())
-    
-    for param_key in all_param_keys:
-        # param_key is already a tuple (param_type, layer_num)
+    for param_key in all_keys:
         param_type, layer_num = param_key
         
-        sv_arrays = [mb_grads[param_key]['sv'] for mb_grads in all_gradient_results if param_key in mb_grads]
-        stable_ranks = [mb_grads[param_key]['stable_rank'] for mb_grads in all_gradient_results if param_key in mb_grads]
-        
-        min_len = min(len(sv) for sv in sv_arrays)
-        aligned_svs = [sv[:min_len] for sv in sv_arrays]
-        aligned_svs_array = np.array(aligned_svs)
-        
-        key = (param_type, layer_num)
-        param_data[key] = {
-            'gradient_singular_values': aligned_svs_array,  # 8x1024 ndarray of all gradient SVs
-            'weight_stable_rank': weight_results[param_key]['stable_rank'],
-            'gradient_stable_rank_mean': np.mean(stable_ranks),
-            'gradient_stable_rank_std': np.std(stable_ranks)
+        records[param_key] = {
+            'gradient_singular_values': per_minibatch_gradient_singular_values[param_key].cpu().numpy(),
+            'weight_stable_rank': weight_matrix_stable_rank[param_key].cpu().item(),
+            'gradient_stable_rank_mean': per_minibatch_gradient_stable_rank[param_key].cpu().mean().item(),
+            'gradient_stable_rank_std': per_minibatch_gradient_stable_rank[param_key].cpu().std().item(),
+            'spectral_projection_coefficients_from_8x_mean_gradient': spectral_projection_coefficients[param_key].cpu().numpy()
         }
-        
-        # Add C estimates if provided
-        if c_estimates_dict and param_key in c_estimates_dict:
-            # Only c_with_mean_truth now
-            param_data[key]['c_with_mean_truth'] = c_estimates_dict[param_key]
     
-    return param_data
+    return records
 
 
 def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: int, rank: int, world_size: int, device: torch.device):
-    """Compute singular values and stable rank analysis using accumulated gradients (with momentum)."""
+    """
+    Functional implementation of gradient analysis using GPTLayerProperty transformations.
+    This replaces the procedural approach with clean functional transformations.
+    """
     
     model = setup_model_from_checkpoint(checkpoint_file, device)
     args = Hyperparameters()
     
     if rank == 0:
-        print(f"Rank {rank}: Starting weight analysis")
-        weight_start = time.time()
-    weight_results = extract_model_analysis_distributed(model, use_gradients=False)
-    torch.cuda.empty_cache()
-    if rank == 0:
-        print(f"Rank {rank}: Weight analysis took {time.time() - weight_start:.1f}s")
+        print(f"Rank {rank}: Starting functional gradient analysis")
+        start_time = time.time()
     
-    # Initialize momentum buffers for accumulated gradient computation
+    # 1. Get weight matrices (full on all ranks, used for stable rank computation)
+    checkpoint_weight_matrices = get_weight_matrices(model, only_hidden=True)
+    
+    # 2. Initialize momentum buffers
     momentum_buffers = {}
-    layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
-    for (param_type, layer_num), param in layer_properties.items():
-        momentum_buffers[(param_type, layer_num)] = torch.zeros_like(param, dtype=torch.float32)
+    for param_key, param in checkpoint_weight_matrices.items():
+        momentum_buffers[param_key] = torch.zeros_like(param, dtype=torch.float32)
     
-    # Get momentum value for this step (matches training_core.py logic)
+    # 3. Get momentum value for this step
     frac = step / args.num_iterations
     momentum_value = (1 - frac) * 0.85 + frac * 0.95
     
     if rank == 0:
         print(f"Using momentum value: {momentum_value:.3f} for step {step}")
     
-    # Create real data loader like training
-    data_loader = create_real_data_loader(args, rank, world_size)
-    all_gradient_results = []
-    my_gradient_dict = {}  # Store accumulated gradient for my assigned minibatch
+    # 4. Create data loader
+    data_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
-    for mb_idx in range(num_minibatches):
-        if rank == 0:
-            print(f"  Minibatch {mb_idx+1}/{num_minibatches}")
-        
-        inputs, targets = next(data_loader)
-        
-        model.zero_grad()
-        model.train()
-        
-        window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(device)
-        if rank == 0:
-            print(f"    Starting forward pass")
-        loss = model(inputs, targets, window_size_blocks)
-        if rank == 0:
-            print(f"    Starting backward pass")
-        loss.backward()
-        
-        if rank == 0:
-            print(f"    Starting gradient sync")
-        # Synchronize gradients across ranks
-        for param in model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        if rank == 0:
-            print(f"    Gradient sync complete")
-        
-        # Update momentum buffers and compute accumulated gradients (like Muon does)
-        accumulated_gradients = {}
-        layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
-        for (param_type, layer_num), param in layer_properties.items():
-            if param.grad is None:
-                continue
-            
-            # Update momentum buffer: momentum_buffer = momentum * momentum_buffer + (1 - momentum) * grad
-            grad_f32 = param.grad.float()
-            param_key = (param_type, layer_num)
-            momentum_buffers[param_key] = momentum_value * momentum_buffers[param_key] + (1 - momentum_value) * grad_f32
-            
-            # Compute accumulated gradient: accumulated_grad = momentum * momentum_buffer + (1 - momentum) * grad
-            # This matches exactly what Muon does in zeropower.py:199
-            accumulated_grad = momentum_value * momentum_buffers[param_key] + (1 - momentum_value) * grad_f32
-            accumulated_gradients[param_key] = accumulated_grad
-        
-        # Store accumulated gradient for C computation if this is my assigned minibatch
-        if mb_idx == rank and mb_idx < world_size:
-            if rank == 0:
-                print(f"    Storing accumulated gradients for C estimation on rank {rank}")
-            for param_key, accumulated_grad in accumulated_gradients.items():
-                # No need to split - already handled by get_weight_matrix_iterator
-                # Keep accumulated gradient on GPU in float32
-                my_gradient_dict[param_key] = accumulated_grad.detach().to(torch.float32)
-        
-        if rank == 0:
-            print(f"    Rank {rank}: Extracting accumulated gradients for mb {mb_idx}")
-            mb_start = time.time()
-        mb_results = extract_model_analysis_distributed(model, use_gradients=True, accumulated_gradients=accumulated_gradients)
-        if rank == 0:
-            all_gradient_results.append(mb_results)
-            print(f"    Rank {rank}: Accumulated gradient extraction took {time.time() - mb_start:.1f}s")
-        
-        model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
+    # 5. Core computation: compute sharded per-minibatch gradients
+    if rank == 0:
+        print(f"Rank {rank}: Computing sharded gradients")
+        grad_start = time.time()
+    
+    per_minibatch_gradient = compute_sharded_gradients(
+        model, data_loader, num_minibatches, momentum_buffers, momentum_value, step
+    )
     
     if rank == 0:
-        print(f"Rank {rank}: Computing distributed C estimates")
-        c_start = time.time()
+        print(f"Rank {rank}: Gradient computation took {time.time() - grad_start:.1f}s")
     
-    # Compute C estimates using distributed approach
-    c_estimates_dict = compute_c_with_mean_truth_distributed(my_gradient_dict, rank, world_size)
+    # 6. Statistical transforms: compute average gradient
+    if rank == 0:
+        print(f"Rank {rank}: Computing average gradients")
+    
+    def apply_mean_across_batch_dim(layer_properties, dim=0):
+        """Apply mean reduction across specified dimension."""
+        return {key: tensor.mean(dim=dim) for key, tensor in layer_properties.items()}
+    
+    average_gradient = apply_mean_across_batch_dim(per_minibatch_gradient, dim=0)
+    
+    # 7. SVD transforms
+    if rank == 0:
+        print(f"Rank {rank}: Computing SVDs")
+        svd_start = time.time()
+    
+    # Batched SVD for per-minibatch gradients
+    per_grad_U, per_grad_S, per_grad_Vh = apply_batched_svd(per_minibatch_gradient)
+    
+    # Regular SVD for average gradients
+    avg_grad_U, avg_grad_S, avg_grad_Vh = apply_svd(average_gradient)
     
     if rank == 0:
-        print(f"Rank {rank}: C estimation took {time.time() - c_start:.1f}s")
-        print(f"Rank {rank}: Aggregating results for {len(all_gradient_results)} minibatches")
-        agg_start = time.time()
-        result = aggregate_singular_values_and_stable_ranks(all_gradient_results, weight_results, c_estimates_dict)
-        print(f"Rank {rank}: Aggregation took {time.time() - agg_start:.1f}s")
-        return step, result
+        print(f"Rank {rank}: SVD computation took {time.time() - svd_start:.1f}s")
+    
+    # 8. Basis similarity and spectral projection coefficients
+    if rank == 0:
+        print(f"Rank {rank}: Computing basis similarities")
+    
+    left_cosines, right_cosines, spectral_coeffs = compute_basis_similarities_and_spectral_coeffs(
+        per_grad_U, per_grad_Vh, avg_grad_U, avg_grad_Vh
+    )
+    
+    # 9. Gradient singular value standard deviations
+    gradient_sv_std = compute_gradient_singular_value_std(per_grad_S, avg_grad_S)
+    
+    # 10. Stable ranks
+    if rank == 0:
+        print(f"Rank {rank}: Computing stable ranks")
+    
+    per_minibatch_stable_ranks = apply_stable_rank(per_minibatch_gradient)  # 8-element tensors
+    weight_stable_ranks = apply_stable_rank(checkpoint_weight_matrices)      # scalars
+    
+    # 11. Gather to rank 0
+    if rank == 0:
+        print(f"Rank {rank}: Gathering results to rank 0")
+        gather_start = time.time()
+    
+    gathered_results = gather_layer_properties_to_rank_zero(
+        avg_grad_S, per_grad_S, gradient_sv_std, spectral_coeffs, 
+        per_minibatch_stable_ranks, weight_stable_ranks
+    )
+    
+    if rank == 0:
+        print(f"Rank {rank}: Gathering took {time.time() - gather_start:.1f}s")
+        
+        # Unpack gathered results
+        (avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
+         spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full) = gathered_results
+        
+        # 12. Convert to record format for CSV compatibility
+        print(f"Rank {rank}: Converting to record format")
+        records = convert_to_record_format(
+            avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
+            spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full
+        )
+        
+        total_time = time.time() - start_time
+        print(f"Rank {rank}: Functional analysis completed in {total_time:.1f}s")
+        
+        return step, records
+    
     return step, {}
 
 
-def save_step_to_csvs(step: int, step_data: dict, sv_output_dir: Path, sr_output_dir: Path):
+def unpivot_and_save_step_to_csvs(step: int, step_data: dict, sv_output_dir: Path, sr_output_dir: Path):
     """Save step data to the new CSV format."""
     sv_cache_data = []
-    sr_cache_data = []
     
     for (param_type, layer_num), layer_data in step_data.items():
         sv_row = {
             'param_type': param_type,
             'layer_num': layer_num,
-            'means': json.dumps(layer_data['means'].tolist()),
-            'stds': json.dumps(layer_data['stds'].tolist()),
-        }
-        
-        # Add C estimate if available
-        if 'c_with_mean_truth' in layer_data:
-            sv_row['c_with_mean_truth'] = json.dumps(layer_data['c_with_mean_truth'].tolist())
-            
-        sv_cache_data.append(sv_row)
-        
-        sr_cache_data.append({
-            'param_type': param_type,
-            'layer_num': layer_num,
             'weight_stable_rank': layer_data['weight_stable_rank'],
             'gradient_stable_rank_mean': layer_data['gradient_stable_rank_mean'],
             'gradient_stable_rank_std': layer_data['gradient_stable_rank_std']
-        })
+        }
+        
+        # Add spectral projection coefficients if available
+        if 'spectral_projection_coefficients_from_8x_mean_gradient' in layer_data:
+            sv_row['spectral_projection_coefficients_from_8x_mean_gradient'] = json.dumps(layer_data['spectral_projection_coefficients_from_8x_mean_gradient'].tolist())
+            
+        sv_cache_data.append(sv_row)
     
     sv_output_dir.mkdir(parents=True, exist_ok=True)
-    sr_output_dir.mkdir(parents=True, exist_ok=True)
     
     pd.DataFrame(sv_cache_data).to_csv(sv_output_dir / f"step_{step:06d}.csv", index=False)
-    pd.DataFrame(sr_cache_data).to_csv(sr_output_dir / f"step_{step:06d}.csv", index=False)
 
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
@@ -496,7 +582,7 @@ def main():
         
         if master_process:
             print(f"Step {step} completed in {time.time() - start_time:.1f}s")
-            save_step_to_csvs(step, param_data, sv_output_dir, sr_output_dir)
+            unpivot_and_save_step_to_csvs(step, param_data, sv_output_dir, sr_output_dir)
             print(f"Step {step} saved to CSV files")
     
     if master_process:

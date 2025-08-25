@@ -137,9 +137,12 @@ def load_singular_values_data(sv_dir: Path) -> dict:
         
         for _, row in df.iterrows():
             key = (row['param_type'], int(row['layer_num']))
+            # New format: (8, |S|) array of per-minibatch singular values
+            gradient_svs = np.array(json.loads(row['gradient_singular_values']))
+            # Use all individual singular values directly
             layer_data = {
-                'means': np.array(json.loads(row['means'])),
-                'stds': np.array(json.loads(row['stds']))
+                'per_minibatch_singular_values': gradient_svs.flatten(),  # All individual singular values
+                'stds': np.ones_like(gradient_svs.flatten()) * 1e-10  # Dummy stds
             }
             
             # Load C estimate if available
@@ -352,13 +355,13 @@ def create_frame_with_scatter(step: int, param_data: dict, axis_ranges: dict, ou
         return [(layer_num, data) for (p_type, layer_num), data in param_data.items() if p_type == param_type and layer_num >= 0]
     def plot_std_mean_scatter(ax, param_type, layer_data_list, viridis, max_layers):
         ax.set_xscale('log'); ax.set_yscale('log')
-        ax.set_xlabel('Mean Singular Value'); ax.set_ylabel('Std Singular Value')
+        ax.set_xlabel('Per-minibatch singular value'); ax.set_ylabel('Singular value standard deviation across minibatch seeds')
         ax.set_title(f'{param_type}')
         ax.grid(True, alpha=0.3)
         rng = axis_ranges[param_type]; ax.set_xlim(rng['x_min'], rng['x_max']); ax.set_ylim(rng['y_min'], rng['y_max'])
         for layer_num, data in layer_data_list:
             color = viridis(layer_num / (max_layers - 1))
-            ax.scatter(data['means'], data['stds'], alpha=0.08, s=15, c=[color])
+            ax.scatter(data['per_minibatch_singular_values'], data['stds'], alpha=0.08, s=15, c=[color])
     frame_path = output_dir / f"frame_scatter_{step:06d}.png"
     create_subplot_grid(param_types, (20, 10), get_frame_data, plot_std_mean_scatter, f'Std–Mean Scatter - Step {step}', frame_path)
     return str(frame_path)

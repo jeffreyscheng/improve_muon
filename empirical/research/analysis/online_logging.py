@@ -64,7 +64,8 @@ def dummy_logging(
     Just log the norm of each weight.
     """
     run_name = other_state["run_name"]
-    apply_fn_to_all_layers(model, calculate_weight_norm, run_name)
+    layer_properties = get_weight_matrices(model, only_hidden=True)
+    apply_fn_to_all_layers(layer_properties, lambda key, tensor: calculate_weight_norm(key, tensor, run_name))
 
 def svd_logging(
     model,
@@ -75,7 +76,8 @@ def svd_logging(
     Log the singular values of each weight matrix.
     """
     run_name = other_state["run_name"]
-    apply_fn_to_all_layers(model, calculate_singular_values, run_name)
+    layer_properties = get_weight_matrices(model, only_hidden=True)
+    apply_fn_to_all_layers(layer_properties, lambda key, tensor: calculate_singular_values(key, tensor, run_name))
 
 def calculate_singular_values(key: tuple[str, int], weight: Parameter | np.ndarray, run_name: str):
     param_type, layer_num = key

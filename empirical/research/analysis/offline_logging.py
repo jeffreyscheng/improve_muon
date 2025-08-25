@@ -7,7 +7,7 @@ import torch.distributed as dist
 import time
 import copy
 from torch.nn import Parameter, Module
-from .map import get_weight_matrix_iterator, apply_fn_to_all_layers, get_research_log_path
+from .map import get_weight_matrices, get_research_log_path
 
 def is_logging_step_piecewise_log(step: int, total_steps: int) -> bool:
     """Determine if we should serialize the model at this step.
@@ -171,7 +171,7 @@ def compute_gradient_singular_values(model, data_loader, num_minibatches: int, r
             # Extract gradients using weight iterator
             batch_gradients = {}
             
-            layer_properties = get_weight_matrix_iterator(model, only_hidden=True)
+            layer_properties = get_weight_matrices(model, only_hidden=True)
             for (param_type, layer_num), param in layer_properties.items():
                 if param.grad is not None:
                     grad = param.grad.clone().detach()
