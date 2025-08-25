@@ -138,16 +138,17 @@ def load_singular_values_data(sv_dir: Path) -> dict:
         for _, row in df.iterrows():
             key = (row['param_type'], int(row['layer_num']))
             # New format: (8, |S|) array of per-minibatch singular values
-            gradient_svs = np.array(json.loads(row['gradient_singular_values']))
-            # Use all individual singular values directly
+            gradient_svs = np.array(json.loads(row['per_minibatch_gradient_singular_values']))
+            gradient_sv_stds = np.array(json.loads(row['gradient_singular_value_standard_deviations']))
+            
             layer_data = {
                 'per_minibatch_singular_values': gradient_svs.flatten(),  # All individual singular values
-                'stds': np.ones_like(gradient_svs.flatten()) * 1e-10  # Dummy stds
+                'stds': gradient_sv_stds.flatten()  # Corresponding standard deviations
             }
             
             # Load C estimate if available
-            if 'c_with_mean_truth' in row and pd.notna(row['c_with_mean_truth']):
-                layer_data['c_with_mean_truth'] = np.array(json.loads(row['c_with_mean_truth']))
+            if 'spectral_projection_coefficients_from_8x_mean_gradient' in row and pd.notna(row['spectral_projection_coefficients_from_8x_mean_gradient']):
+                layer_data['c_with_mean_truth'] = np.array(json.loads(row['spectral_projection_coefficients_from_8x_mean_gradient']))
                 
             step_data[key] = layer_data
         
@@ -171,10 +172,13 @@ def load_stable_rank_data(sr_dir: Path) -> dict:
         
         for _, row in df.iterrows():
             key = (row['param_type'], int(row['layer_num']))
+            # Load per-minibatch gradient stable ranks and compute stats
+            per_mb_ranks = np.array(json.loads(row['per_minibatch_gradient_stable_rank']))
             step_data[key] = {
                 'weight_stable_rank': row['weight_stable_rank'],
-                'gradient_stable_rank_mean': row['gradient_stable_rank_mean'],
-                'gradient_stable_rank_std': row['gradient_stable_rank_std']
+                'gradient_stable_rank_mean': per_mb_ranks.mean(),
+                'gradient_stable_rank_std': per_mb_ranks.std(),
+                'per_minibatch_gradient_stable_rank': per_mb_ranks
             }
         
         results[step] = step_data
@@ -199,12 +203,24 @@ def fit_noise_models_to_data(sv_data: dict, sr_data: dict) -> dict:
         for key in sv_data[step].keys():
             if key in sr_data[step]:
                 step_data[key] = {**sv_data[step][key], **sr_data[step][key]}
-                # Add c_i prediction from mean singular values (square case, beta=1)
-                means = step_data[key].get('means', None)
-                if isinstance(means, np.ndarray) and means.size > 0:
+                # Compute means from per-minibatch singular values
+                per_mb_svs = step_data[key]['per_minibatch_singular_values']
+                # Reshape to (num_minibatches, num_singular_values) and take mean across minibatches
+                if per_mb_svs.size > 0:
+                    # Assume 8 minibatches - reshape accordingly
+                    num_svs_per_mb = per_mb_svs.size // 8
+                    if per_mb_svs.size % 8 == 0 and num_svs_per_mb > 0:
+                        reshaped = per_mb_svs.reshape(8, num_svs_per_mb)
+                        means = reshaped.mean(axis=0)  # Average across minibatches
+                    else:
+                        means = per_mb_svs  # Fallback if reshape fails
+                    step_data[key]['means'] = means
+                    
+                    # Add c_i prediction from mean singular values (square case, beta=1)
                     edge = _estimate_bulk_edge_from_spectrum(means)  # robust bulk edge from that layer's spectrum
                     step_data[key]['c_pred_from_means'] = c_pred_square(means, edge=edge)
                 else:
+                    step_data[key]['means'] = np.array([], dtype=float)
                     step_data[key]['c_pred_from_means'] = np.array([], dtype=float)
 
         # --- Mixture model (lognormal edge) per param_type at this step ---

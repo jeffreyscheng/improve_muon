@@ -345,10 +345,10 @@ def convert_to_record_format(
         param_type, layer_num = param_key
         
         records[param_key] = {
-            'gradient_singular_values': per_minibatch_gradient_singular_values[param_key].cpu().numpy(),
+            'per_minibatch_gradient_singular_values': per_minibatch_gradient_singular_values[param_key].cpu().numpy(),
+            'gradient_singular_value_standard_deviations': gradient_singular_value_standard_deviations[param_key].cpu().numpy(),
             'weight_stable_rank': weight_matrix_stable_rank[param_key].cpu().item(),
-            'gradient_stable_rank_mean': per_minibatch_gradient_stable_rank[param_key].cpu().mean().item(),
-            'gradient_stable_rank_std': per_minibatch_gradient_stable_rank[param_key].cpu().std().item(),
+            'per_minibatch_gradient_stable_rank': per_minibatch_gradient_stable_rank[param_key].cpu().numpy(),
             'spectral_projection_coefficients_from_8x_mean_gradient': spectral_projection_coefficients[param_key].cpu().numpy()
         }
     
@@ -481,13 +481,11 @@ def unpivot_and_save_step_to_csvs(step: int, step_data: dict, sv_output_dir: Pat
             'param_type': param_type,
             'layer_num': layer_num,
             'weight_stable_rank': layer_data['weight_stable_rank'],
-            'gradient_stable_rank_mean': layer_data['gradient_stable_rank_mean'],
-            'gradient_stable_rank_std': layer_data['gradient_stable_rank_std']
+            'per_minibatch_gradient_singular_values': json.dumps(layer_data['per_minibatch_gradient_singular_values'].tolist()),
+            'gradient_singular_value_standard_deviations': json.dumps(layer_data['gradient_singular_value_standard_deviations'].tolist()),
+            'per_minibatch_gradient_stable_rank': json.dumps(layer_data['per_minibatch_gradient_stable_rank'].tolist()),
+            'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(layer_data['spectral_projection_coefficients_from_8x_mean_gradient'].tolist())
         }
-        
-        # Add spectral projection coefficients if available
-        if 'spectral_projection_coefficients_from_8x_mean_gradient' in layer_data:
-            sv_row['spectral_projection_coefficients_from_8x_mean_gradient'] = json.dumps(layer_data['spectral_projection_coefficients_from_8x_mean_gradient'].tolist())
             
         sv_cache_data.append(sv_row)
     
