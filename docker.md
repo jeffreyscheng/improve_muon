@@ -318,3 +318,29 @@ docker run --gpus all --rm \
 - Cached kernels from training are reused immediately
 - No redundant compilation across ranks
 - Proper file system coordination prevents race conditions
+
+## Memory Management for Analysis Scripts
+
+**Problem**: Gradient analysis scripts can hit CUDA OOM errors due to memory fragmentation, even when total GPU memory is sufficient. This is especially common when processing later checkpoints or larger models.
+
+**Solution**: Use PyTorch's memory allocator configuration to reduce fragmentation:
+
+```bash
+docker run --gpus all --rm \
+  -v $(pwd):/workspace \
+  -v $(pwd)/torch_compile_cache:/tmp/torchinductor_root \
+  -w /workspace \
+  -e PYTHONPATH=/workspace \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128 \
+  nanogpt-archived \
+  torchrun --standalone --nproc_per_node=8 analysis_script.py
+```
+
+**Memory settings explained:**
+- `expandable_segments:True`: Reduces memory fragmentation by allowing dynamic memory segment expansion
+- `max_split_size_mb:128`: Limits memory split size to prevent large unusable fragments
+
+**When to use:**
+- Gradient analysis scripts that process multiple checkpoints
+- When seeing OOM errors with "reserved but unallocated memory is large"
+- Any memory-intensive analysis that loads full models and computes gradients
