@@ -10,12 +10,6 @@ import itertools
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Set standardized cache directories before torch import
-cache_dir = "kernel_cache"
-os.makedirs(cache_dir, exist_ok=True)
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_dir}/inductor"
-os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
-
 import torch
 if torch.cuda.is_available():
     torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems

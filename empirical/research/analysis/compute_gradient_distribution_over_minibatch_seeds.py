@@ -29,12 +29,6 @@ from pathlib import Path
 # Memory optimization like training
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Set standardized cache directories before torch import
-cache_dir = "kernel_cache"
-os.makedirs(cache_dir, exist_ok=True)
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_dir}/inductor"
-os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
-
 import torch
 torch._inductor.config.coordinate_descent_tuning = False
 import torch.distributed as dist
