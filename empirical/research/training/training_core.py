@@ -141,7 +141,6 @@ def setup_distributed_training():
     import torch._inductor.config as config
     config.coordinate_descent_tuning = True  # Keep existing setting
     config.triton.unique_kernel_names = True  # Prevents name collisions
-    config.cache_dir = os.environ["TORCHINDUCTOR_CACHE_DIR"]
     config.compile_threads = 1  # Prevents race conditions
     config.worker_start_method = "spawn"  # Clean process isolation
     
