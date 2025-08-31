@@ -157,22 +157,39 @@ def safe_torch_compile(model, **compile_kwargs):
     Returns:
         Compiled model
     """
-    if dist.is_initialized():
-        # Rank 0 compiles first to populate cache
-        if dist.get_rank() == 0:
-            model = torch.compile(model, **compile_kwargs)
-        
-        # Synchronization point - rank 0 signals completion
-        dist.barrier()
-        
-        # Other ranks can now safely compile (will use cached kernels)
-        if dist.get_rank() != 0:
-            model = torch.compile(model, **compile_kwargs)
-    else:
-        # Non-distributed case
-        model = torch.compile(model, **compile_kwargs)
+    # Always call torch.compile - the synchronization happens during first execution
+    compiled_model = torch.compile(model, **compile_kwargs)
     
-    return model
+    if dist.is_initialized():
+        # Create a wrapper that handles distributed synchronization on first call
+        original_forward = compiled_model.forward
+        first_call = [True]  # Use list to allow modification in closure
+        
+        def synchronized_forward(*args, **kwargs):
+            if first_call[0]:
+                first_call[0] = False
+                
+                # Only rank 0 executes the first forward pass (triggers compilation)
+                if dist.get_rank() == 0:
+                    result = original_forward(*args, **kwargs)
+                else:
+                    result = None
+                
+                # Synchronize - rank 0 has finished compilation
+                dist.barrier()
+                
+                # Now all ranks can safely call forward (uses cached kernels)
+                if dist.get_rank() != 0:
+                    result = original_forward(*args, **kwargs)
+                
+                return result
+            else:
+                # Subsequent calls use the compiled model normally
+                return original_forward(*args, **kwargs)
+        
+        compiled_model.forward = synchronized_forward
+    
+    return compiled_model
 
 def setup_logging(run_id, master_process):
     """Setup logging infrastructure and return logging function and paths."""
