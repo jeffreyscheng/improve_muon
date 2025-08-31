@@ -218,22 +218,28 @@ def gather_layer_properties_to_rank_zero(*sharded_properties: GPTLayerProperty) 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
+    # Batch all properties into a single gather operation
+    all_gathered_data = [None] * world_size
+    dist.all_gather_object(all_gathered_data, sharded_properties)
+    
     gathered_properties = []
     
-    for sharded_prop in sharded_properties:
-        # Gather all sharded properties from all ranks
-        all_sharded_props = [None] * world_size
-        dist.all_gather_object(all_sharded_props, sharded_prop)
+    if rank == 0:
+        # all_gathered_data contains [rank0_props, rank1_props, ..., rank7_props]
+        # where each rank_props is a tuple of GPTLayerProperty objects
         
-        if rank == 0:
-            # Merge all sharded properties into one full property
+        for prop_idx in range(len(sharded_properties)):
+            # Merge this property across all ranks
             full_property = {}
-            for rank_prop in all_sharded_props:
-                if rank_prop is not None:
-                    full_property.update(rank_prop)
+            for rank_data in all_gathered_data:
+                if rank_data is not None and len(rank_data) > prop_idx:
+                    rank_prop = rank_data[prop_idx]
+                    if rank_prop is not None:
+                        full_property.update(rank_prop)
             gathered_properties.append(full_property)
-        else:
-            gathered_properties.append({})
+    else:
+        # Non-rank-0 processes get empty properties
+        gathered_properties = [{}] * len(sharded_properties)
     
     return gathered_properties
 
