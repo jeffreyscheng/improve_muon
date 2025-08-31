@@ -40,7 +40,7 @@ import imageio.v2 as imageio
 # Import all dependencies at top level
 from empirical.research.training.training_core import (
     setup_distributed_training, get_window_size_blocks, Hyperparameters, 
-    warmup_kernels, distributed_data_generator, safe_torch_compile
+    warmup_kernels, distributed_data_generator, safe_torch_compile, ddp_compile_gate
 )
 from empirical.research.analysis.offline_logging import compute_stable_rank
 from empirical.research.analysis.map import (
@@ -332,6 +332,14 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
     # Collect gradients and momentum buffers for my assigned parameters across all minibatches
     per_minibatch_gradients = {}
     per_minibatch_momentum_buffers = {}
+    
+    # Ensure kernels are compiled before starting the gradient computation loop
+    # Only local rank 0 compiles, others wait at barrier
+    inputs, targets = next(data_loader)
+    window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(device)
+    ddp_compile_gate(lambda: model(inputs, targets, window_size_blocks).backward())
+    # Reset data loader to start from beginning again
+    data_loader = distributed_data_generator(step, num_minibatches, rank, world_size, device)
     
     for mb_idx in range(num_minibatches):
         if rank == 0:
