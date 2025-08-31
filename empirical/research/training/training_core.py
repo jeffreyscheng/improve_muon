@@ -148,47 +148,29 @@ def setup_distributed_training():
 
 def safe_torch_compile(model, **compile_kwargs):
     """
-    Standard distributed-safe torch.compile wrapper.
+    Distributed-safe torch.compile that prevents kernel cache corruption.
+    Only compiles on rank 0, other ranks use eager mode to avoid race conditions.
     
     Args:
         model: PyTorch model to compile
         **compile_kwargs: Arguments passed to torch.compile (e.g., dynamic=False)
     
     Returns:
-        Compiled model
+        Compiled model (rank 0) or original model (other ranks)
     """
-    # Always call torch.compile - the synchronization happens during first execution
-    compiled_model = torch.compile(model, **compile_kwargs)
+    if not dist.is_initialized():
+        return torch.compile(model, **compile_kwargs)
     
-    if dist.is_initialized():
-        # Create a wrapper that handles distributed synchronization on first call
-        original_forward = compiled_model.forward
-        first_call = [True]  # Use list to allow modification in closure
-        
-        def synchronized_forward(*args, **kwargs):
-            if first_call[0]:
-                first_call[0] = False
-                
-                # Only rank 0 executes the first forward pass (triggers compilation)
-                if dist.get_rank() == 0:
-                    result = original_forward(*args, **kwargs)
-                else:
-                    result = None
-                
-                # Synchronize - rank 0 has finished compilation
-                dist.barrier()
-                
-                # Now all ranks can safely call forward (uses cached kernels)
-                if dist.get_rank() != 0:
-                    result = original_forward(*args, **kwargs)
-                
-                return result
-            else:
-                # Subsequent calls use the compiled model normally
-                return original_forward(*args, **kwargs)
-        
-        compiled_model.forward = synchronized_forward
+    # Only compile on rank 0 to prevent kernel cache corruption
+    if dist.get_rank() == 0:
+        compiled_model = torch.compile(model, **compile_kwargs)
+        print(f"Rank {dist.get_rank()}: Model compiled with torch.compile")
+    else:
+        compiled_model = model  # Use eager mode on other ranks
+        print(f"Rank {dist.get_rank()}: Using eager mode (compilation disabled)")
     
+    # Synchronize to ensure rank 0 finishes compilation setup
+    dist.barrier()
     return compiled_model
 
 def setup_logging(run_id, master_process):

@@ -80,9 +80,9 @@ def estimate_noise_level(innovation_spectrum: np.ndarray, beta: float) -> float:
 
     So the singular spectrum of R_t should be mostly Marchenko-Pastur with a few spikes.
 
-    We find the noise level \hat{\sigma} by using fixed point iteration to the condition that:
-    - inliers are exactly those below the edge {i: s_i\leq \tau(\hat{sigma})}
-    - \hat{\sigma} is the MLE of \sigam on those inliers.
+    We find the noise level \\hat{\\sigma} by using fixed point iteration to the condition that:
+    - inliers are exactly those below the edge {i: s_i\\leq \\tau(\\hat{sigma})}
+    - \\hat{\\sigma} is the MLE of \\sigma on those inliers.
     """
     assert np.all(np.diff(innovation_spectrum) <= 0.0)
     spectrum = innovation_spectrum[::-1]
