@@ -1,0 +1,47 @@
+FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_VERSION=3.12.7
+ENV PATH=/usr/local/bin:$PATH
+
+RUN apt update && apt install -y --no-install-recommends build-essential libssl-dev zlib1g-dev \
+    libbz2-dev libreadline-dev libsqlite3-dev curl git libncursesw5-dev xz-utils tk-dev libxml2-dev \
+    libxmlsec1-dev libffi-dev liblzma-dev \
+    && apt clean && rm -rf /var/lib/apt/lists/*
+
+RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
+    tar -xzf Python-${PYTHON_VERSION}.tgz && \
+    cd Python-${PYTHON_VERSION} && \
+    ./configure --enable-optimizations && \
+    make -j$(nproc) && \
+    make altinstall && \
+    cd .. && \
+    rm -rf Python-${PYTHON_VERSION} Python-${PYTHON_VERSION}.tgz
+
+RUN ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
+    ln -s /usr/local/bin/pip3.12 /usr/local/bin/pip
+
+WORKDIR /improve_muon
+
+RUN python -m pip install --upgrade pip
+
+# Install only basic requirements without torch first
+RUN pip install tqdm numpy huggingface_hub
+
+# Install specific archived PyTorch version that works with FlexAttention
+RUN pip install https://github.com/YouJiacheng/pytorch-nightly-whl-archive/releases/download/v2.7.0.dev20250208/torch-2.7.0.dev20250208+cu126-cp312-cp312-manylinux_2_28_x86_64.whl --no-deps
+
+# Try installing triton from PyPI that's compatible with this torch version
+RUN pip install triton==3.2.0 --no-deps || pip install triton --no-deps || echo "Triton installation failed, continuing..."
+
+# Install remaining NVIDIA dependencies
+RUN pip install nvidia-cuda-nvrtc-cu12==12.6.77 nvidia-cuda-runtime-cu12==12.6.77 nvidia-cuda-cupti-cu12==12.6.80 nvidia-cudnn-cu12==9.5.1.17 nvidia-cublas-cu12==12.6.4.1 nvidia-cufft-cu12==11.3.0.4 nvidia-curand-cu12==10.3.7.77 nvidia-cusolver-cu12==11.7.1.2 nvidia-cusparse-cu12==12.5.4.2 nvidia-cusparselt-cu12==0.6.3 nvidia-nccl-cu12==2.21.5 nvidia-nvtx-cu12==12.6.77 nvidia-nvjitlink-cu12==12.6.85
+
+# Install remaining torch dependencies
+RUN pip install sympy==1.13.1 networkx jinja2 fsspec filelock typing-extensions setuptools
+
+# Install dependencies for gif generation and analysis
+RUN pip install pandas matplotlib imageio
+
+CMD ["bash"]
+ENTRYPOINT []
