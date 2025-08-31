@@ -136,7 +136,44 @@ def setup_distributed_training():
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
     master_process = (rank == 0)
+    
+    # Configure inductor for distributed-safe compilation
+    import torch._inductor.config as config
+    config.coordinate_descent_tuning = True  # Keep existing setting
+    config.triton.unique_kernel_names = True  # Prevents name collisions
+    config.cache_dir = os.environ["TORCHINDUCTOR_CACHE_DIR"]
+    config.compile_threads = 1  # Prevents race conditions
+    config.worker_start_method = "spawn"  # Clean process isolation
+    
     return run_id, rank, world_size, device, master_process
+
+def safe_torch_compile(model, **compile_kwargs):
+    """
+    Standard distributed-safe torch.compile wrapper.
+    
+    Args:
+        model: PyTorch model to compile
+        **compile_kwargs: Arguments passed to torch.compile (e.g., dynamic=False)
+    
+    Returns:
+        Compiled model
+    """
+    if dist.is_initialized():
+        # Rank 0 compiles first to populate cache
+        if dist.get_rank() == 0:
+            model = torch.compile(model, **compile_kwargs)
+        
+        # Synchronization point - rank 0 signals completion
+        dist.barrier()
+        
+        # Other ranks can now safely compile (will use cached kernels)
+        if dist.get_rank() != 0:
+            model = torch.compile(model, **compile_kwargs)
+    else:
+        # Non-distributed case
+        model = torch.compile(model, **compile_kwargs)
+    
+    return model
 
 def setup_logging(run_id, master_process):
     """Setup logging infrastructure and return logging function and paths."""

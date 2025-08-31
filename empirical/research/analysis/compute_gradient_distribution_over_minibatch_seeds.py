@@ -40,7 +40,7 @@ import imageio.v2 as imageio
 # Import all dependencies at top level
 from empirical.research.training.training_core import (
     setup_distributed_training, get_window_size_blocks, Hyperparameters, 
-    warmup_kernels, distributed_data_generator
+    warmup_kernels, distributed_data_generator, safe_torch_compile
 )
 from empirical.research.analysis.offline_logging import compute_stable_rank
 from empirical.research.analysis.map import (
@@ -121,8 +121,8 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     
-    # Compile model like training does
-    model = torch.compile(model, dynamic=False)
+    # Compile model using distributed-safe compilation
+    model = safe_torch_compile(model, dynamic=False)
     
     # Lightweight warmup for analysis - use small sequence to avoid OOM
     small_seq_len = 128  # Much smaller than training's 8192
