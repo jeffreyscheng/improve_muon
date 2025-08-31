@@ -9,8 +9,12 @@ from pathlib import Path
 import itertools
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = "kernel_cache/inductor"
-os.environ["TRITON_CACHE_DIR"] = "kernel_cache/triton"
+
+# Set standardized cache directories before torch import
+cache_dir = "kernel_cache"
+os.makedirs(cache_dir, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_dir}/inductor"
+os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
 
 import torch
 if torch.cuda.is_available():
@@ -148,30 +152,16 @@ def setup_distributed_training():
 
 def safe_torch_compile(model, **compile_kwargs):
     """
-    Distributed-safe torch.compile that prevents kernel cache corruption.
-    Only compiles on rank 0, other ranks use eager mode to avoid race conditions.
+    Standard torch.compile wrapper (cache directories set at import time).
     
     Args:
         model: PyTorch model to compile
         **compile_kwargs: Arguments passed to torch.compile (e.g., dynamic=False)
     
     Returns:
-        Compiled model (rank 0) or original model (other ranks)
+        Compiled model
     """
-    if not dist.is_initialized():
-        return torch.compile(model, **compile_kwargs)
-    
-    # Only compile on rank 0 to prevent kernel cache corruption
-    if dist.get_rank() == 0:
-        compiled_model = torch.compile(model, **compile_kwargs)
-        print(f"Rank {dist.get_rank()}: Model compiled with torch.compile")
-    else:
-        compiled_model = model  # Use eager mode on other ranks
-        print(f"Rank {dist.get_rank()}: Using eager mode (compilation disabled)")
-    
-    # Synchronize to ensure rank 0 finishes compilation setup
-    dist.barrier()
-    return compiled_model
+    return torch.compile(model, **compile_kwargs)
 
 def setup_logging(run_id, master_process):
     """Setup logging infrastructure and return logging function and paths."""
