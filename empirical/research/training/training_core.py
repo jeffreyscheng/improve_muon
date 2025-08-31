@@ -1,4 +1,4 @@
-import os, socket, pathlib
+import os
 import sys
 import uuid
 import time
@@ -8,52 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 import itertools
 
-# Memory optimization like training (must be set before importing torch)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# ---- Stable kernel caches (set once, before importing torch) -----------------
-def _configure_kernel_caches() -> None:
-    host = os.environ.get("HOSTNAME") or socket.gethostname() or "host"
-    home = pathlib.Path.home()
-    xdg_cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
-    torch_cache = xdg_cache / "torch" / "inductor" / host
-    triton_cache = home / ".triton" / "cache" / host
-    # Let external env override; otherwise set ours.
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(torch_cache))
-    os.environ.setdefault("TRITON_CACHE_DIR", str(triton_cache))
-    pathlib.Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    pathlib.Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    # Ensure CUDA driver JIT cache isn't disabled; give it room.
-    if os.environ.get("CUDA_CACHE_DISABLE") == "1":
-        del os.environ["CUDA_CACHE_DISABLE"]
-    os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(1 << 30))  # 1 GiB
-
-_configure_kernel_caches()
-# ------------------------------------------------------------------------------
-
 import torch
-import torch.distributed as dist
-
-# ---- Per-node compile gate ---------------------------------------------------
-def ddp_compile_gate(warmup_fn) -> None:
-    """
-    Idiomatic DDP pattern: only LOCAL_RANK==0 on this node performs the first
-    model forward/backward to trigger Triton/Inductor compilation;
-    other local ranks wait at a barrier so the cache is populated.
-    Call this ONCE, after constructing the model and example inputs.
-    """
-    # Figure out local ranks for this node (torchrun sets these env vars)
-    lrank = int(os.environ.get("LOCAL_RANK", "0"))
-    lworld = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-    rank  = int(os.environ.get("RANK", "0"))
-    first = rank - lrank
-    local_ranks = list(range(first, first + lworld))
-    group = dist.new_group(local_ranks) if dist.is_initialized() and lworld > 1 else None
-    if lrank == 0:
-        warmup_fn()
-    if group is not None:
-        dist.barrier(group=group)
-# ------------------------------------------------------------------------------
 if torch.cuda.is_available():
     torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
