@@ -9,6 +9,9 @@ from pathlib import Path
 import itertools
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "kernel_cache/inductor"
+os.environ["TRITON_CACHE_DIR"] = "kernel_cache/triton"
+
 import torch
 if torch.cuda.is_available():
     torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
