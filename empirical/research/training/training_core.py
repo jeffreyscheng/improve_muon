@@ -1,4 +1,4 @@
-import os
+import os, socket, pathlib
 import sys
 import uuid
 import time
@@ -8,7 +8,41 @@ from functools import lru_cache
 from pathlib import Path
 import itertools
 
+# Memory optimization like training (must be set before importing torch)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# ---- Stable kernel caches (set once, before importing torch) -----------------
+def _setup_kernel_caches() -> None:
+    """
+    Put TorchInductor/Triton caches in a stable, per-host absolute path to avoid
+    /tmp volatility and cross-node races. Users can still override via env.
+    If IMPROVE_MUON_CACHE_PER_RANK=1 is set, add a _rank{LOCAL_RANK} suffix to
+    fully avoid concurrent writers on flaky network filesystems.
+    """
+    host = os.environ.get("HOSTNAME") or socket.gethostname() or "unknown_host"
+    rank_suffix = (
+        f"_rank{os.environ.get('LOCAL_RANK','0')}"
+        if os.environ.get("IMPROVE_MUON_CACHE_PER_RANK")
+        else ""
+    )
+    home = pathlib.Path.home()
+    base_cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
+    torch_cache = base_cache / "torch" / "inductor" / f"{host}{rank_suffix}"
+    triton_cache = home / ".triton" / "cache" / f"{host}{rank_suffix}"
+
+    # Respect user-provided env if present; otherwise set ours.
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(torch_cache))
+    os.environ.setdefault("TRITON_CACHE_DIR", str(triton_cache))
+    pathlib.Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(os.environ["TRITON_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+
+    # Ensure CUDA driver JIT cache isn't disabled; size large enough.
+    if os.environ.get("CUDA_CACHE_DISABLE") == "1":
+        del os.environ["CUDA_CACHE_DISABLE"]
+    os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(1 << 30))  # 1 GiB
+
+_setup_kernel_caches()
+# ------------------------------------------------------------------------------
 
 import torch
 if torch.cuda.is_available():
