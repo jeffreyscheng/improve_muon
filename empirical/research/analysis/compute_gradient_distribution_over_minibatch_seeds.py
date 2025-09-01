@@ -48,9 +48,12 @@ from empirical.research.analysis.map import (
     combine_layer_properties, gather_layer_properties_to_rank_zero, apply_stable_rank,
     GPTLayerProperty
 )
-from empirical.research.analysis.predict_spectral_projection import (
-    predict_spectral_projection, matrix_shape_beta, estimate_noise_level,
-    get_denoised_squared_singular_value, estimate_spectral_projection_coefficients
+from empirical.research.analysis.predict_spectral_projection_torch import (
+    predict_spectral_projection_batched,
+    matrix_shape_beta,
+    estimate_noise_level_numpy,
+    get_denoised_squared_singular_value_numpy,
+    estimate_spectral_projection_coefficients_numpy,
 )
 
 
@@ -513,23 +516,17 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
     # 9. Gradient singular value standard deviations
     gradient_sv_std: GPTLayerProperty = compute_gradient_singular_value_std(per_grad_S, avg_grad_S)
     
-    # 10. Compute spectral projection coefficients using predict_spectral_projection
+    # 10. Compute spectral projection coefficients using torch (batched, sharded on this rank)
     if rank == 0:
         print(f"Rank {rank}: Computing spectral projection coefficients")
     
-    def apply_predict_spectral_projection(grad_tensor, momentum_tensor):
-        """Apply predict_spectral_projection to each minibatch."""
-        results = []
-        for mb_idx in range(grad_tensor.shape[0]):
-            spc = predict_spectral_projection(
-                grad_tensor[mb_idx].cpu().numpy(),
-                momentum_tensor[mb_idx].cpu().numpy()
-            )
-            results.append(torch.from_numpy(spc).to(grad_tensor.device))
-        return torch.stack(results, dim=0)
-    
+    def apply_predict_spc_torch(grad_tensor, momentum_tensor):
+        # grad_tensor, momentum_tensor: [B, n, m] for this param on THIS rank
+        # returns [B, min(n,m)] — computation sharded across ranks by param key
+        return predict_spectral_projection_batched(grad_tensor, momentum_tensor)
+
     predicted_spectral_coeffs: GPTLayerProperty = combine_layer_properties(
-        apply_predict_spectral_projection, per_minibatch_gradient, per_minibatch_momentum_buffers
+        apply_predict_spc_torch, per_minibatch_gradient, per_minibatch_momentum_buffers
     )
     
     # 11. Stable ranks
@@ -677,7 +674,7 @@ def create_noise_estimation_visualizations(
                 
                 # Estimate noise level
                 innovation_spectrum = np.sort(all_innovations)[::-1]  # Descending order
-                sigma_hat = estimate_noise_level(innovation_spectrum, beta)
+                sigma_hat = estimate_noise_level_numpy(innovation_spectrum, beta)
                 
                 # Plot histogram of singular values
                 ax.hist(all_innovations, bins=60, density=True, alpha=0.35, label="Empirical spectrum")
@@ -713,14 +710,14 @@ def create_noise_estimation_visualizations(
                 beta = matrix_shape_beta(innovation.shape)
                 innovation_spectrum = np.linalg.svdvals(innovation)
                 innovation_spectrum = np.sort(innovation_spectrum)[::-1]  # Descending
-                sigma_hat = estimate_noise_level(innovation_spectrum, beta)
+                sigma_hat = estimate_noise_level_numpy(innovation_spectrum, beta)
                 
                 # Whitened spectrum
                 y = innovation_spectrum / max(sigma_hat, 1e-30)
                 
                 # Predicted SPC
-                t_hat = get_denoised_squared_singular_value(y, beta)
-                spc_pred = estimate_spectral_projection_coefficients(t_hat, beta)
+                t_hat = get_denoised_squared_singular_value_numpy(y, beta)
+                spc_pred = estimate_spectral_projection_coefficients_numpy(t_hat, beta)
                 
                 # Only plot spikes (above edge)
                 edge_y = 1 + np.sqrt(beta)
@@ -732,8 +729,8 @@ def create_noise_estimation_visualizations(
         # Add theoretical SPC curve
         ygrid = np.logspace(0, 2, 200)  # y from 1 to 100
         beta_sample = matrix_shape_beta((1024, 1024))  # Use typical shape
-        tgrid = get_denoised_squared_singular_value(ygrid, beta_sample)
-        spcgrid = estimate_spectral_projection_coefficients(tgrid, beta_sample)
+        tgrid = get_denoised_squared_singular_value_numpy(ygrid, beta_sample)
+        spcgrid = estimate_spectral_projection_coefficients_numpy(tgrid, beta_sample)
         ax.plot(ygrid, spcgrid, 'k--', lw=2, alpha=0.7, label='Theoretical SPC')
         
         ax.legend(loc='lower right', fontsize=8)
@@ -899,12 +896,16 @@ def main():
         step_result, param_data, viz_data = compute_analysis_for_step(step, checkpoint_file, num_minibatches, rank, world_size, device)
         
         if master_process:
-            print(f"Step {step} completed in {time.time() - start_time:.1f}s")
+            analysis_time = time.time() - start_time
+            print(f"Step {step} functional analysis completed in {analysis_time:.1f}s")
             unpivot_and_save_step_to_csvs(step, param_data, sv_output_dir, sr_output_dir)
             print(f"Step {step} saved to CSV files")
         
         # Create visualizations (only on rank 0)
         if rank == 0 and viz_data:
+            if master_process:
+                print(f"Step {step} creating visualizations...")
+                viz_start_time = time.time()
             try:
                 create_noise_estimation_visualizations(
                     step,
@@ -915,8 +916,21 @@ def main():
                     gif_frames,
                     rank
                 )
+                if master_process:
+                    viz_time = time.time() - viz_start_time
+                    total_time = time.time() - start_time
+                    print(f"Step {step} visualizations completed in {viz_time:.1f}s")
+                    print(f"Step {step} fully completed in {total_time:.1f}s")
             except Exception as e:
-                print(f"Warning: Visualization failed for step {step}: {e}")
+                if master_process:
+                    total_time = time.time() - start_time
+                    print(f"Step {step} visualization failed: {e}")
+                    print(f"Step {step} completed (without visualization) in {total_time:.1f}s")
+        
+        # Print completion message for non-rank-0 processes or when no visualization data
+        if not (rank == 0 and viz_data) and master_process:
+            total_time = time.time() - start_time
+            print(f"Step {step} completed in {total_time:.1f}s")
     
     # Create final GIFs from collected frames
     finalize_noise_estimation_gifs(gif_frames, rank)
