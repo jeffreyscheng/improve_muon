@@ -388,7 +388,8 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
 
 
 def convert_to_record_format(
-    keys_source,
+    average_gradient_singular_values,
+    per_minibatch_gradient_singular_values, 
     gradient_singular_value_standard_deviations,
     spectral_projection_coefficients,
     per_minibatch_gradient_stable_rank,
@@ -398,13 +399,14 @@ def convert_to_record_format(
     """Convert functional computation results back to the record format expected by CSV output."""
     records = {}
     
-    # Use any gathered property as the canonical key set
-    all_keys = set(keys_source.keys())
+    # Get all keys (should be the same across all inputs on rank 0)
+    all_keys = set(average_gradient_singular_values.keys())
     
     for param_key in all_keys:
         param_type, layer_num = param_key
         
         records[param_key] = {
+            'per_minibatch_gradient_singular_values': per_minibatch_gradient_singular_values[param_key].cpu().numpy(),
             'gradient_singular_value_standard_deviations': gradient_singular_value_standard_deviations[param_key].cpu().numpy(),
             'weight_stable_rank': weight_matrix_stable_rank[param_key].cpu().item(),
             'per_minibatch_gradient_stable_rank': per_minibatch_gradient_stable_rank[param_key].cpu().numpy(),
@@ -651,17 +653,17 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         print(f"Rank {rank}: Gathering results to rank 0")
         gather_start = time.time()
     
-    # Drop per-minibatch singular values from gather to reduce comms
     gathered_results = gather_layer_properties_to_rank_zero(
-        gradient_sv_std, spectral_coeffs, per_minibatch_stable_ranks, weight_stable_ranks, predicted_spectral_coeffs
+        avg_grad_S, per_grad_S, gradient_sv_std, spectral_coeffs, 
+        per_minibatch_stable_ranks, weight_stable_ranks, predicted_spectral_coeffs
     )
     
     if rank == 0:
         print(f"Rank {rank}: Gathering took {time.time() - gather_start:.1f}s")
         
         # Unpack gathered results
-        (gradient_sv_std_full, spectral_coeffs_full, per_mb_ranks_full,
-         weight_ranks_full, predicted_spectral_coeffs_full) = gathered_results
+        (avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
+         spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full) = gathered_results
 
         # Gather compact viz stats objects
         viz_stats_full = _gather_viz_stats_to_rank0(viz_stats_shard)
@@ -669,8 +671,8 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         # 13. Convert to record format for CSV compatibility
         print(f"Rank {rank}: Converting to record format")
         records = convert_to_record_format(
-            gradient_sv_std_full,
-            gradient_sv_std_full, spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full
+            avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
+            spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full
         )
         
         total_time = time.time() - start_time
