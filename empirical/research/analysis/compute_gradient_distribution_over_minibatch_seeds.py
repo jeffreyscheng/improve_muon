@@ -56,6 +56,10 @@ from empirical.research.analysis.predict_spectral_projection_torch import (
     estimate_spectral_projection_coefficients_numpy,
 )
 
+# ---- Small utilities for viz/gather ----
+from typing import Dict, Tuple, Any, List
+import math
+
 
 def precompile_svd_kernels(device: torch.device, rank: int):
     """Precompile SVD kernels for all expected tensor shapes to avoid compilation overhead during analysis."""
@@ -127,16 +131,10 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     # Compile model using distributed-safe compilation
     model = safe_torch_compile(model, dynamic=False)
     
-    # Lightweight warmup for analysis - use small sequence to avoid OOM
-    small_seq_len = 128  # Much smaller than training's 8192
-    vocab_size = args.vocab_size
-    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
-    sliding_window_blocks = 1  # Minimal sliding window
-    
-    # Single warmup pass
-    model(inputs.to(torch.int32), targets, sliding_window_blocks).backward()
-    model.zero_grad(set_to_none=True)
-    torch.cuda.empty_cache()  # Clear memory after warmup
+    # (1) Use the *training* warmup path to match hyperparameters exactly.
+    #     This also gives Inductor maximal shape fidelity.
+    with torch.no_grad():
+        warmup_kernels(model, args)
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
@@ -195,23 +193,12 @@ SVD and Mathematical Functions for Gradient Analysis
 
 def apply_batched_svd(layer_properties) -> tuple:
     """Apply SVD to each batched tensor (batch×n×m) in the GPTLayerProperty."""
+    # 3F: vectorized SVD (supports batched B×n×m) instead of Python loop
     def compute_batched_svd(key, tensor):
         if tensor.ndim != 3:
             raise ValueError(f"Expected 3D tensor for batched SVD, got {tensor.ndim}D for {key}")
-        
-        batch_size = tensor.shape[0]
-        U_list, S_list, Vh_list = [], [], []
-        
-        for i in range(batch_size):
-            U_i, S_i, Vh_i = torch.linalg.svd(tensor[i].float(), full_matrices=False)
-            U_list.append(U_i)
-            S_list.append(S_i)
-            Vh_list.append(Vh_i)
-        
-        U = torch.stack(U_list, dim=0)  # batch×n×n
-        S = torch.stack(S_list, dim=0)  # batch×min(n,m)
-        Vh = torch.stack(Vh_list, dim=0)  # batch×m×m
-        
+        with torch.no_grad():  # 3E: no autograd needed
+            U, S, Vh = torch.linalg.svd(tensor.float(), full_matrices=False)
         return U, S, Vh
     
     U_prop, S_prop, Vh_prop = {}, {}, {}
@@ -230,8 +217,9 @@ def apply_svd(layer_properties) -> tuple:
     def compute_svd(key, tensor):
         if tensor.ndim != 2:
             raise ValueError(f"Expected 2D tensor for SVD, got {tensor.ndim}D for {key}")
-        
-        U, S, Vh = torch.linalg.svd(tensor.float(), full_matrices=False)
+        # 3E: analysis math doesn't require grad
+        with torch.no_grad():
+            U, S, Vh = torch.linalg.svd(tensor.float(), full_matrices=False)
         return U, S, Vh
     
     U_prop, S_prop, Vh_prop = {}, {}, {}
@@ -350,11 +338,10 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
         loss = model(inputs, targets, window_size_blocks)
         loss.backward()
         
-        # Synchronize gradients across ranks (like in training)
-        for param in model.parameters():
-            if param.grad is not None:
-                if dist.is_initialized():
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # (2) Do NOT all-reduce per-parameter grads in analysis.
+        #     Each rank only needs grads for its shard of params; avoid broadcast+network cost.
+        #     (We keep data parallel input sharding in the loader.)
+        #     Intentionally no dist.all_reduce here.
         
         # Store current momentum buffers before they get updated
         for param_key in my_param_keys:
@@ -387,9 +374,8 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
                 # Store this minibatch's gradient
                 per_minibatch_gradients[param_key][mb_idx] = grad_tensor.detach()
         
-        # Clear gradients to save memory
+        # Clear gradients to save memory (no per-minibatch empty_cache: 3E)
         model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
     
     if rank == 0:
         print(f"    Rank {rank}: Collected gradients and momentum buffers for {len(per_minibatch_gradients)} parameters")
@@ -488,16 +474,18 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         svd_start = time.time()
     
     # Batched SVD for per-minibatch gradients
-    per_grad_U: GPTLayerProperty
-    per_grad_S: GPTLayerProperty
-    per_grad_Vh: GPTLayerProperty
-    per_grad_U, per_grad_S, per_grad_Vh = apply_batched_svd(per_minibatch_gradient)
+    with torch.no_grad():  # 3E
+        per_grad_U: GPTLayerProperty
+        per_grad_S: GPTLayerProperty
+        per_grad_Vh: GPTLayerProperty
+        per_grad_U, per_grad_S, per_grad_Vh = apply_batched_svd(per_minibatch_gradient)
     
     # Regular SVD for average gradients
-    avg_grad_U: GPTLayerProperty
-    avg_grad_S: GPTLayerProperty
-    avg_grad_Vh: GPTLayerProperty
-    avg_grad_U, avg_grad_S, avg_grad_Vh = apply_svd(average_gradient)
+    with torch.no_grad():  # 3E
+        avg_grad_U: GPTLayerProperty
+        avg_grad_S: GPTLayerProperty
+        avg_grad_Vh: GPTLayerProperty
+        avg_grad_U, avg_grad_S, avg_grad_Vh = apply_svd(average_gradient)
     
     if rank == 0:
         print(f"Rank {rank}: SVD computation took {time.time() - svd_start:.1f}s")
@@ -536,6 +524,118 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
     predicted_spectral_coeffs: GPTLayerProperty = combine_layer_properties(
         apply_predict_spc_torch, per_minibatch_gradient, per_minibatch_momentum_buffers
     )
+
+    # 10b. (3A) Build compact per-layer viz stats on *this* rank only.
+    def _sample_numpy_1d(a: np.ndarray, k: int) -> np.ndarray:
+        if a.size <= k:
+            return a
+        idx = np.random.default_rng(0).choice(a.size, size=k, replace=False)
+        out = a[idx]
+        # 3B: ensure contiguous, no negative strides surprises later
+        return np.ascontiguousarray(out)
+
+    BETA_CACHE: Dict[Tuple[int,int], float] = {}
+    def _beta_for(shape: Tuple[int,int]) -> float:
+        if shape not in BETA_CACHE:
+            BETA_CACHE[shape] = matrix_shape_beta(shape)
+        return BETA_CACHE[shape]
+
+    viz_stats_shard: Dict[Tuple[str,int], Dict[str, Any]] = {}
+    with torch.no_grad():
+        for key in per_minibatch_gradient.keys():
+            param_type, layer_num = key
+            grads = per_minibatch_gradient[key]          # [B,n,m]
+            moms  = per_minibatch_momentum_buffers[key]  # [B,n,m]
+
+            innov = grads - moms                         # [B,n,m]
+            B, n, m = innov.shape
+            # Get singular values for all minibatches (vectorized)
+            try:
+                s_all = torch.linalg.svdvals(innov.float())  # [B, K]
+            except AttributeError:
+                # Fallback if svdvals not available
+                _, s_all, _ = torch.linalg.svd(innov.float(), full_matrices=False)
+            K = s_all.shape[-1]
+
+            # Flatten + downsample on device, then move a small sample to CPU
+            s_flat = s_all.reshape(-1)
+            # take up to 4096 samples for a nice histogram
+            ksample = min(4096, s_flat.numel())
+            if ksample < s_flat.numel():
+                perm = torch.randperm(s_flat.numel(), device=s_flat.device)
+                s_sample = s_flat.index_select(0, perm[:ksample])
+            else:
+                s_sample = s_flat
+            s_np = s_sample.detach().cpu().contiguous().numpy()
+            # Sorted descending (3B: .copy() avoids negative stride)
+            s_np_sorted_desc = np.sort(s_np)[::-1].copy()
+
+            beta = _beta_for((n, m))
+            sigma_hat = float(estimate_noise_level_numpy(s_np_sorted_desc, beta))
+
+            # For "SPC vs Singular": take first two minibatches
+            mb_take = min(2, B)
+            y_list: List[np.ndarray] = []
+            spc_list: List[np.ndarray] = []
+            for mb in range(mb_take):
+                s_mb = s_all[mb].detach().cpu().contiguous().numpy()
+                y = s_mb / max(sigma_hat, 1e-30)
+                # spikes only
+                edge = 1.0 + math.sqrt(beta)
+                spike_mask = y > edge
+                if spike_mask.any():
+                    t_hat = get_denoised_squared_singular_value_numpy(y, beta)
+                    spc   = estimate_spectral_projection_coefficients_numpy(t_hat, beta)
+                    y_list.append(np.ascontiguousarray(y[spike_mask]))
+                    spc_list.append(np.ascontiguousarray(spc[spike_mask]))
+            if len(y_list) == 0:
+                y_spikes = np.empty((0,), dtype=np.float64)
+                spc_pred = np.empty((0,), dtype=np.float64)
+            else:
+                y_spikes = np.ascontiguousarray(np.concatenate(y_list))
+                spc_pred = np.ascontiguousarray(np.concatenate(spc_list))
+                # cap to 512 points for plotting
+                y_spikes = _sample_numpy_1d(y_spikes, 512)
+                spc_pred = _sample_numpy_1d(spc_pred, 512)
+
+            # For "Predicted vs Actual": sample pairs
+            pred = predicted_spectral_coeffs[key].detach().cpu().contiguous().numpy().ravel()
+            act  = spectral_coeffs[key].detach().cpu().contiguous().numpy().ravel()
+            kpair = min(2048, min(pred.size, act.size))
+            if pred.size and act.size:
+                idx = np.random.default_rng(0).choice(min(pred.size, act.size), size=kpair, replace=False)
+                pred_s = np.ascontiguousarray(pred[idx])
+                act_s  = np.ascontiguousarray(act[idx])
+            else:
+                pred_s = np.empty((0,), dtype=np.float64)
+                act_s  = np.empty((0,), dtype=np.float64)
+
+            viz_stats_shard[key] = {
+                "shape": (n, m),
+                "beta": beta,
+                "sigma_hat": sigma_hat,
+                "innovation_sample": s_np,            # for histogram
+                "y_spikes": y_spikes,                 # x for SPC vs y
+                "spc_pred": spc_pred,                 # y for SPC vs y
+                "pred_vs_actual": (act_s, pred_s),    # scatter pairs
+            }
+
+    # Helper: gather Python objects to rank 0
+    def _gather_viz_stats_to_rank0(local_obj):
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return local_obj if rank == 0 else None
+        if rank == 0:
+            all_objs: List[Dict] = [None for _ in range(world_size)]
+            dist.gather_object(local_obj, object_gather_list=all_objs, dst=0)
+            merged = {}
+            for d in all_objs:
+                if not d:
+                    continue
+                merged.update(d)
+            return merged
+        else:
+            dist.gather_object(local_obj, dst=0)
+            return None
     
     # 11. Stable ranks
     if rank == 0:
@@ -551,8 +651,7 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
     
     gathered_results = gather_layer_properties_to_rank_zero(
         avg_grad_S, per_grad_S, gradient_sv_std, spectral_coeffs, 
-        per_minibatch_stable_ranks, weight_stable_ranks, predicted_spectral_coeffs,
-        per_minibatch_gradient, per_minibatch_momentum_buffers
+        per_minibatch_stable_ranks, weight_stable_ranks, predicted_spectral_coeffs
     )
     
     if rank == 0:
@@ -560,8 +659,10 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         
         # Unpack gathered results
         (avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
-         spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full,
-         per_minibatch_gradient_full, per_minibatch_momentum_buffers_full) = gathered_results
+         spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full) = gathered_results
+
+        # Gather compact viz stats objects
+        viz_stats_full = _gather_viz_stats_to_rank0(viz_stats_shard)
         
         # 13. Convert to record format for CSV compatibility
         print(f"Rank {rank}: Converting to record format")
@@ -574,12 +675,7 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         print(f"Rank {rank}: Functional analysis completed in {total_time:.1f}s")
         
         # Return additional visualization data for rank 0
-        viz_data = {
-            'per_minibatch_gradient': per_minibatch_gradient_full,
-            'per_minibatch_momentum_buffers': per_minibatch_momentum_buffers_full,
-            'predicted_spectral_coeffs': predicted_spectral_coeffs_full,
-            'actual_spectral_coeffs': spectral_coeffs_full
-        } if rank == 0 else {}
+        viz_data = {"viz_stats": viz_stats_full} if rank == 0 else {}
         
         return step, records, viz_data
     
@@ -633,10 +729,7 @@ def setup_output_directories(run_name: str) -> tuple[Path, Path]:
 
 def create_noise_estimation_visualizations(
     step: int, 
-    per_minibatch_gradient: GPTLayerProperty,
-    per_minibatch_momentum_buffers: GPTLayerProperty,
-    predicted_spectral_coeffs: GPTLayerProperty,
-    actual_spectral_coeffs: GPTLayerProperty,
+    viz_stats: Dict[Tuple[str,int], Dict[str, Any]],
     gif_frames: dict,
     rank: int
 ):
@@ -649,14 +742,12 @@ def create_noise_estimation_visualizations(
     frames_dir.mkdir(parents=True, exist_ok=True)
     
     def get_layer_data_for_param_type(param_type):
-        """Get all layer data for a specific parameter type."""
-        return [(layer_num, {
-            'gradients': per_minibatch_gradient[(param_type, layer_num)].cpu().numpy(),
-            'momentum': per_minibatch_momentum_buffers[(param_type, layer_num)].cpu().numpy(),
-            'predicted_spc': predicted_spectral_coeffs[(param_type, layer_num)].cpu().numpy(),
-            'actual_spc': actual_spectral_coeffs[(param_type, layer_num)].cpu().numpy()
-        }) for (p_type, layer_num) in per_minibatch_gradient.keys() 
-        if p_type == param_type and layer_num >= 0]
+        """Get compact viz stats for this parameter type."""
+        items = []
+        for (p_type, layer_num), d in viz_stats.items():
+            if p_type == param_type and layer_num >= 0:
+                items.append((layer_num, d))
+        return sorted(items, key=lambda x: x[0])
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
@@ -664,40 +755,30 @@ def create_noise_estimation_visualizations(
         ax.set_xlabel('Singular value')
         ax.set_ylabel('Density')
         
-        # Combine all innovations from all layers for this param type
-        all_innovations = []
-        for layer_num, data in layer_data_list:
-            for mb_idx in range(data['gradients'].shape[0]):
-                innovation = data['gradients'][mb_idx] - data['momentum'][mb_idx]
-                innovation_sv = np.linalg.svdvals(innovation)
-                all_innovations.extend(innovation_sv)
-        
-        if len(all_innovations) > 0:
-            all_innovations = np.array(all_innovations)
-            
-            # Get the innovation matrix shape for beta calculation
-            if layer_data_list:
-                sample_innovation = layer_data_list[0][1]['gradients'][0] - layer_data_list[0][1]['momentum'][0]
-                beta = matrix_shape_beta(sample_innovation.shape)
-                
-                # Estimate noise level
-                innovation_spectrum = np.sort(all_innovations)[::-1]  # Descending order
-                sigma_hat = estimate_noise_level_numpy(innovation_spectrum, beta)
-                
-                # Plot histogram of singular values
-                ax.hist(all_innovations, bins=60, density=True, alpha=0.35, label="Empirical spectrum")
-                
-                # Plot MP density overlay
-                xs = np.linspace(0, all_innovations.max()*1.05, 1000)
+        # Sum up per-layer innovation samples (already downsampled) and render a histogram
+        samples = []
+        betas = []
+        sigmas = []
+        for _, data in layer_data_list:
+            s = np.asarray(data["innovation_sample"], dtype=float)
+            if s.size:
+                samples.append(s)
+                betas.append(float(data["beta"]))
+                sigmas.append(float(data["sigma_hat"]))
+        if samples:
+            all_innov = np.ascontiguousarray(np.concatenate(samples))
+            ax.hist(all_innov, bins=60, density=True, alpha=0.35, label="Empirical spectrum")
+            # Use median β, σ̂ across layers for the overlay
+            if betas and sigmas:
+                beta = float(np.median(np.asarray(betas)))
+                sigma_hat = float(np.median(np.asarray(sigmas)))
+                xs = np.linspace(0, all_innov.max()*1.05, 1000)
                 mp_density = mp_pdf_singular(xs, beta, sigma_hat)
                 ax.plot(xs, mp_density, 'r--', lw=2, label=f"MP (σ̂={sigma_hat:.3f})")
-                
-                # Plot edge
                 edge = sigma_hat * (1 + np.sqrt(beta))
                 ax.axvline(edge, color='k', lw=1.5, ls='--', label=f"Edge τ̂={edge:.3f}")
-                
-                ax.legend(loc='upper right', fontsize=8)
-                ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
     
     # 2. SPC vs Singular Values  
     def plot_spc_vs_singular_values(ax, param_type, layer_data_list, viridis, max_layers):
@@ -708,35 +789,17 @@ def create_noise_estimation_visualizations(
         ax.set_ylim(0, 1.02)
         ax.grid(True, alpha=0.3)
         
-        # Plot predicted SPC curve
         for layer_num, data in layer_data_list:
             color = viridis(layer_num / (max_layers - 1))
-            
-            # Get innovation and compute whitened spectrum
-            for mb_idx in range(min(2, data['gradients'].shape[0])):  # Show first 2 minibatches
-                innovation = data['gradients'][mb_idx] - data['momentum'][mb_idx]
-                beta = matrix_shape_beta(innovation.shape)
-                innovation_spectrum = np.linalg.svdvals(innovation)
-                innovation_spectrum = np.sort(innovation_spectrum)[::-1]  # Descending
-                sigma_hat = estimate_noise_level_numpy(innovation_spectrum, beta)
-                
-                # Whitened spectrum
-                y = innovation_spectrum / max(sigma_hat, 1e-30)
-                
-                # Predicted SPC
-                t_hat = get_denoised_squared_singular_value_numpy(y, beta)
-                spc_pred = estimate_spectral_projection_coefficients_numpy(t_hat, beta)
-                
-                # Only plot spikes (above edge)
-                edge_y = 1 + np.sqrt(beta)
-                spike_mask = y > edge_y
-                if np.any(spike_mask):
-                    ax.scatter(y[spike_mask], spc_pred[spike_mask], 
-                             alpha=0.6, s=20, c=[color], label=f'L{layer_num}' if mb_idx == 0 else None)
+            y = np.asarray(data["y_spikes"])
+            spc_pred = np.asarray(data["spc_pred"])
+            if y.size and spc_pred.size:
+                ax.scatter(y, spc_pred, alpha=0.6, s=20, c=[color], label=f'L{layer_num}')
         
         # Add theoretical SPC curve
         ygrid = np.logspace(0, 2, 200)  # y from 1 to 100
-        beta_sample = matrix_shape_beta((1024, 1024))  # Use typical shape
+        # Use a typical shape's β for reference (3D: fixed once)
+        beta_sample = matrix_shape_beta((1024, 1024))
         tgrid = get_denoised_squared_singular_value_numpy(ygrid, beta_sample)
         spcgrid = estimate_spectral_projection_coefficients_numpy(tgrid, beta_sample)
         ax.plot(ygrid, spcgrid, 'k--', lw=2, alpha=0.7, label='Theoretical SPC')
@@ -757,16 +820,10 @@ def create_noise_estimation_visualizations(
         
         for layer_num, data in layer_data_list:
             color = viridis(layer_num / (max_layers - 1))
-            
-            # Flatten SPC arrays and compare
-            predicted_flat = data['predicted_spc'].flatten()
-            actual_flat = data['actual_spc'].flatten()
-            
-            # Take min length in case of dimension mismatch
-            min_len = min(len(predicted_flat), len(actual_flat))
-            if min_len > 0:
-                ax.scatter(actual_flat[:min_len], predicted_flat[:min_len],
-                         alpha=0.3, s=10, c=[color], label=f'L{layer_num}' if layer_num <= 2 else None)
+            act, pred = data["pred_vs_actual"]
+            if act.size and pred.size:
+                ax.scatter(np.asarray(act), np.asarray(pred), alpha=0.3, s=10, c=[color],
+                           label=f'L{layer_num}' if layer_num <= 2 else None)
         
         ax.legend(loc='upper left', fontsize=8)
     
@@ -910,17 +967,14 @@ def main():
             print(f"Step {step} saved to CSV files")
         
         # Create visualizations (only on rank 0)
-        if rank == 0 and viz_data:
+        if rank == 0 and viz_data and viz_data.get("viz_stats"):
             if master_process:
                 print(f"Step {step} creating visualizations...")
                 viz_start_time = time.time()
             try:
                 create_noise_estimation_visualizations(
                     step,
-                    viz_data['per_minibatch_gradient'],
-                    viz_data['per_minibatch_momentum_buffers'], 
-                    viz_data['predicted_spectral_coeffs'],
-                    viz_data['actual_spectral_coeffs'],
+                    viz_data["viz_stats"],
                     gif_frames,
                     rank
                 )
