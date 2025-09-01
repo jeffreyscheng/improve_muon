@@ -757,9 +757,14 @@ def create_noise_estimation_visualizations(
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
-        # Title lives on the container axis; then we hide it and draw two inset axes
+        # Title lives on the container axis; keep axis visible so tight_layout
+        # preserves space, but make it visually blank.
         ax.set_title(f'{param_type}')
-        ax.set_visible(False)
+        ax.set_facecolor('none')
+        ax.grid(False)
+        ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
         # Collect downsampled singular values from layers
         samples, betas, sigmas = [], [], []
