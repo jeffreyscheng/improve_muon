@@ -653,10 +653,15 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         print(f"Rank {rank}: Gathering results to rank 0")
         gather_start = time.time()
     
+    # 12a: tensor collects (all ranks participate)
     gathered_results = gather_layer_properties_to_rank_zero(
         avg_grad_S, per_grad_S, gradient_sv_std, spectral_coeffs, 
         per_minibatch_stable_ranks, weight_stable_ranks, predicted_spectral_coeffs
     )
+
+    # 12b: object gather for compact viz stats (must be called by ALL ranks)
+    # This returns the merged dict on rank 0 and None on other ranks.
+    viz_stats_full = _gather_viz_stats_to_rank0(viz_stats_shard)
     
     if rank == 0:
         print(f"Rank {rank}: Gathering took {time.time() - gather_start:.1f}s")
@@ -664,9 +669,6 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         # Unpack gathered results
         (avg_grad_S_full, per_grad_S_full, gradient_sv_std_full,
          spectral_coeffs_full, per_mb_ranks_full, weight_ranks_full, predicted_spectral_coeffs_full) = gathered_results
-
-        # Gather compact viz stats objects
-        viz_stats_full = _gather_viz_stats_to_rank0(viz_stats_shard)
         
         # 13. Convert to record format for CSV compatibility
         print(f"Rank {rank}: Converting to record format")
@@ -679,7 +681,7 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
         print(f"Rank {rank}: Functional analysis completed in {total_time:.1f}s")
         
         # Return additional visualization data for rank 0
-        viz_data = {"viz_stats": viz_stats_full} if rank == 0 else {}
+        viz_data = {"viz_stats": viz_stats_full} if viz_stats_full is not None else {}
         
         return step, records, viz_data
     
