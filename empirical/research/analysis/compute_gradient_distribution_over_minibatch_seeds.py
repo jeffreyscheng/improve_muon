@@ -173,7 +173,8 @@ def create_gif_from_frames(frame_paths, gif_path, fps=12):
 
 def create_subplot_grid(param_types, figsize, get_data_fn, plot_fn, title, output_path):
     """Generic subplot grid creator."""
-    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    # Use constrained_layout to avoid weird whitespace / ribbon images.
+    fig, axes = plt.subplots(2, 3, figsize=figsize, constrained_layout=True)
     fig.suptitle(title, fontsize=14)
     
     viridis = plt.cm.viridis
@@ -183,8 +184,9 @@ def create_subplot_grid(param_types, figsize, get_data_fn, plot_fn, title, outpu
         max_layers = max([layer_num for layer_num, _ in layer_data_list], default=1) + 1
         plot_fn(ax, param_type, layer_data_list, viridis, max_layers)
     
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    # Constrained layout already sizes tightly; avoid bbox_inches='tight' (caused huge left whitespace).
+    # Slightly higher DPI for label readability.
+    fig.savefig(output_path, dpi=180)
     plt.close()
 
 
@@ -757,7 +759,8 @@ def create_noise_estimation_visualizations(
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
-        # Title lives on the container axis; keep axis visible so tight_layout
+        from matplotlib.ticker import MaxNLocator, LogLocator, LogFormatterMathtext
+        # Title lives on the container axis; keep axis visible so constrained_layout
         # preserves space, but make it visually blank.
         ax.set_title(f'{param_type}')
         ax.set_facecolor('none')
@@ -789,6 +792,11 @@ def create_noise_estimation_visualizations(
         # [x0, y0, w, h] in axes fraction coords
         ax_lin = ax.inset_axes([0.00, 0.00, 0.58, 1.00])
         ax_log = ax.inset_axes([0.62, 0.00, 0.38, 1.00], sharey=ax_lin)
+        # The parent axis is just a container; hide its frame/ticks to avoid
+        # any spurious layout artifacts.
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
         # Left (linear) histogram up to edge
         if edge > 0:
@@ -797,23 +805,29 @@ def create_noise_estimation_visualizations(
                         bins=bins_lin, density=True, alpha=0.35, label="Empirical spectrum")
             xs_lin = np.linspace(0.0, edge, 400)
             mp_lin = mp_pdf_singular(xs_lin, beta, sigma_hat)
-            ax_lin.plot(xs_lin, mp_lin, '--', lw=2, label=f"MP (σ̂={sigma_hat:.3f})")
-            ax_lin.axvline(edge, color='k', lw=1.0, ls='--', label=f"Edge τ̂")
+            # orange dotted = MP bulk
+            ax_lin.plot(xs_lin, mp_lin, ls='--', lw=2, color='tab:orange', label=f"MP (σ̂={sigma_hat:.3f})")
+            ax_lin.axvline(edge, color='k', lw=1.0, ls='--', label="Edge τ̂")
         else:
             # Degenerate edge; just show a small linear window near zero
             bins_lin = np.linspace(0.0, min(x_max, 1.0), 50)
             ax_lin.hist(all_innov[(all_innov >= 0.0) & (all_innov <= bins_lin[-1])],
                         bins=bins_lin, density=True, alpha=0.35, label="Empirical spectrum")
 
-        ax_lin.set_xlim(left=0.0, right=max(edge, bins_lin[-1] if edge == 0 else edge))
-        ax_lin.set_xlabel('singular value s (linear, ≤ τ̂)')
+        # Make the split continuous: right bound of linear == left bound of log == edge
+        ax_lin.set_xlim(0.0, max(edge, bins_lin[-1] if edge == 0 else edge))
+        ax_lin.set_xlabel('singular value s — linear (≤ τ̂)')
         ax_lin.set_ylabel('density')
         ax_lin.grid(True, alpha=0.3)
-        ax_lin.legend(loc='upper right', fontsize=8)
+        ax_lin.legend(loc='upper right', fontsize=8, frameon=False)
+        # Fewer, clean ticks + sane box aspect that won't fight constrained_layout
+        ax_lin.xaxis.set_major_locator(MaxNLocator(4))
+        ax_lin.tick_params(axis='x', labelsize=8)
+        ax_lin.set_box_aspect(0.9)
 
         # Right (log) histogram for the spike tail
         if x_max > edge * 1.0001:
-            # Avoid putting the exact edge into a log bin start (log undefined at 0)
+            # Use bins that start just above the edge, but axis starts at the edge
             start = edge * 1.0001 if edge > 0 else max(x_max * 1e-3, 1e-8)
             bins_log = np.geomspace(start, x_max, 50)
             tail = all_innov[all_innov > edge]
@@ -821,29 +835,27 @@ def create_noise_estimation_visualizations(
                 ax_log.hist(tail, bins=bins_log, density=True, alpha=0.35)
             xs_log = np.geomspace(start, x_max, 400)
             mp_log = mp_pdf_singular(xs_log, beta, sigma_hat)
-            ax_log.plot(xs_log, mp_log, '--', lw=2)
+            ax_log.plot(xs_log, mp_log, ls='--', lw=2, color='tab:orange')
             ax_log.set_xscale('log')
-            ax_log.set_xlim(left=start, right=x_max)
-            ax_log.set_xlabel('singular value s (log, > τ̂)')
+            # left limit equals the edge to make panes meet at same x-value
+            ax_log.set_xlim(left=edge if edge > 0 else start, right=x_max)
+            ax_log.set_xlabel('singular value s — log (> τ̂)')
             ax_log.grid(True, which='both', alpha=0.3)
-            # Draw the edge marker at the left boundary of the log pane (cosmetic)
+            # Edge marker on log pane
             ax_log.axvline(edge if edge > 0 else start, color='k', lw=1.0, ls='--')
-
-            # Tidy: hide the shared y label on the right pane
+            # Tidy: hide y ticks on right pane (sharey keeps the scale)
             ax_log.yaxis.set_visible(False)
-
-            # Visual cue for the axis break (small slanted ticks at the split)
-            for a, xpos, sign in [(ax_lin, ax_lin.get_xlim()[1], +1),
-                                  (ax_log, ax_log.get_xlim()[0], -1)]:
-                ylim = a.get_ylim()
-                y0 = ylim[0] + 0.05*(ylim[1]-ylim[0])
-                y1 = ylim[0] + 0.15*(ylim[1]-ylim[0])
-                dx = (a.get_xlim()[1]-a.get_xlim()[0]) * 0.01
-                a.plot([xpos, xpos + sign*dx], [y0, y1], color='k', clip_on=False, lw=1)
-                a.plot([xpos, xpos + sign*dx], [y0*1.02, y1*1.02], color='k', clip_on=False, lw=1)
+            # readable log ticks: few majors, no crowded minors
+            ax_log.xaxis.set_major_locator(LogLocator(base=10, numticks=5))
+            ax_log.xaxis.set_minor_locator(LogLocator(base=10, subs=[], numticks=0))
+            ax_log.xaxis.set_major_formatter(LogFormatterMathtext())
+            ax_log.tick_params(axis='x', labelsize=8)
+            ax_log.set_box_aspect(0.9)
         else:
             # No tail beyond edge — keep a single linear pane labeling
             ax_log.set_visible(False)
+            ax_lin.xaxis.set_major_locator(MaxNLocator(5))
+            ax_lin.tick_params(axis='x', labelsize=8)
     
     # 2. SPC vs Singular Values  
     def plot_spc_vs_singular_values(ax, param_type, layer_data_list, viridis, max_layers):
