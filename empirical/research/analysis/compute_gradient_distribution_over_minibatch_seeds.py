@@ -132,9 +132,9 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     model = safe_torch_compile(model, dynamic=False)
     
     # Warm up kernels using the same helper as training.
-    # training_core.warmup_kernels expects an `optimizers` dict; for analysis
-    # we can hand it a simple throwaway optimizer to compile the optimizer path.
-    optimizers = {"sgd": torch.optim.SGD(model.parameters(), lr=1.0)}
+    # warmup_kernels expects an *iterable of optimizer instances* (not a dict),
+    # and the positional signature is (model, optimizers, args).
+    optimizers = [torch.optim.SGD(model.parameters(), lr=1.0)]
     warmup_kernels(model, optimizers, args)
     
     if rank == 0:
