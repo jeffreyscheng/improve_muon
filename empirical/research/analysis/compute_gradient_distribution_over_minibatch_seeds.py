@@ -759,7 +759,7 @@ def create_noise_estimation_visualizations(
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
-        from matplotlib.ticker import LogLocator, LogFormatterMathtext
+        from matplotlib.ticker import LogLocator, LogFormatterMathtext, NullLocator
         ax.set_title(f'{param_type}')
         ax.grid(True, which='both', alpha=0.3)
         ax.set_xscale('log')
@@ -767,7 +767,8 @@ def create_noise_estimation_visualizations(
         ax.set_ylabel('density')
         ax.tick_params(axis='x', labelsize=8)
         ax.xaxis.set_major_locator(LogLocator(base=10, numticks=6))
-        ax.xaxis.set_minor_locator(LogLocator(base=10, subs=[], numticks=0))
+        # Disable minor ticks robustly to avoid ZeroDivisionError inside constrained_layout.
+        ax.xaxis.set_minor_locator(NullLocator())
         ax.xaxis.set_major_formatter(LogFormatterMathtext())
 
         # Collect downsampled singular values from layers
