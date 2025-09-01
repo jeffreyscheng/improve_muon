@@ -135,7 +135,7 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     # training_core.warmup_kernels expects an `optimizers` dict; for analysis
     # we can hand it a simple throwaway optimizer to compile the optimizer path.
     optimizers = {"sgd": torch.optim.SGD(model.parameters(), lr=1.0)}
-    warmup_kernels(model, args, optimizers=optimizers)
+    warmup_kernels(model, optimizers, args)
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
