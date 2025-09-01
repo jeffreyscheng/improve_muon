@@ -759,7 +759,7 @@ def create_noise_estimation_visualizations(
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
-        from matplotlib.ticker import MaxNLocator, LogLocator, LogFormatterMathtext
+        from matplotlib.ticker import MaxNLocator, LogLocator, LogFormatterMathtext, NullLocator
         # Title lives on the container axis; keep axis visible so constrained_layout
         # preserves space, but make it visually blank.
         ax.set_title(f'{param_type}')
@@ -847,7 +847,8 @@ def create_noise_estimation_visualizations(
             ax_log.yaxis.set_visible(False)
             # readable log ticks: few majors, no crowded minors
             ax_log.xaxis.set_major_locator(LogLocator(base=10, numticks=5))
-            ax_log.xaxis.set_minor_locator(LogLocator(base=10, subs=[], numticks=0))
+            # Disable minor ticks without triggering zero-division in some Matplotlib versions
+            ax_log.xaxis.set_minor_locator(NullLocator())
             ax_log.xaxis.set_major_formatter(LogFormatterMathtext())
             ax_log.tick_params(axis='x', labelsize=8)
             ax_log.set_box_aspect(0.9)
@@ -867,7 +868,11 @@ def create_noise_estimation_visualizations(
         ax.grid(True, alpha=0.3)
         
         for layer_num, data in layer_data_list:
-            color = viridis(layer_num / (max_layers - 1))
+            # Avoid divide-by-zero when only one layer; clamp to [0,1]
+            denom = max(max_layers - 1, 1)
+            t = layer_num / denom
+            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+            color = viridis(t)
             y = np.asarray(data["y_spikes"])
             spc_pred = np.asarray(data["spc_pred"])
             if y.size and spc_pred.size:
@@ -896,7 +901,11 @@ def create_noise_estimation_visualizations(
         ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect prediction')
         
         for layer_num, data in layer_data_list:
-            color = viridis(layer_num / (max_layers - 1))
+            # Avoid divide-by-zero when only one layer; clamp to [0,1]
+            denom = max(max_layers - 1, 1)
+            t = layer_num / denom
+            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+            color = viridis(t)
             act, pred = data["pred_vs_actual"]
             if act.size and pred.size:
                 ax.scatter(np.asarray(act), np.asarray(pred), alpha=0.3, s=10, c=[color],
@@ -905,28 +914,22 @@ def create_noise_estimation_visualizations(
         ax.legend(loc='upper left', fontsize=8)
     
     # Create all three frame types
-    try:
-        # Frame 1: Bulk vs Spike
-        frame_path_1 = frames_dir / f"bulk_spike_{step:06d}.png"
-        create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type, 
-                           plot_bulk_vs_spike, f'Bulk vs Spike Estimation - Step {step}', frame_path_1)
-        gif_frames['bulk_spike'].append(str(frame_path_1))
-        
-        # Frame 2: SPC vs Singular Values
-        frame_path_2 = frames_dir / f"spc_singular_{step:06d}.png"
-        create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type,
-                           plot_spc_vs_singular_values, f'SPC vs Singular Values - Step {step}', frame_path_2)
-        gif_frames['spc_singular'].append(str(frame_path_2))
-        
-        # Frame 3: Predicted vs Actual SPC
-        frame_path_3 = frames_dir / f"pred_actual_{step:06d}.png"
-        create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type,
-                           plot_predicted_vs_actual_spc, f'Predicted vs Actual SPC - Step {step}', frame_path_3)
-        gif_frames['pred_actual'].append(str(frame_path_3))
-        
-        print(f"Rank {rank}: Created visualization frames for step {step}")
-    except Exception as e:
-        print(f"Rank {rank}: Warning - Failed to create visualization frames for step {step}: {e}")
+    # Frame 1: Bulk vs Spike
+    frame_path_1 = frames_dir / f"bulk_spike_{step:06d}.png"
+    create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type, 
+                        plot_bulk_vs_spike, f'Bulk vs Spike Estimation - Step {step}', frame_path_1)
+    gif_frames['bulk_spike'].append(str(frame_path_1))
+    # Frame 2: SPC vs Singular Values
+    frame_path_2 = frames_dir / f"spc_singular_{step:06d}.png"
+    create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type,
+                        plot_spc_vs_singular_values, f'SPC vs Singular Values - Step {step}', frame_path_2)
+    gif_frames['spc_singular'].append(str(frame_path_2))
+    # Frame 3: Predicted vs Actual SPC
+    frame_path_3 = frames_dir / f"pred_actual_{step:06d}.png"
+    create_subplot_grid(PARAM_TYPES, (20, 10), get_layer_data_for_param_type,
+                        plot_predicted_vs_actual_spc, f'Predicted vs Actual SPC - Step {step}', frame_path_3)
+    gif_frames['pred_actual'].append(str(frame_path_3))
+    print(f"Rank {rank}: Created visualization frames for step {step}")
 
 
 def finalize_noise_estimation_gifs(gif_frames: dict, rank: int):
@@ -1048,23 +1051,17 @@ def main():
             if master_process:
                 print(f"Step {step} creating visualizations...")
                 viz_start_time = time.time()
-            try:
-                create_noise_estimation_visualizations(
-                    step,
-                    viz_data["viz_stats"],
-                    gif_frames,
-                    rank
-                )
-                if master_process:
-                    viz_time = time.time() - viz_start_time
-                    total_time = time.time() - start_time
-                    print(f"Step {step} visualizations completed in {viz_time:.1f}s")
-                    print(f"Step {step} fully completed in {total_time:.1f}s")
-            except Exception as e:
-                if master_process:
-                    total_time = time.time() - start_time
-                    print(f"Step {step} visualization failed: {e}")
-                    print(f"Step {step} completed (without visualization) in {total_time:.1f}s")
+            create_noise_estimation_visualizations(
+                step,
+                viz_data["viz_stats"],
+                gif_frames,
+                rank
+            )
+            if master_process:
+                viz_time = time.time() - viz_start_time
+                total_time = time.time() - start_time
+                print(f"Step {step} visualizations completed in {viz_time:.1f}s")
+                print(f"Step {step} fully completed in {total_time:.1f}s")
         
         # Print completion message for non-rank-0 processes or when no visualization data
         if not (rank == 0 and viz_data) and master_process:
