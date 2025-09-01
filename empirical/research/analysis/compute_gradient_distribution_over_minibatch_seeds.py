@@ -131,10 +131,11 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     # Compile model using distributed-safe compilation
     model = safe_torch_compile(model, dynamic=False)
     
-    # (1) Use the *training* warmup path to match hyperparameters exactly.
-    #     This also gives Inductor maximal shape fidelity.
-    with torch.no_grad():
-        warmup_kernels(model, args)
+    # Warm up kernels using the same helper as training.
+    # training_core.warmup_kernels expects an `optimizers` dict; for analysis
+    # we can hand it a simple throwaway optimizer to compile the optimizer path.
+    optimizers = {"sgd": torch.optim.SGD(model.parameters(), lr=1.0)}
+    warmup_kernels(model, args, optimizers=optimizers)
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
