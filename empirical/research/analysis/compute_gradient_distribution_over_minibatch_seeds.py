@@ -523,7 +523,15 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
     def apply_predict_spc_torch(grad_tensor, momentum_tensor):
         # grad_tensor, momentum_tensor: [B, n, m] for this param on THIS rank
         # returns [B, min(n,m)] — computation sharded across ranks by param key
-        return predict_spectral_projection_batched(grad_tensor, momentum_tensor)
+        # Ensure each invocation is a new cudagraph "step" to avoid output reuse hazards
+        try:
+            import torch
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+        # Also clone outside compiled calls (predict_spectral_projection_batched already clones,
+        # but keeping this here makes the contract explicit at the boundary)
+        return predict_spectral_projection_batched(grad_tensor, momentum_tensor).clone()
 
     predicted_spectral_coeffs: GPTLayerProperty = combine_layer_properties(
         apply_predict_spc_torch, per_minibatch_gradient, per_minibatch_momentum_buffers

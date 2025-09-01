@@ -193,14 +193,14 @@ def predict_spectral_projection_batched(
     s = torch.linalg.svdvals(innovation)
     s, _ = torch.sort(s, dim=-1, descending=True)
 
-    sigma_hat = estimate_noise_level_torch(s, beta=beta)              # [B]
+    # Clone OUTSIDE compiled function so we don't hold onto cudagraph-managed storage
+    sigma_hat = estimate_noise_level_torch(s, beta=beta).clone()      # [B]
     y = s / sigma_hat.unsqueeze(-1).clamp_min(1e-30)                  # [B,K]
-    t = get_denoised_squared_singular_value_torch(y, beta=beta)       # [B,K]
-    spc = estimate_spectral_projection_coefficients_torch(t, beta=beta)  # [B,K]
-    # Important: outputs from compiled + cudagraphs can be re-used/overwritten
-    # across invocations. Clone OUTSIDE of compiled regions so callers can safely
-    # stash results without being invalidated on a subsequent call.
-    return spc.clone()
+    # Clone OUTSIDE compiled function for the same reason
+    t = get_denoised_squared_singular_value_torch(y, beta=beta).clone()  # [B,K]
+    # Clone OUTSIDE compiled function to decouple from cudagraph output buffers
+    spc = estimate_spectral_projection_coefficients_torch(t, beta=beta).clone()  # [B,K]
+    return spc
 
 
 # --- Optional NumPy convenience wrappers for plotting paths ---
