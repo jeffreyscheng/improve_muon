@@ -15,6 +15,73 @@ def matrix_shape_beta(shape: Union[Tuple[int, int], torch.Size]) -> float:
     a, b = (n, m) if n < m else (m, n)
     return float(a) / float(b)
 
+@torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+def _mp_quantiles_lambda(probs: torch.Tensor, beta: float, grid_size: int = 2048, device: torch.device | None = None) -> torch.Tensor:
+    """
+    Quantiles of the Marchenko–Pastur law for eigenvalues λ = s^2/σ^2.
+    Returns tensor of shape [P] with λ-quantiles for given probs ∈ (0,1).
+    Computed by numerically inverting the CDF on a fixed grid (compile-friendly).
+    """
+    if device is None:
+        device = probs.device
+    sqrtb = float(math.sqrt(beta))
+    lam_m = (1.0 - sqrtb) ** 2
+    lam_p = (1.0 + sqrtb) ** 2
+    # avoid singular endpoints; keep shapes static
+    eps = max(1e-12, 1e-6 * lam_p)
+    x0 = lam_m + eps
+    x1 = lam_p - eps
+    # fixed-size grid (static for compilation)
+    grid = torch.linspace(x0, x1, grid_size, device=device, dtype=torch.float32)  # [G]
+    # MP pdf on λ (safe near edges because of eps)
+    num = torch.sqrt(torch.clamp((lam_p - grid) * (grid - lam_m), min=0.0))       # [G]
+    den = (2.0 * math.pi * beta) * torch.clamp(grid, min=1e-30)                   # [G]
+    pdf = num / den                                                                # [G]
+    # CDF via trapezoid rule
+    dx = (x1 - x0) / (grid_size - 1)
+    inc = 0.5 * (pdf[1:] + pdf[:-1]) * dx                                         # [G-1]
+    cdf = torch.cumsum(inc, dim=0)
+    cdf = torch.cat([torch.zeros(1, device=device, dtype=pdf.dtype), cdf], dim=0) # [G]
+    cdf = cdf / torch.clamp(cdf[-1], min=1e-30)
+    # inverse CDF by interpolation
+    # probs: [P]  -> idx in [1..G-1]
+    idx_hi = torch.searchsorted(cdf, probs)                                        # [P]
+    idx_hi = torch.clamp(idx_hi, 1, grid_size - 1)
+    idx_lo = idx_hi - 1
+    c_lo = torch.take(cdf, idx_lo)
+    c_hi = torch.take(cdf, idx_hi)
+    x_lo = torch.take(grid, idx_lo)
+    x_hi = torch.take(grid, idx_hi)
+    t = (probs - c_lo) / torch.clamp(c_hi - c_lo, min=1e-30)
+    lam_q = x_lo + t * (x_hi - x_lo)                                              # [P]
+    return lam_q
+
+@torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+def _empirical_quantiles_from_sorted(s2_asc: torch.Tensor, probs: torch.Tensor, k_eff: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Empirical quantiles for each batch row from an ASCENDING-sorted tensor of s^2.
+    s2_asc: [B, K] ascending; probs: [P]; k_eff: [B] (effective count to use, ≤ K).
+    Returns [B, P] with linear interpolation between adjacent order stats.
+    """
+    B, K = s2_asc.shape
+    P = probs.numel()
+    if k_eff is None:
+        k_eff = torch.full((B,), K, device=s2_asc.device, dtype=torch.int64)
+    else:
+        k_eff = torch.clamp(k_eff.to(torch.int64), 1, K)
+    # positions in [0, k_eff-1]
+    pos = probs.unsqueeze(0) * (k_eff.unsqueeze(1).to(s2_asc.dtype) - 1.0)        # [B,P]
+    lo = torch.floor(pos)
+    hi = torch.ceil(pos)
+    w = (pos - lo).to(s2_asc.dtype)
+    lo_idx = torch.clamp(lo.to(torch.int64), 0, K - 1)                            # [B,P]
+    hi_idx = torch.clamp(hi.to(torch.int64), 0, K - 1)
+    # gather via take_along_dim (batch-safe)
+    q_lo = torch.take_along_dim(s2_asc, lo_idx, dim=-1)                           # [B,P]
+    q_hi = torch.take_along_dim(s2_asc, hi_idx, dim=-1)
+    q = (1.0 - w) * q_lo + w * q_hi
+    return q                                                                       # [B,P]
+
 
 def _score_fixed_mask(
     svals_sq: torch.Tensor,  # [B, K], squared singular values
@@ -52,88 +119,56 @@ def _score_fixed_mask(
 def _estimate_noise_level_torch_compiled(
     svals_desc: torch.Tensor,  # [B, K] singular values, DESCENDING order
     beta: float,
-    outer_iters: int = 3,
-    bisect_iters: int = 20,
+    p_lo: float = 0.05,
+    p_hi: float = 0.30,
+    num_p: int = 6,
+    tail_rel: float = 0.00,    # trim anything above λ_+(1+tail_rel) after first pass
 ) -> torch.Tensor:
     """
-    Batched hard-mask fixed-point with inner bisection on GPU.
-    Returns sigma_hat of shape [B].
+    Batched, spike-robust MP fit using LEFT-CDF quantile matching + one trim.
+    1) Choose a set of left quantiles p in [p_lo, p_hi], match empirical s^2 quantiles to MP λ-quantiles to get σ_p.
+    2) Take median over p -> σ0. Trim right-tail by λ_+ threshold on whitened s^2, re-fit quantiles -> σ1.
+    Returns σ̂ of shape [B]. Fully vectorized and compile-friendly.
     """
     device = svals_desc.device
     B, K = svals_desc.shape
-    svals = svals_desc.to(dtype=torch.float32)
-    s2 = svals * svals  # [B,K]
-
-    sqrtb = math.sqrt(beta)
-    one_plus_sqrtb = 1.0 + sqrtb
-
-    # Initial guess close to edge-of-bulk from the largest s
-    smax = svals.max(dim=-1).values  # [B]
-    sigma = (smax / one_plus_sqrtb) * 0.9  # [B]
-
-    # Ensure we have at least one inlier (edge = sigma*(1+sqrtb))
-    # Do a few fixed expansions (kept small & fixed to remain compile-friendly).
-    for _ in range(6):
-        edge = sigma * one_plus_sqrtb  # [B]
-        inliers = (svals <= edge.unsqueeze(-1))  # [B,K]
-        has_any = inliers.any(dim=-1)           # [B]
-        sigma = torch.where(has_any, sigma, sigma * 2.0)
-
-    # Outer fixed-point: recompute mask from current sigma, then
-    # solve F_I(sigma)=0 on that fixed mask via bisection.
-    for _ in range(outer_iters):
-        edge = sigma * one_plus_sqrtb  # [B]
-        mask = (svals <= edge.unsqueeze(-1))    # [B,K]
-        # if mask is empty for a batch item, fall back to include the smallest value
-        # (make sure bisection has something to work with)
-        any_inlier = mask.any(dim=-1, keepdim=True)
-        mask = torch.where(any_inlier, mask, torch.nn.functional.one_hot(
-            torch.full((B,), K - 1, device=device), num_classes=K
-        ).bool())
-
-        # s_I_max used to anchor the bracket
-        neg_inf = torch.full_like(svals, -float("inf"))
-        s_masked = torch.where(mask, svals, neg_inf)
-        s_I_max = s_masked.max(dim=-1).values  # [B]
-
-        base = (s_I_max / one_plus_sqrtb).clamp(min=1e-12)  # [B]
-        sigma_L = base * 0.5
-        sigma_R = base * 4.0
-
-        # Make sure the bracket encloses a root: F_L <= 0, F_R >= 0 (monotone increasing)
-        for _ in range(6):
-            F_L = _score_fixed_mask(s2, sigma_L, beta, mask)
-            F_R = _score_fixed_mask(s2, sigma_R, beta, mask)
-            # If F_L > 0, move left bound further left
-            sigma_L = torch.where(F_L > 0, sigma_L * 0.5, sigma_L)
-            # If F_R < 0, move right bound further right
-            sigma_R = torch.where(F_R < 0, sigma_R * 2.0, sigma_R)
-
-        # Bisection with fixed steps (branchless via where)
-        for _ in range(bisect_iters):
-            sigma_M = 0.5 * (sigma_L + sigma_R)
-            F_M = _score_fixed_mask(s2, sigma_M, beta, mask)
-            go_right = (F_M <= 0)  # if <= 0, move left up to mid; else move right down to mid
-            sigma_L = torch.where(go_right, sigma_M, sigma_L)
-            sigma_R = torch.where(go_right, sigma_R, sigma_M)
-
-        sigma = 0.5 * (sigma_L + sigma_R)
-
-    return sigma  # [B]
+    s = svals_desc.to(dtype=torch.float32)
+    # sort ascending on s^2 for stable quantiles
+    s2_asc = torch.sort(s * s, dim=-1, descending=False).values                   # [B,K]
+    # build left quantile grid p
+    if num_p <= 1:
+        probs = torch.tensor([(p_lo + p_hi) * 0.5], device=device, dtype=torch.float32)
+    else:
+        probs = torch.linspace(p_lo, p_hi, num_p, device=device, dtype=torch.float32)  # [P]
+    # MP λ-quantiles (independent of σ)
+    lam_q = _mp_quantiles_lambda(probs, beta, device=device)                       # [P]
+    lam_q = torch.clamp(lam_q, min=1e-12)
+    # ---- Pass 1: raw left-quantile fit ----
+    q_emp = _empirical_quantiles_from_sorted(s2_asc, probs)                        # [B,P]
+    sigma_p = torch.sqrt(q_emp / lam_q.unsqueeze(0))                               # [B,P]
+    sigma0 = torch.median(sigma_p, dim=-1).values                                   # [B]
+    # ---- Trim tail once, then re-fit ----
+    sqrtb = float(math.sqrt(beta))
+    lam_plus = (1.0 + sqrtb) ** 2
+    thresh = (lam_plus * (1.0 + tail_rel)) * (sigma0 * sigma0).unsqueeze(-1)       # [B,1]
+    inlier_count = (s2_asc <= thresh).to(torch.int64).sum(dim=-1)                  # [B]
+    inlier_count = torch.clamp(inlier_count, min=2, max=K)
+    q_emp_trim = _empirical_quantiles_from_sorted(s2_asc, probs, k_eff=inlier_count)  # [B,P]
+    sigma_p2 = torch.sqrt(q_emp_trim / lam_q.unsqueeze(0))                         # [B,P]
+    sigma1 = torch.median(sigma_p2, dim=-1).values                                  # [B]
+    return sigma1
 
 
 def estimate_noise_level_torch(
     innovation_svals_desc: torch.Tensor,  # [B, K] DESC
     beta: float,
-    outer_iters: int = 3,
-    bisect_iters: int = 20,
+    **kwargs,
 ) -> torch.Tensor:
     """
     Convenience wrapper (keeps public API small). Returns [B] sigma_hat.
+    Accepts optional kwargs: p_lo, p_hi, num_p, tail_rel.
     """
-    return _estimate_noise_level_torch_compiled(
-        innovation_svals_desc, beta, outer_iters=outer_iters, bisect_iters=bisect_iters
-    )
+    return _estimate_noise_level_torch_compiled(innovation_svals_desc, beta, **kwargs)
 
 
 @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
