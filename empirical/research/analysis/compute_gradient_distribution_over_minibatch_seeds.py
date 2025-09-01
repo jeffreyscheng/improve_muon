@@ -309,14 +309,16 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
     args = Hyperparameters()
     
     # Get all parameters that we'll need for sharding
-    all_layer_properties = get_weight_matrices(model, only_hidden=True)
-    all_param_keys = list(all_layer_properties.keys())
-    
+    all_layer_properties = get_weight_matrices(model, only_hidden=True)  # dict[(param_type, layer_idx)] -> tensor
+    # Deterministic global order across ranks
+    all_param_keys = sorted(list(all_layer_properties.keys()))
+
     # Shard parameters across ranks
     params_per_rank = len(all_param_keys) // world_size
     start_idx = rank * params_per_rank
     end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
-    my_param_keys = set(all_param_keys[start_idx:end_idx])
+    # Keep shard keys as an ORDERED list to preserve deterministic iteration
+    my_param_keys = all_param_keys[start_idx:end_idx]
     
     if rank == 0:
         print(f"    Rank {rank}: Processing {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
@@ -344,36 +346,37 @@ def compute_sharded_gradients(model: torch.nn.Module, data_loader, num_minibatch
         #     (We keep data parallel input sharding in the loader.)
         #     Intentionally no dist.all_reduce here.
         
-        # Store current momentum buffers before they get updated
+        # Store current momentum buffers before they get updated (iterate deterministically)
         for param_key in my_param_keys:
-            if param_key in momentum_buffers:
-                if param_key not in per_minibatch_momentum_buffers:
-                    # Initialize tensor to store all minibatches: num_minibatches×n×m
-                    per_minibatch_momentum_buffers[param_key] = torch.zeros(
-                        (num_minibatches,) + momentum_buffers[param_key].shape,
-                        dtype=momentum_buffers[param_key].dtype,
-                        device=momentum_buffers[param_key].device
-                    )
-                
-                # Store current momentum buffer before update
-                per_minibatch_momentum_buffers[param_key][mb_idx] = momentum_buffers[param_key].detach()
+            buf = momentum_buffers.get(param_key, None)
+            if buf is None:
+                continue
+            if param_key not in per_minibatch_momentum_buffers:
+                # Initialize tensor to store all minibatches: [B,n,m]
+                per_minibatch_momentum_buffers[param_key] = torch.zeros(
+                    (num_minibatches,) + buf.shape,
+                    dtype=buf.dtype,
+                    device=buf.device,
+                )
+            per_minibatch_momentum_buffers[param_key][mb_idx] = buf.detach()
         
         # Update momentum buffers and get accumulated gradients
         accumulated_gradients = get_accumulated_gradient_matrices(model, momentum_buffers, momentum_value)
         
-        # Store gradients for my assigned parameters
-        for param_key, grad_tensor in accumulated_gradients.items():
-            if param_key in my_param_keys:
-                if param_key not in per_minibatch_gradients:
-                    # Initialize tensor to store all minibatches: num_minibatches×n×m
-                    per_minibatch_gradients[param_key] = torch.zeros(
-                        (num_minibatches,) + grad_tensor.shape,
-                        dtype=grad_tensor.dtype,
-                        device=grad_tensor.device
-                    )
-                
-                # Store this minibatch's gradient
-                per_minibatch_gradients[param_key][mb_idx] = grad_tensor.detach()
+        # Store gradients for my assigned parameters (iterate deterministically)
+        for param_key in my_param_keys:
+            grad_tensor = accumulated_gradients.get(param_key, None)
+            if grad_tensor is None:
+                continue
+            if param_key not in per_minibatch_gradients:
+                # Initialize tensor to store all minibatches: [B,n,m]
+                per_minibatch_gradients[param_key] = torch.zeros(
+                    (num_minibatches,) + grad_tensor.shape,
+                    dtype=grad_tensor.dtype,
+                    device=grad_tensor.device,
+                )
+            # Store this minibatch's gradient
+            per_minibatch_gradients[param_key][mb_idx] = grad_tensor.detach()
         
         # Clear gradients to save memory (no per-minibatch empty_cache: 3E)
         model.zero_grad(set_to_none=True)

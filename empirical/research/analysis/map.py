@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Tuple, Iterator, TypeAlias, Callable
+from typing import Tuple, Iterator, TypeAlias, Callable, Iterable, List
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -148,15 +148,10 @@ def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) 
     if not layer_properties:
         return {}
     
-    # Get intersection of all keys
-    common_keys = set(layer_properties[0].keys())
-    for prop in layer_properties[1:]:
-        common_keys &= set(prop.keys())
-    
-    return {
-        key: fn(*[prop[key] for prop in layer_properties])
-        for key in common_keys
-    }
+    # Deterministic key order across ranks (even if construction orders differ)
+    key_sets = [set(p.keys()) for p in layer_properties]
+    keys: List[Tuple[str, int]] = sorted(set.intersection(*key_sets))
+    return {key: fn(*[prop[key] for prop in layer_properties]) for key in keys}
 
 
 def apply_fn_to_all_layers_multi(fn: Callable, *layer_properties: GPTLayerProperty) -> GPTLayerProperty:
@@ -202,46 +197,30 @@ def filter_layer_properties(layer_properties: GPTLayerProperty, predicate: Calla
     }
 
 
-def gather_layer_properties_to_rank_zero(*sharded_properties: GPTLayerProperty) -> list[GPTLayerProperty]:
+def gather_layer_properties_to_rank_zero(*props: GPTLayerProperty):
     """
-    Gather sharded GPTLayerProperty objects from all ranks to rank 0.
-    
-    Args:
-        *sharded_properties: Variable number of sharded GPTLayerProperty objects
-        
-    Returns:
-        List of full GPTLayerProperty objects (only populated on rank 0, empty on other ranks)
+    Gather each GPTLayerProperty dict from all ranks with a SINGLE collective per property.
+    This avoids per-key collective order divergence. On rank 0, dictionaries are merged.
     """
-    if not dist.is_initialized():
-        return list(sharded_properties)
-    
-    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    
-    # Batch all properties into a single gather operation
-    all_gathered_data = [None] * world_size
-    dist.all_gather_object(all_gathered_data, sharded_properties)
-    
-    gathered_properties = []
-    
-    if rank == 0:
-        # all_gathered_data contains [rank0_props, rank1_props, ..., rank7_props]
-        # where each rank_props is a tuple of GPTLayerProperty objects
-        
-        for prop_idx in range(len(sharded_properties)):
-            # Merge this property across all ranks
-            full_property = {}
-            for rank_data in all_gathered_data:
-                if rank_data is not None and len(rank_data) > prop_idx:
-                    rank_prop = rank_data[prop_idx]
-                    if rank_prop is not None:
-                        full_property.update(rank_prop)
-            gathered_properties.append(full_property)
-    else:
-        # Non-rank-0 processes get empty properties
-        gathered_properties = [{}] * len(sharded_properties)
-    
-    return gathered_properties
+    rank = dist.get_rank()
+    gathered = []
+    for prop in props:
+        bucket = [None] * world_size
+        # One collective per property; PyTorch handles size negotiation internally
+        dist.all_gather_object(bucket, prop)
+        if rank == 0:
+            merged: GPTLayerProperty = {}
+            # Merge in a deterministic order for reproducibility (not required for correctness)
+            for d in bucket:
+                if not d:
+                    continue
+                for k, v in d.items():
+                    merged[k] = v
+            gathered.append(merged)
+        else:
+            gathered.append(None)
+    return tuple(gathered)
 
 
 def broadcast_layer_properties_from_rank_zero(*full_properties: GPTLayerProperty) -> list[GPTLayerProperty]:
