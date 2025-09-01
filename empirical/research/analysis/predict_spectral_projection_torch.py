@@ -197,7 +197,10 @@ def predict_spectral_projection_batched(
     y = s / sigma_hat.unsqueeze(-1).clamp_min(1e-30)                  # [B,K]
     t = get_denoised_squared_singular_value_torch(y, beta=beta)       # [B,K]
     spc = estimate_spectral_projection_coefficients_torch(t, beta=beta)  # [B,K]
-    return spc
+    # Important: outputs from compiled + cudagraphs can be re-used/overwritten
+    # across invocations. Clone OUTSIDE of compiled regions so callers can safely
+    # stash results without being invalidated on a subsequent call.
+    return spc.clone()
 
 
 # --- Optional NumPy convenience wrappers for plotting paths ---
