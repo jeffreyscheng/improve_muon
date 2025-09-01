@@ -757,34 +757,88 @@ def create_noise_estimation_visualizations(
     
     # 1. Bulk vs Spike Estimation (Spectrum with MP density)
     def plot_bulk_vs_spike(ax, param_type, layer_data_list, viridis, max_layers):
+        # Title lives on the container axis; then we hide it and draw two inset axes
         ax.set_title(f'{param_type}')
-        ax.set_xlabel('Singular value')
-        ax.set_ylabel('Density')
-        
-        # Sum up per-layer innovation samples (already downsampled) and render a histogram
-        samples = []
-        betas = []
-        sigmas = []
+        ax.set_visible(False)
+
+        # Collect downsampled singular values from layers
+        samples, betas, sigmas = [], [], []
         for _, data in layer_data_list:
             s = np.asarray(data["innovation_sample"], dtype=float)
             if s.size:
-                samples.append(s)
+                samples.append(np.ascontiguousarray(s))
                 betas.append(float(data["beta"]))
                 sigmas.append(float(data["sigma_hat"]))
-        if samples:
-            all_innov = np.ascontiguousarray(np.concatenate(samples))
-            ax.hist(all_innov, bins=60, density=True, alpha=0.35, label="Empirical spectrum")
-            # Use median β, σ̂ across layers for the overlay
-            if betas and sigmas:
-                beta = float(np.median(np.asarray(betas)))
-                sigma_hat = float(np.median(np.asarray(sigmas)))
-                xs = np.linspace(0, all_innov.max()*1.05, 1000)
-                mp_density = mp_pdf_singular(xs, beta, sigma_hat)
-                ax.plot(xs, mp_density, 'r--', lw=2, label=f"MP (σ̂={sigma_hat:.3f})")
-                edge = sigma_hat * (1 + np.sqrt(beta))
-                ax.axvline(edge, color='k', lw=1.5, ls='--', label=f"Edge τ̂={edge:.3f}")
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(True, alpha=0.3)
+        if not samples:
+            return
+
+        all_innov = np.ascontiguousarray(np.concatenate(samples))
+        beta = float(np.median(np.asarray(betas))) if betas else 1.0
+        sigma_hat = float(np.median(np.asarray(sigmas))) if sigmas else 1e-8
+        edge = sigma_hat * (1.0 + np.sqrt(max(beta, 0.0)))
+        x_max = float(all_innov.max()*1.05)
+        # Ensure the right pane has a valid log domain
+        x_max = max(x_max, edge * 1.05 if edge > 0 else 1.0)
+
+        # Create two side-by-side inset axes: left linear (≤ τ̂), right log (> τ̂)
+        # [x0, y0, w, h] in axes fraction coords
+        ax_lin = ax.inset_axes([0.00, 0.00, 0.58, 1.00])
+        ax_log = ax.inset_axes([0.62, 0.00, 0.38, 1.00], sharey=ax_lin)
+
+        # Left (linear) histogram up to edge
+        if edge > 0:
+            bins_lin = np.linspace(0.0, edge, 50)
+            ax_lin.hist(all_innov[(all_innov >= 0.0) & (all_innov <= edge)],
+                        bins=bins_lin, density=True, alpha=0.35, label="Empirical spectrum")
+            xs_lin = np.linspace(0.0, edge, 400)
+            mp_lin = mp_pdf_singular(xs_lin, beta, sigma_hat)
+            ax_lin.plot(xs_lin, mp_lin, '--', lw=2, label=f"MP (σ̂={sigma_hat:.3f})")
+            ax_lin.axvline(edge, color='k', lw=1.0, ls='--', label=f"Edge τ̂")
+        else:
+            # Degenerate edge; just show a small linear window near zero
+            bins_lin = np.linspace(0.0, min(x_max, 1.0), 50)
+            ax_lin.hist(all_innov[(all_innov >= 0.0) & (all_innov <= bins_lin[-1])],
+                        bins=bins_lin, density=True, alpha=0.35, label="Empirical spectrum")
+
+        ax_lin.set_xlim(left=0.0, right=max(edge, bins_lin[-1] if edge == 0 else edge))
+        ax_lin.set_xlabel('singular value s (linear, ≤ τ̂)')
+        ax_lin.set_ylabel('density')
+        ax_lin.grid(True, alpha=0.3)
+        ax_lin.legend(loc='upper right', fontsize=8)
+
+        # Right (log) histogram for the spike tail
+        if x_max > edge * 1.0001:
+            # Avoid putting the exact edge into a log bin start (log undefined at 0)
+            start = edge * 1.0001 if edge > 0 else max(x_max * 1e-3, 1e-8)
+            bins_log = np.geomspace(start, x_max, 50)
+            tail = all_innov[all_innov > edge]
+            if tail.size:
+                ax_log.hist(tail, bins=bins_log, density=True, alpha=0.35)
+            xs_log = np.geomspace(start, x_max, 400)
+            mp_log = mp_pdf_singular(xs_log, beta, sigma_hat)
+            ax_log.plot(xs_log, mp_log, '--', lw=2)
+            ax_log.set_xscale('log')
+            ax_log.set_xlim(left=start, right=x_max)
+            ax_log.set_xlabel('singular value s (log, > τ̂)')
+            ax_log.grid(True, which='both', alpha=0.3)
+            # Draw the edge marker at the left boundary of the log pane (cosmetic)
+            ax_log.axvline(edge if edge > 0 else start, color='k', lw=1.0, ls='--')
+
+            # Tidy: hide the shared y label on the right pane
+            ax_log.yaxis.set_visible(False)
+
+            # Visual cue for the axis break (small slanted ticks at the split)
+            for a, xpos, sign in [(ax_lin, ax_lin.get_xlim()[1], +1),
+                                  (ax_log, ax_log.get_xlim()[0], -1)]:
+                ylim = a.get_ylim()
+                y0 = ylim[0] + 0.05*(ylim[1]-ylim[0])
+                y1 = ylim[0] + 0.15*(ylim[1]-ylim[0])
+                dx = (a.get_xlim()[1]-a.get_xlim()[0]) * 0.01
+                a.plot([xpos, xpos + sign*dx], [y0, y1], color='k', clip_on=False, lw=1)
+                a.plot([xpos, xpos + sign*dx], [y0*1.02, y1*1.02], color='k', clip_on=False, lw=1)
+        else:
+            # No tail beyond edge — keep a single linear pane labeling
+            ax_log.set_visible(False)
     
     # 2. SPC vs Singular Values  
     def plot_spc_vs_singular_values(ax, param_type, layer_data_list, viridis, max_layers):
