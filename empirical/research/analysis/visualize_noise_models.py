@@ -18,6 +18,11 @@ import matplotlib.pyplot as plt
 import imageio.v2 as imageio
 
 from empirical.research.analysis.map import get_research_log_path
+from empirical.research.analysis.predict_spectral_projection_torch import (
+    estimate_noise_level_numpy,
+    matrix_shape_beta,
+)
+
 
 PARAM_TYPES = ['Attention Q', 'Attention K', 'Attention V', 'Attention O', 'MLP Input', 'MLP Output']
 
@@ -81,6 +86,24 @@ def create_gif_from_frames(frame_paths, gif_path, fps=12):
     imageio.mimsave(gif_path, images, fps=fps, loop=0)
     print(f"Looping GIF saved: {gif_path}")
 
+
+def _mp_pdf_singular_np(s: np.ndarray, beta: float, sigma: float) -> np.ndarray:
+    """
+    Marchenko–Pastur density for singular values (not eigenvalues).
+    s, beta, sigma are numpy scalars/arrays; returns pdf(s) with same shape as s.
+    """
+    s = np.asarray(s, dtype=np.float64)
+    sigma = float(sigma)
+    sqrtb = np.sqrt(beta)
+    lam_m = (1.0 - sqrtb) ** 2
+    lam_p = (1.0 + sqrtb) ** 2
+    u = np.clip(s / max(sigma, 1e-30), 1e-30, None)
+    lam = u * u
+    inside = (lam > lam_m) & (lam < lam_p)
+    out = np.zeros_like(s, dtype=np.float64)
+    num = np.sqrt(np.clip((lam_p - lam) * (lam - lam_m), 0.0, None))
+    out[inside] = num[inside] / (np.pi * beta * sigma * u[inside])
+    return out
 
 def create_subplot_grid(param_types, figsize, get_data_fn, plot_fn, title, output_path):
     """Generic subplot grid creator."""
@@ -268,6 +291,110 @@ def create_spc_plots(data, output_dir):
     create_gif_from_frames(frame_paths, output_dir / "spc_vs_s.gif", 12)
     for fp in frame_paths:
         Path(fp).unlink()
+
+
+def create_bulk_spike_plots(data, output_dir, bins_per_axis: int = 64):
+    """
+    Bulk vs Spike plots with per-layer *lines* (no bars):
+    - empirical density: solid viridis line per layer
+    - fitted MP bulk:    dashed viridis line per layer (same color)
+    x-axis is log scale to match the noise model visualizations.
+    """
+    # Shapes used for beta (matches training architecture)
+    # If your shapes change, update this map.
+    SHAPES = {
+        'Attention Q': (1024, 1024),
+        'Attention K': (1024, 1024),
+        'Attention V': (1024, 1024),
+        'Attention O': (1024, 1024),
+        'MLP Input'  : (4096, 1024),
+        'MLP Output' : (1024, 4096),
+    }
+
+    def _geom_bins_for_param(step_data_for_type):
+        """Compute shared geometric bins for one param type at a given step."""
+        smins, smaxs = [], []
+        for _, d in step_data_for_type:
+            sv = np.asarray(d.get('per_minibatch_singular_values', []), dtype=np.float64)
+            sv = sv[sv > 0]
+            if sv.size:
+                smins.append(sv.min())
+                smaxs.append(sv.max())
+        if not smaxs:
+            # Fallback to a tiny positive range to avoid logspace errors
+            return np.geomspace(1e-12, 1.0, bins_per_axis + 1)
+        lo = max(1e-12, float(np.min(smins)))
+        hi = float(np.max(smaxs)) * 1.05
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = 1e-12, 1.0
+        return np.geomspace(lo, hi, bins_per_axis + 1)
+
+    def _get_step_param_type(step_dict, param_type):
+        return [(layer_num, d) for (p_type, layer_num), d in step_dict.items()
+                if p_type == param_type and layer_num >= 0 and
+                'per_minibatch_singular_values' in d]
+
+    def _plot_param_type(ax, param_type, layer_list, viridis, max_layers, bins):
+        ax.set_title(f'{param_type}')
+        ax.set_xlabel('singular value s  (log scale)')
+        ax.set_ylabel('density')
+        ax.grid(True, alpha=0.3)
+        ax.set_xscale('log')
+
+        # Common bin centers and widths
+        centers = np.sqrt(bins[:-1] * bins[1:])
+        widths  = np.diff(bins)
+
+        # β from known shape
+        shape = SHAPES.get(param_type, (1024, 1024))
+        beta = matrix_shape_beta(shape)
+
+        # Color scale keyed to layer id (avoid divide-by-zero)
+        denom = max(1, max_layers - 1)
+
+        for layer_num, d in layer_list:
+            color = viridis(layer_num / denom)
+            sv = np.asarray(d['per_minibatch_singular_values'], dtype=np.float64)
+            sv = sv[sv > 0]
+            if sv.size == 0:
+                continue
+            # Empirical density on geometric bins
+            counts, _ = np.histogram(sv, bins=bins)
+            density = counts.astype(np.float64) / (sv.size * widths)
+            # MP fit: estimate σ from the *descending* singulars
+            s_desc = np.sort(sv)[::-1].copy()
+            sigma_hat = estimate_noise_level_numpy(s_desc, beta)
+            mp = _mp_pdf_singular_np(centers, beta, sigma_hat)
+            # Draw both lines
+            ax.plot(centers, density, color=color, lw=1.6, alpha=0.9)
+            ax.plot(centers, mp,      color=color, lw=1.6, ls='--', alpha=0.9)
+
+    # Build frames, one per step, 6 subplots (param types)
+    frame_paths = []
+    for step in sorted(data.keys()):
+        def _get_data(param_type):
+            return _get_step_param_type(data[step], param_type)
+
+        # Precompute bins per param type for this step (shared within panel)
+        bins_map = {
+            pt: _geom_bins_for_param(_get_data(pt)) for pt in PARAM_TYPES
+        }
+
+        def _plot(ax, param_type, layer_list, viridis, max_layers):
+            _plot_param_type(ax, param_type, layer_list, viridis, max_layers, bins_map[param_type])
+
+        frame_path = output_dir / f"bulk_spike_lines_{step:06d}.png"
+        create_subplot_grid(PARAM_TYPES, (20, 10), _get_data, _plot,
+                            f'Bulk vs Spike (lines) - Step {step}', frame_path)
+        frame_paths.append(str(frame_path))
+
+    if frame_paths:
+        print(f"Creating Bulk/Spike lines GIF with {len(frame_paths)} frames...")
+        create_gif_from_frames(frame_paths, output_dir / "bulk_spike_lines.gif", 12)
+        for fp in frame_paths:
+            Path(fp).unlink()
+    else:
+        print("No singular values found for bulk/spike plots; skipping.")
 
 
 def main():

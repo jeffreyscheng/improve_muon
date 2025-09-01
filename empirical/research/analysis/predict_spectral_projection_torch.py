@@ -1,6 +1,7 @@
 import math
 from typing import Tuple, Union
 
+import functools
 import torch
 
 # We keep tiny epsilons to avoid hitting MP support endpoints numerically
@@ -83,92 +84,147 @@ def _empirical_quantiles_from_sorted(s2_asc: torch.Tensor, probs: torch.Tensor, 
     return q                                                                       # [B,P]
 
 
-def _score_fixed_mask(
-    svals_sq: torch.Tensor,  # [B, K], squared singular values
-    sigma: torch.Tensor,     # [B]    or [B, 1]
-    beta: float,
-    mask: torch.Tensor       # [B, K] boolean: which entries are "inliers"
-) -> torch.Tensor:
+# ---------- MP helpers (torch) ----------
+def _mp_pdf_singular_torch(s: torch.Tensor, beta: float, sigma: torch.Tensor) -> torch.Tensor:
     """
-    Score F_I(sigma) with a FIXED inlier mask I.
-    Monotone increasing in sigma for any fixed mask.
-    Returns shape [B].
+    MP density for singular values (not eigenvalues).
+    s: [...], sigma: broadcastable to s, beta: float
+    Returns pdf(s; sigma, beta) with shape s.shape.
     """
-    # broadcast sigma to [B, 1]
-    sigma = sigma.unsqueeze(-1)
-    u2 = (svals_sq / (sigma * sigma)).clamp(min=0)  # [B, K]
-
+    s = s.to(dtype=torch.float32)
+    sigma = sigma.to(dtype=torch.float32)
     sqrtb = math.sqrt(beta)
     lam_m = (1.0 - sqrtb) ** 2
     lam_p = (1.0 + sqrtb) ** 2
+    # u = s / sigma  (singular value whitened by sigma)
+    u = (s / sigma).clamp_min(1e-30)
+    lam = u * u
+    inside = (lam > lam_m + _EPS) & (lam < lam_p - _EPS)
+    out = torch.zeros_like(s, dtype=torch.float32)
+    if torch.is_tensor(beta):
+        # not expected, but keep broadcast-safety
+        b = beta.to(dtype=torch.float32)
+    else:
+        b = torch.tensor(beta, device=s.device, dtype=torch.float32)
+    # numerator: sqrt((λ_+ - λ)(λ - λ_-))
+    num = torch.sqrt(torch.clamp((lam_p - lam) * (lam - lam_m), min=0.0))
+    # pdf for singular values: (1 / (π β σ)) * sqrt((λ_+ - λ)(λ - λ_-)) / u
+    # (see derivation via change of variables from MP for eigenvalues)
+    denom = (math.pi * b) * sigma * u
+    val = num / denom
+    out = torch.where(inside, val, out)
+    return out
 
-    # clamp u2 strictly inside MP support to avoid infinities
-    u2 = u2.clamp(min=lam_m + _EPS, max=lam_p - _EPS)
-
-    # term = u2/(u2 - lam_m) - u2/(lam_p - u2)
-    term1 = u2 / (u2 - lam_m)
-    term2 = u2 / (lam_p - u2)
-    score_terms = term1 - term2  # [B, K]
-
-    # sum only over inliers
-    score = (score_terms * mask.float()).sum(dim=-1)  # [B]
-    return score
+def _trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute CDF from pdf on a shared grid via trapezoid rule.
+    pdf: [..., G], x: [G]
+    Returns CDF with shape [..., G], starting at 0.
+    """
+    dx = torch.diff(x)                               # [G-1]
+    mid = 0.5 * (pdf[..., 1:] + pdf[..., :-1])      # [..., G-1]
+    F = torch.cumsum(mid * dx, dim=-1)              # [..., G-1]
+    F = torch.nn.functional.pad(F, (1, 0))          # [..., G]
+    # numerical guard to keep within [0,1]
+    return torch.clamp(F, 0.0, 1.0)
 
 
 @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
-def _estimate_noise_level_torch_compiled(
-    svals_desc: torch.Tensor,  # [B, K] singular values, DESCENDING order
+def _estimate_noise_level_one_sided_cdf(
+    svals_desc: torch.Tensor,   # [B, K], DESC
     beta: float,
-    p_lo: float = 0.05,
-    p_hi: float = 0.30,
-    num_p: int = 6,
-    tail_rel: float = 0.00,    # trim anything above λ_+(1+tail_rel) after first pass
+    grid_points: int = 256,
+    cand_points: int = 33,
+    refine_rounds: int = 2,
 ) -> torch.Tensor:
     """
-    Batched, spike-robust MP fit using LEFT-CDF quantile matching + one trim.
-    1) Choose a set of left quantiles p in [p_lo, p_hi], match empirical s^2 quantiles to MP λ-quantiles to get σ_p.
-    2) Take median over p -> σ0. Trim right-tail by λ_+ threshold on whitened s^2, re-fit quantiles -> σ1.
-    Returns σ̂ of shape [B]. Fully vectorized and compile-friendly.
+    One-sided CDF fit:
+      minimize mean_g ReLU(F_MP(s_g; sigma) - F_emp(s_g))^2
+    over sigma. Robust to spikes because underprediction is not penalized.
+    Fully batched and compile-friendly (fixed grid sizes).
+    Returns [B] sigma_hat.
     """
     device = svals_desc.device
     B, K = svals_desc.shape
-    s = svals_desc.to(dtype=torch.float32)
-    # sort ascending on s^2 for stable quantiles
-    s2_asc = torch.sort(s * s, dim=-1, descending=False).values                   # [B,K]
-    # build left quantile grid p
-    if num_p <= 1:
-        probs = torch.tensor([(p_lo + p_hi) * 0.5], device=device, dtype=torch.float32)
-    else:
-        probs = torch.linspace(p_lo, p_hi, num_p, device=device, dtype=torch.float32)  # [P]
-    # MP λ-quantiles (independent of σ)
-    lam_q = _mp_quantiles_lambda(probs, beta, device=device)                       # [P]
-    lam_q = torch.clamp(lam_q, min=1e-12)
-    # ---- Pass 1: raw left-quantile fit ----
-    q_emp = _empirical_quantiles_from_sorted(s2_asc, probs)                        # [B,P]
-    sigma_p = torch.sqrt(q_emp / lam_q.unsqueeze(0))                               # [B,P]
-    sigma0 = torch.median(sigma_p, dim=-1).values                                   # [B]
-    # ---- Trim tail once, then re-fit ----
-    sqrtb = float(math.sqrt(beta))
-    lam_plus = (1.0 + sqrtb) ** 2
-    thresh = (lam_plus * (1.0 + tail_rel)) * (sigma0 * sigma0).unsqueeze(-1)       # [B,1]
-    inlier_count = (s2_asc <= thresh).to(torch.int64).sum(dim=-1)                  # [B]
-    inlier_count = torch.clamp(inlier_count, min=2, max=K)
-    q_emp_trim = _empirical_quantiles_from_sorted(s2_asc, probs, k_eff=inlier_count)  # [B,P]
-    sigma_p2 = torch.sqrt(q_emp_trim / lam_q.unsqueeze(0))                         # [B,P]
-    sigma1 = torch.median(sigma_p2, dim=-1).values                                  # [B]
-    return sigma1
+    s_desc = svals_desc.to(torch.float32)
+    # Ascending order for cheap empirical CDF
+    s = torch.flip(s_desc, dims=[-1])                # [B, K] ASC
+    # Global grid bounds across batch to keep shapes static
+    s_min_pos = torch.clamp_min(s[..., 0].min(), 1e-20)
+    s_max = s[..., -1].max()
+    # Modest expansion to accommodate edge placement
+    s_lo = s_min_pos
+    s_hi = s_max * 1.1
+    # Log-spaced grid for numerical stability
+    s_grid = torch.logspace(torch.log10(s_lo), torch.log10(s_hi),
+                            steps=grid_points, device=device, dtype=torch.float32)  # [G]
+
+    # Empirical CDF at grid points: fraction of samples ≤ s_g
+    # Broadcast compare: (B,K,1) <= (G) -> (B,G)
+    F_emp = (s.unsqueeze(-1) <= s_grid).float().mean(dim=-2)  # [B, G]
+
+    # Base scale ~ right edge / (1+sqrtβ)
+    one_plus_sqrtb = 1.0 + math.sqrt(beta)
+    smax = s_desc.max(dim=-1).values                            # [B]
+    base = (smax / one_plus_sqrtb).clamp_min(1e-12)            # [B]
+
+    # Coarse candidate ratios around base (log-spaced)
+    def _ratios(n, span_lo, span_hi):
+        return torch.logspace(math.log10(span_lo), math.log10(span_hi),
+                              steps=n, device=device, dtype=torch.float32)  # [n]
+
+    ratios = _ratios(cand_points, 0.125, 8.0)                   # [C]
+    sigma_c = (base.unsqueeze(-1) * ratios).contiguous()        # [B, C]
+
+    # Fixed number of refinement rounds around current best
+    for _ in range(refine_rounds):
+        # MP pdf for each (B, C) at grid s_grid -> [B, C, G]
+        pdf = _mp_pdf_singular_torch(
+            s_grid.view(1, 1, -1).expand(B, sigma_c.shape[1], -1),
+            beta=beta,
+            sigma=sigma_c.unsqueeze(-1),
+        )  # [B,C,G]
+        F_mp = _trapz_cdf_from_pdf(pdf, s_grid)                 # [B,C,G]
+        # One-sided squared error
+        err = torch.relu(F_mp - F_emp.unsqueeze(1)) ** 2        # [B,C,G]
+        loss = err.mean(dim=-1)                                  # [B,C]
+        # Best per batch
+        best_idx = loss.argmin(dim=-1)                           # [B]
+        best_sigma = sigma_c.gather(1, best_idx.unsqueeze(-1)).squeeze(-1)  # [B]
+        # Build a tighter candidate set around the winner
+        ratios = _ratios(cand_points, 0.5, 2.0)                  # narrower
+        sigma_c = (best_sigma.unsqueeze(-1) * ratios).contiguous()
+
+    # Final pick from the last refinement grid
+    pdf = _mp_pdf_singular_torch(
+        s_grid.view(1, 1, -1).expand(B, sigma_c.shape[1], -1),
+        beta=beta,
+        sigma=sigma_c.unsqueeze(-1),
+    )
+    F_mp = _trapz_cdf_from_pdf(pdf, s_grid)                      # [B,C,G]
+    err = torch.relu(F_mp - F_emp.unsqueeze(1)) ** 2             # [B,C,G]
+    loss = err.mean(dim=-1)                                      # [B,C]
+    best_idx = loss.argmin(dim=-1)
+    sigma_hat = sigma_c.gather(1, best_idx.unsqueeze(-1)).squeeze(-1)  # [B]
+    return sigma_hat
 
 
 def estimate_noise_level_torch(
     innovation_svals_desc: torch.Tensor,  # [B, K] DESC
     beta: float,
-    **kwargs,
+    grid_points: int = 256,
+    cand_points: int = 33,
+    refine_rounds: int = 2,
 ) -> torch.Tensor:
     """
-    Convenience wrapper (keeps public API small). Returns [B] sigma_hat.
-    Accepts optional kwargs: p_lo, p_hi, num_p, tail_rel.
+    One-sided CDF fit wrapper. Returns [B] sigma_hat.
     """
-    return _estimate_noise_level_torch_compiled(innovation_svals_desc, beta, **kwargs)
+    return _estimate_noise_level_one_sided_cdf(
+        innovation_svals_desc, beta,
+        grid_points=grid_points,
+        cand_points=cand_points,
+        refine_rounds=refine_rounds,
+    )
 
 
 @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
