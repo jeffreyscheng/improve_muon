@@ -202,27 +202,3 @@ def predict_spectral_projection_batched(
     spc = estimate_spectral_projection_coefficients_torch(t, beta=beta).clone()  # [B,K]
     return spc
 
-
-# --- Optional NumPy convenience wrappers for plotting paths ---
-def estimate_noise_level_numpy(innovation_spectrum_desc_np, beta: float) -> float:
-    import numpy as _np
-    t = torch.as_tensor(innovation_spectrum_desc_np, dtype=torch.float32, device="cuda" if torch.cuda.is_available() else "cpu")
-    if t.ndim == 1:
-        t = t.unsqueeze(0)
-    with torch.no_grad():
-        sig = estimate_noise_level_torch(t, beta=beta)
-    return float(sig.squeeze().cpu().item())
-
-def get_denoised_squared_singular_value_numpy(y_np, beta: float):
-    import numpy as _np
-    t = torch.as_tensor(y_np, dtype=torch.float32, device="cuda" if torch.cuda.is_available() else "cpu")
-    with torch.no_grad():
-        out = get_denoised_squared_singular_value_torch(t, beta=beta)
-    return out.cpu().numpy()
-
-def estimate_spectral_projection_coefficients_numpy(t_np, beta: float):
-    import numpy as _np
-    t = torch.as_tensor(t_np, dtype=torch.float32, device="cuda" if torch.cuda.is_available() else "cpu")
-    with torch.no_grad():
-        out = estimate_spectral_projection_coefficients_torch(t, beta=beta)
-    return out.cpu().numpy()

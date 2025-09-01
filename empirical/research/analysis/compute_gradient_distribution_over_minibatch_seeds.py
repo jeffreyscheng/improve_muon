@@ -51,9 +51,9 @@ from empirical.research.analysis.map import (
 from empirical.research.analysis.predict_spectral_projection_torch import (
     predict_spectral_projection_batched,
     matrix_shape_beta,
-    estimate_noise_level_numpy,
-    get_denoised_squared_singular_value_numpy,
-    estimate_spectral_projection_coefficients_numpy,
+    estimate_noise_level_torch,
+    get_denoised_squared_singular_value_torch,
+    estimate_spectral_projection_coefficients_torch,
 )
 
 # ---- Small utilities for viz/gather ----
@@ -577,7 +577,7 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
             s_np_sorted_desc = np.sort(s_np)[::-1].copy()
 
             beta = _beta_for((n, m))
-            sigma_hat = float(estimate_noise_level_numpy(s_np_sorted_desc, beta))
+            sigma_hat = float(estimate_noise_level_torch(torch.tensor(s_np_sorted_desc).unsqueeze(0), beta).item())
 
             # For "SPC vs Singular": take first two minibatches
             mb_take = min(2, B)
@@ -590,8 +590,8 @@ def compute_analysis_for_step(step: int, checkpoint_file: str, num_minibatches: 
                 edge = 1.0 + math.sqrt(beta)
                 spike_mask = y > edge
                 if spike_mask.any():
-                    t_hat = get_denoised_squared_singular_value_numpy(y, beta)
-                    spc   = estimate_spectral_projection_coefficients_numpy(t_hat, beta)
+                    t_hat = get_denoised_squared_singular_value_torch(torch.tensor(y), beta).cpu().numpy()
+                    spc   = estimate_spectral_projection_coefficients_torch(torch.tensor(t_hat), beta).cpu().numpy()
                     y_list.append(np.ascontiguousarray(y[spike_mask]))
                     spc_list.append(np.ascontiguousarray(spc[spike_mask]))
             if len(y_list) == 0:
@@ -882,8 +882,8 @@ def create_noise_estimation_visualizations(
         ygrid = np.logspace(0, 2, 200)  # y from 1 to 100
         # Use a typical shape's β for reference (3D: fixed once)
         beta_sample = matrix_shape_beta((1024, 1024))
-        tgrid = get_denoised_squared_singular_value_numpy(ygrid, beta_sample)
-        spcgrid = estimate_spectral_projection_coefficients_numpy(tgrid, beta_sample)
+        tgrid = get_denoised_squared_singular_value_torch(torch.tensor(ygrid), beta_sample).cpu().numpy()
+        spcgrid = estimate_spectral_projection_coefficients_torch(torch.tensor(tgrid), beta_sample).cpu().numpy()
         ax.plot(ygrid, spcgrid, 'k--', lw=2, alpha=0.7, label='Theoretical SPC')
         
         ax.legend(loc='lower right', fontsize=8)
