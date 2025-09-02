@@ -3,6 +3,7 @@ from typing import Tuple, Union
 
 import functools
 import torch
+from empirical.research.analysis.core_math import mp_pdf_singular_torch
 
 # We keep tiny epsilons to avoid hitting MP support endpoints numerically
 _EPS = 1e-6
@@ -85,35 +86,6 @@ def _empirical_quantiles_from_sorted(s2_asc: torch.Tensor, probs: torch.Tensor, 
 
 
 # ---------- MP helpers (torch) ----------
-def _mp_pdf_singular_torch(s: torch.Tensor, beta: float, sigma: torch.Tensor) -> torch.Tensor:
-    """
-    MP density for singular values (not eigenvalues).
-    s: [...], sigma: broadcastable to s, beta: float
-    Returns pdf(s; sigma, beta) with shape s.shape.
-    """
-    s = s.to(dtype=torch.float32)
-    sigma = sigma.to(dtype=torch.float32)
-    sqrtb = math.sqrt(beta)
-    lam_m = (1.0 - sqrtb) ** 2
-    lam_p = (1.0 + sqrtb) ** 2
-    # u = s / sigma  (singular value whitened by sigma)
-    u = (s / sigma).clamp_min(1e-30)
-    lam = u * u
-    inside = (lam > lam_m + _EPS) & (lam < lam_p - _EPS)
-    out = torch.zeros_like(s, dtype=torch.float32)
-    if torch.is_tensor(beta):
-        # not expected, but keep broadcast-safety
-        b = beta.to(dtype=torch.float32)
-    else:
-        b = torch.tensor(beta, device=s.device, dtype=torch.float32)
-    # numerator: sqrt((λ_+ - λ)(λ - λ_-))
-    num = torch.sqrt(torch.clamp((lam_p - lam) * (lam - lam_m), min=0.0))
-    # pdf for singular values: (1 / (π β σ)) * sqrt((λ_+ - λ)(λ - λ_-)) / u
-    # (see derivation via change of variables from MP for eigenvalues)
-    denom = (math.pi * b) * sigma * u
-    val = num / denom
-    out = torch.where(inside, val, out)
-    return out
 
 def _trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
@@ -179,7 +151,7 @@ def _estimate_noise_level_one_sided_cdf(
     # Fixed number of refinement rounds around current best
     for _ in range(refine_rounds):
         # MP pdf for each (B, C) at grid s_grid -> [B, C, G]
-        pdf = _mp_pdf_singular_torch(
+        pdf = mp_pdf_singular_torch(
             s_grid.view(1, 1, -1).expand(B, sigma_c.shape[1], -1),
             beta=beta,
             sigma=sigma_c.unsqueeze(-1),
@@ -196,7 +168,7 @@ def _estimate_noise_level_one_sided_cdf(
         sigma_c = (best_sigma.unsqueeze(-1) * ratios).contiguous()
 
     # Final pick from the last refinement grid
-    pdf = _mp_pdf_singular_torch(
+    pdf = mp_pdf_singular_torch(
         s_grid.view(1, 1, -1).expand(B, sigma_c.shape[1], -1),
         beta=beta,
         sigma=sigma_c.unsqueeze(-1),
