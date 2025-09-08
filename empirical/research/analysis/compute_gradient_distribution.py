@@ -29,8 +29,8 @@ import numpy as np
 import pandas as pd
 
 from empirical.research.training.training_core import (
-    setup_distributed_training, Hyperparameters, warmup_kernels,
-    distributed_data_generator
+    setup_distributed_training, Hyperparameters, get_window_size_blocks,
+    distributed_data_generator, safe_torch_compile
 )
 from empirical.research.analysis.model_utilities import (
     get_weight_matrices, get_accumulated_gradient_matrices,
@@ -110,21 +110,37 @@ def precompile_svd_kernels(device: torch.device, rank: int):
 def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     """Load model from checkpoint with proper device placement."""
     from empirical.research.training.architecture import GPT
+    from empirical.research.training.training_core import safe_torch_compile
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_file, map_location=device)
+    rank = dist.get_rank()
+    if rank == 0:
+        print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
     
-    # Create model with hardcoded args like original
+    # Create fresh model exactly like training does
     args = Hyperparameters()
-    model = GPT(args.vocab_size, 16, 8, 1024, max(args.train_seq_len, args.val_seq_len)).to(device)
+    model = GPT(args.vocab_size, 16, 8, 1024, max(args.train_seq_len, args.val_seq_len)).cuda()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Embedding):
+            m.bfloat16()
     
-    # Load state dict with _orig_mod prefix handling
-    state_dict = checkpoint['model_state_dict']
+    # Broadcast parameters like training does
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
+    
+    # Load checkpoint weights
+    checkpoint_data = torch.load(checkpoint_file, map_location=device)
+    state_dict = checkpoint_data['model_state_dict']
     if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     
-    return model, checkpoint.get('step', 0)
+    # Compile model using distributed-safe compilation
+    model = safe_torch_compile(model, dynamic=False)
+    
+    if rank == 0:
+        print(f"Rank {rank}: Model loaded and compiled")
+    
+    return model, checkpoint_data.get('step', 0)
 
 
 def compute_analysis_for_step(
@@ -139,8 +155,20 @@ def compute_analysis_for_step(
     
     # 1. Setup (5 LOC)
     model, _ = setup_model_from_checkpoint(checkpoint_file, device)
-    warmup_kernels(model, [torch.optim.SGD(model.parameters(), lr=1.0)], 
-                  Hyperparameters())
+    
+    # Lightweight warmup for analysis - use small sequence to avoid OOM
+    args = Hyperparameters()
+    small_seq_len = 128  # Much smaller than training's 8192
+    vocab_size = args.vocab_size
+    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
+    sliding_window_blocks = 1  # Minimal sliding window
+    
+    # Single warmup pass
+    window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
+    model(inputs.to(torch.int32), targets, window_size_blocks).backward()
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()  # Clear memory after warmup
+    
     precompile_svd_kernels(device, rank)
     
     # Synchronize after setup
