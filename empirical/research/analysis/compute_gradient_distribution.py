@@ -312,6 +312,11 @@ def main():
     # Distributed setup
     _, rank, world_size, device, master_process = setup_distributed_training()
     
+    # Initialize global print function for training_core patch
+    from empirical.research.training.training_core import _global_print0
+    import empirical.research.training.training_core as training_core
+    training_core._global_print0 = lambda s, console=False: print(s) if rank == 0 else None
+    
     if rank == 0:
         print(f"Starting gradient distribution analysis for run: {run_id}")
         print(f"Testing mode: {testing_mode}, Force recompute: {force_recompute}")
