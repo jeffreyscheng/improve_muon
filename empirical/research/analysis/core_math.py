@@ -142,6 +142,9 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
         U, s, Vh tensors with proper cloning for CUDA graph safety
     """
     with torch.no_grad():
+        # Cast to float32 if needed for SVD compatibility
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
         U, s, Vh = torch.linalg.svd(tensor, full_matrices=False)
         return U.clone(), s.clone(), Vh.clone()
 
@@ -215,6 +218,9 @@ def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
     """Compute stable rank directly from a matrix (computes SVD internally)."""
     if isinstance(tensor, torch.Tensor):
         with torch.no_grad():
+            # Cast to float32 if needed for SVD compatibility
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.float()
             s = torch.linalg.svdvals(tensor)
             return compute_stable_rank(s)
     else:
