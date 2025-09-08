@@ -167,7 +167,7 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     # Get data generator
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    data_generator = distributed_data_generator(args, rank, world_size)
+    data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
     # Storage for per-minibatch gradients
     per_minibatch_grads = {}
