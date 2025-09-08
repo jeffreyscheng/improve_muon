@@ -180,7 +180,7 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 inputs, targets = next(data_generator)
             except StopIteration:
                 # Re-initialize data generator if exhausted
-                data_generator = distributed_data_generator(args, rank, world_size)
+                data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
                 inputs, targets = next(data_generator)
             
             # Zero gradients
@@ -189,13 +189,13 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
             # Forward pass
             with torch.enable_grad():
                 model.train()  # Brief switch to train mode for gradient computation
-                outputs = model(inputs)
                 
-                # Compute loss (simple cross-entropy)
-                loss = torch.nn.functional.cross_entropy(
-                    outputs.view(-1, outputs.size(-1)), 
-                    targets.view(-1)
-                )
+                # Get sliding window blocks for this step
+                from empirical.research.training.training_core import get_window_size_blocks
+                window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(inputs.device)
+                
+                # Call model with all required arguments
+                loss = model(inputs.to(torch.int32), targets, window_size_blocks)
                 
                 # Backward pass
                 loss.backward()
