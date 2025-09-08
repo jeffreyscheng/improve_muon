@@ -175,20 +175,34 @@ def compute_analysis_for_step(
     if dist.is_initialized():
         dist.barrier()
     
-    # 2. Get initial layer properties (10 LOC) 
-    weights = get_weight_matrices(model)
-    
-    # Create data loader for gradient computation
+    # 2. Parameter sharding - each rank gets subset of parameters
     args = Hyperparameters()
-    data_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
+    # Get all parameters for sharding
+    all_weights = get_weight_matrices(model, only_hidden=True)
+    all_param_keys = list(all_weights.keys())
+    
+    # Shard parameters across ranks
+    params_per_rank = len(all_param_keys) // world_size
+    start_idx = rank * params_per_rank
+    end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
+    my_param_keys = set(all_param_keys[start_idx:end_idx])
+    
+    if rank == 0:
+        print(f"    Rank {rank}: Processing {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
+    
+    # Get sharded gradients (only for my assigned parameters)
     gradients = get_accumulated_gradient_matrices(
-        model, args, step, num_minibatches=num_minibatches
+        model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys
     )
     
+    # Filter weights to only assigned parameters
+    my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
+    
+    # Create initial properties only for assigned parameters
     initial_props = combine_layer_properties(
         lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
-        weights, gradients
+        my_weights, gradients
     )
     
     # 3. Execute analysis pipeline (5 LOC)
@@ -200,18 +214,38 @@ def compute_analysis_for_step(
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
     
+    # Convert to compact record format for efficient gathering
+    local_records = convert_pipeline_results_to_record_format(local_results)
+    
     # Synchronize ranks before gathering
     if dist.is_initialized():
         dist.barrier()
     
     # 4. Distributed coordination (10 LOC)
     if rank == 0:
-        all_results = gather_layer_properties_to_rank_zero(local_results)
-        print(f"Step {step}: Analysis complete for {len(all_results)} layers")
-        return all_results
+        all_records = gather_layer_properties_to_rank_zero(local_records)
+        print(f"Step {step}: Analysis complete for {len(all_records)} layers")
+        return all_records
     else:
-        gather_layer_properties_to_rank_zero(local_results)
+        gather_layer_properties_to_rank_zero(local_records)
         return {}
+
+
+def convert_pipeline_results_to_record_format(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    """Convert pipeline results to compact record format for gathering."""
+    records = {}
+    
+    for (param_type, layer_num), props in layer_props.items():
+        record = {
+            'weight_stable_rank': float(props.get('weights_stable_rank', 0)),
+            'per_minibatch_gradient_stable_rank': props.get('gradients_stable_rank', torch.tensor(0.0)).cpu().numpy(),
+            'per_minibatch_gradient_singular_values': props.get('minibatch_singular_values', torch.tensor([])).cpu().numpy(),
+            'gradient_singular_value_standard_deviations': props.get('singular_value_std', torch.tensor([])).cpu().numpy(),
+            'spectral_projection_coefficients_from_8x_mean_gradient': props.get('spectral_projection_coefficients', torch.tensor([])).cpu().numpy()
+        }
+        records[(param_type, layer_num)] = record
+    
+    return records
 
 
 def create_compact_visualization_stats(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
@@ -235,47 +269,39 @@ def create_compact_visualization_stats(layer_props: GPTLayerProperty) -> Dict[Tu
     return viz_stats
 
 
-def save_analysis_results(results: GPTLayerProperty, step: int):
+def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: int):
     """Save analysis results to CSV files."""
-    # Create output directories
-    base_dir = Path("research_logs/fitted_noise_model")
-    sv_dir = base_dir / "singular_values"
-    sr_dir = base_dir / "stable_ranks"
+    # Create output directories  
+    base_dir = Path("research_logs/singular_values_distribution")
+    sv_dir = base_dir
     sv_dir.mkdir(parents=True, exist_ok=True)
-    sr_dir.mkdir(parents=True, exist_ok=True)
     
-    # Convert to record format and save
+    # Convert to record format for CSV
     step_records = []
     
-    for (param_type, layer_num), props in results.items():
+    for (param_type, layer_num), record_data in results.items():
         if layer_num < 0:  # Skip invalid layers
             continue
             
-        # Extract key metrics for CSV export
+        # Create record in original format
+        import json
         record = {
-            "step": step,
             "param_type": param_type,
-            "layer": layer_num,
-            "weights_stable_rank": float(props.get("weights_stable_rank", 0)),
-            "gradients_stable_rank": float(props.get("gradients_stable_rank", 0)),
+            "layer_num": layer_num,
+            "weight_stable_rank": record_data.get('weight_stable_rank', 0),
+            "per_minibatch_gradient_singular_values": json.dumps(record_data.get('per_minibatch_gradient_singular_values', []).tolist()),
+            "gradient_singular_value_standard_deviations": json.dumps(record_data.get('gradient_singular_value_standard_deviations', []).tolist()),
+            "per_minibatch_gradient_stable_rank": json.dumps(record_data.get('per_minibatch_gradient_stable_rank', []).tolist()),
+            "spectral_projection_coefficients_from_8x_mean_gradient": json.dumps(record_data.get('spectral_projection_coefficients_from_8x_mean_gradient', []).tolist())
         }
-        
-        # Add singular value statistics
-        if "minibatch_singular_values" in props:
-            sv = props["minibatch_singular_values"].cpu().numpy()
-            record.update({
-                "mean_singular_value": float(sv.mean()),
-                "std_singular_value": float(sv.std()),
-                "max_singular_value": float(sv.max()),
-            })
         
         step_records.append(record)
     
-    # Save to CSV (simplified version - expand as needed)
+    # Save to CSV in original format
     df = pd.DataFrame(step_records)
     
     if not df.empty:
-        csv_path = sr_dir / f"step_{step:06d}.csv"
+        csv_path = sv_dir / f"step_{step:06d}.csv"
         df.to_csv(csv_path, index=False)
         print(f"Saved analysis results to {csv_path}")
 

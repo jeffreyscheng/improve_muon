@@ -117,7 +117,7 @@ def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) 
     return result
 
 
-def gather_layer_properties_to_rank_zero(*props: GPTLayerProperty):
+def gather_layer_properties_to_rank_zero(*props):
     """Gather layer properties from all ranks to rank 0."""
     if not dist.is_initialized():
         return props[0] if props else {}
@@ -128,22 +128,26 @@ def gather_layer_properties_to_rank_zero(*props: GPTLayerProperty):
     # Get the local properties to gather
     local_props = props[0] if props else {}
     
-    # Use all_gather_object to collect complex dictionaries from all ranks
-    gathered_props_list = [None] * world_size
-    dist.all_gather_object(gathered_props_list, local_props)
-    
     if rank == 0:
-        # Combine all gathered properties into a single dictionary
+        # Rank 0 collects from all ranks
         combined_props = {}
-        for rank_props in gathered_props_list:
-            if rank_props:  # Skip empty dictionaries
-                combined_props.update(rank_props)
+        combined_props.update(local_props)  # Add rank 0's data
+        
+        # Collect from other ranks one by one to avoid memory spikes
+        for src_rank in range(1, world_size):
+            received_props = {}
+            dist.recv_object(received_props, src=src_rank)
+            if received_props:
+                combined_props.update(received_props)
+        
         return combined_props
     else:
+        # Other ranks send their data to rank 0
+        dist.send_object(local_props, dst=0)
         return {}
 
 
-def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int) -> GPTLayerProperty:
+def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int, assigned_params: set = None) -> GPTLayerProperty:
     """
     Compute accumulated gradient matrices for analysis.
     
@@ -215,12 +219,18 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                     if param_type == "Attention" and param.grad.ndim >= 3:
                         for i, component in enumerate(["Q", "K", "V", "O"]):
                             key = (f"Attention {component}", layer_num)
+                            # Skip if not assigned to this rank
+                            if assigned_params is not None and key not in assigned_params:
+                                continue
                             grad_tensor = param.grad[i].clone().detach()
                             if key not in minibatch_grads:
                                 minibatch_grads[key] = []
                             minibatch_grads[key].append(grad_tensor)
                     else:
                         key = (param_type, layer_num)
+                        # Skip if not assigned to this rank
+                        if assigned_params is not None and key not in assigned_params:
+                            continue
                         grad_tensor = param.grad.clone().detach()
                         if key not in minibatch_grads:
                             minibatch_grads[key] = []
