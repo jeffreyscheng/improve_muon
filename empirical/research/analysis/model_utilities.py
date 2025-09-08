@@ -125,23 +125,21 @@ def gather_layer_properties_to_rank_zero(*props: GPTLayerProperty):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
+    # Get the local properties to gather
+    local_props = props[0] if props else {}
+    
+    # Use all_gather_object to collect complex dictionaries from all ranks
+    gathered_props_list = [None] * world_size
+    dist.all_gather_object(gathered_props_list, local_props)
+    
     if rank == 0:
-        # Rank 0 collects from all other ranks
-        all_props = [props[0]] if props else [{}]
-        
-        for src_rank in range(1, world_size):
-            # Receive from each rank
-            received = {}
-            for key in props[0].keys() if props else []:
-                tensor = props[0][key]
-                gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
-                dist.gather(tensor, gathered_tensors if rank == 0 else None, dst=0)
-                
-        return all_props[0] if all_props else {}
+        # Combine all gathered properties into a single dictionary
+        combined_props = {}
+        for rank_props in gathered_props_list:
+            if rank_props:  # Skip empty dictionaries
+                combined_props.update(rank_props)
+        return combined_props
     else:
-        # Other ranks send their data
-        for key, tensor in (props[0].items() if props else []):
-            dist.gather(tensor, None, dst=0)
         return {}
 
 
