@@ -233,15 +233,26 @@ def compute_analysis_for_step(
 
 def convert_pipeline_results_to_record_format(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
     """Convert pipeline results to compact record format for gathering."""
+    import numpy as np
+    
     records = {}
+    
+    def safe_tensor_to_numpy(value, default_value=0.0):
+        """Safely convert tensor or float to numpy array."""
+        if isinstance(value, torch.Tensor):
+            return value.cpu().numpy()
+        elif isinstance(value, (int, float)):
+            return np.array(value)
+        else:
+            return np.array(default_value)
     
     for (param_type, layer_num), props in layer_props.items():
         record = {
             'weight_stable_rank': float(props.get('weights_stable_rank', 0)),
-            'per_minibatch_gradient_stable_rank': props.get('gradients_stable_rank', torch.tensor(0.0)).cpu().numpy(),
-            'per_minibatch_gradient_singular_values': props.get('minibatch_singular_values', torch.tensor([])).cpu().numpy(),
-            'gradient_singular_value_standard_deviations': props.get('singular_value_std', torch.tensor([])).cpu().numpy(),
-            'spectral_projection_coefficients_from_8x_mean_gradient': props.get('spectral_projection_coefficients', torch.tensor([])).cpu().numpy()
+            'per_minibatch_gradient_stable_rank': safe_tensor_to_numpy(props.get('gradients_stable_rank', 0.0)),
+            'per_minibatch_gradient_singular_values': safe_tensor_to_numpy(props.get('minibatch_singular_values', [])),
+            'gradient_singular_value_standard_deviations': safe_tensor_to_numpy(props.get('singular_value_std', [])),
+            'spectral_projection_coefficients_from_8x_mean_gradient': safe_tensor_to_numpy(props.get('spectral_projection_coefficients', []))
         }
         records[(param_type, layer_num)] = record
     
