@@ -131,30 +131,15 @@ def mp_pdf_singular_torch(s: torch.Tensor, beta: float, sigma: torch.Tensor) -> 
     return out
 
 
-def batched_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute batched SVD with proper memory management.
+    Compute SVD with proper memory management (handles both single and batched).
     
     Args:
-        tensor: Input tensor of shape [B, H, W]
+        tensor: Input tensor of shape [H, W] or [B, H, W]
         
     Returns:
         U, s, Vh tensors with proper cloning for CUDA graph safety
-    """
-    with torch.no_grad():
-        U, s, Vh = torch.linalg.svd(tensor, full_matrices=False)
-        return U.clone(), s.clone(), Vh.clone()
-
-
-def single_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute single SVD with proper memory management.
-    
-    Args:
-        tensor: Input tensor of shape [H, W]
-        
-    Returns:
-        U, s, Vh tensors with proper cloning
     """
     with torch.no_grad():
         U, s, Vh = torch.linalg.svd(tensor, full_matrices=False)
@@ -237,35 +222,15 @@ def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
         return compute_stable_rank(s)
 
 
-def innovation_matrix(per_batch_grad: torch.Tensor, mean_grad: torch.Tensor) -> torch.Tensor:
-    """Compute innovation matrix: per_batch - mean."""
-    return per_batch_grad - mean_grad.unsqueeze(0)
-
-
-def compute_spectral_projection_coefficients_direct(per_minibatch_grad: torch.Tensor, mean_grad: torch.Tensor) -> torch.Tensor:
-    """Compute SPC directly using the torch-compiled implementation."""
-    from empirical.research.analysis.predict_spectral_projection_torch import predict_spectral_projection_batched
-    
-    # Expand mean gradient to match batch dimension
-    mean_grad_expanded = mean_grad.unsqueeze(0).expand_as(per_minibatch_grad)
-    
-    with torch.no_grad():
-        spc = predict_spectral_projection_batched(
-            per_minibatch_grad, 
-            mean_grad_expanded
-        )
-        return spc.clone()
-
-
 def compute_innovation_statistics(per_minibatch_grad: torch.Tensor, mean_grad: torch.Tensor) -> Dict[str, torch.Tensor]:
     """Compute statistics on the innovation matrix (per_batch - mean)."""
     
-    # Use unified innovation function
-    innovation = innovation_matrix(per_minibatch_grad, mean_grad)
+    # Compute innovation matrix directly
+    innovation = per_minibatch_grad - mean_grad.unsqueeze(0)
     
     with torch.no_grad():
         # Compute singular values of each innovation matrix  
-        _, s, _ = batched_svd(innovation)
+        _, s, _ = safe_svd(innovation)
         
         # Get matrix shape parameters
         B, H, W = innovation.shape

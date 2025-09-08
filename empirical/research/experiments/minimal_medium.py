@@ -1,7 +1,7 @@
 # minimal_medium.py (after refactoring) - 12 crispy functional lines
 from empirical.research.training.training_core import *
 from empirical.research.training.zeropower import get_zeropower_function
-from empirical.research.analysis.online_logging import svd_logging, serialize_model_checkpoint
+from empirical.research.analysis.online_logging import serialize_model_checkpoint
 
 args = Hyperparameters()
 loggers = []  # Disabled SVD logging due to BFloat16 incompatibility with archived PyTorch

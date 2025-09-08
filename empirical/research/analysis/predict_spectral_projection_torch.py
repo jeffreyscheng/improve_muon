@@ -3,19 +3,10 @@ from typing import Tuple, Union
 
 import functools
 import torch
-from empirical.research.analysis.core_math import mp_pdf_singular_torch
+from empirical.research.analysis.core_math import mp_pdf_singular_torch, matrix_shape_beta
 
 # We keep tiny epsilons to avoid hitting MP support endpoints numerically
 _EPS = 1e-6
-
-def matrix_shape_beta(shape: Union[Tuple[int, int], torch.Size]) -> float:
-    """
-    Compute beta = min(n,m)/max(n,m) from a (n,m) shape tuple or torch.Size.
-    Pure-Python, safe to call from both torch and numpy codepaths.
-    """
-    n, m = int(shape[0]), int(shape[1])
-    a, b = (n, m) if n < m else (m, n)
-    return float(a) / float(b)
 
 @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
 def _mp_quantiles_lambda(probs: torch.Tensor, beta: float, grid_size: int = 2048, device: torch.device | None = None) -> torch.Tensor:

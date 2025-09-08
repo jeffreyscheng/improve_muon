@@ -138,22 +138,6 @@ def categorize_parameter(param_name: str) -> Tuple[str, int]:
     return param_type, layer_num
 
 
-def compute_singular_values(matrix: np.ndarray) -> np.ndarray:
-    """
-    Compute singular values of a matrix.
-    
-    Args:
-        matrix: Input matrix
-        
-    Returns:
-        Singular values in descending order
-    """
-    if matrix.ndim != 2:
-        raise ValueError(f"Expected 2D matrix, got {matrix.ndim}D")
-    
-    return np.linalg.svd(matrix, compute_uv=False)
-
-
 def calculate_singular_values(key: Tuple[str, int], weight: Parameter | np.ndarray, run_name: str):
     """
     Calculate and log singular values for a parameter.
@@ -173,7 +157,7 @@ def calculate_singular_values(key: Tuple[str, int], weight: Parameter | np.ndarr
     if matrix.ndim != 2:
         return
     
-    singular_values = compute_singular_values(matrix)
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
     
     # Create logging record
     record = {
@@ -241,48 +225,3 @@ def dummy_logging(
         print(f"Dummy logging at step {step} for run {run_name}")
 
 
-def svd_logging(
-    model,
-    run_name: str, 
-    step: int,
-    rank: int = 0,
-    world_size: int = 1
-):
-    """
-    Perform SVD-based logging for model parameters.
-    
-    Args:
-        model: PyTorch model
-        run_name: Name of the run
-        step: Current training step  
-        rank: Process rank
-        world_size: Total number of processes
-    """
-    if rank == 0:
-        records = []
-        
-        for name, param in model.named_parameters():
-            if param.ndim >= 2 and "embed" not in name:
-                param_type, layer_num = categorize_parameter(name)
-                
-                # Calculate singular values
-                sv_record = calculate_singular_values((param_type, layer_num), param, run_name)
-                if sv_record:
-                    sv_record['step'] = step
-                    records.append(sv_record)
-                
-                # Calculate weight norms  
-                norm_record = calculate_weight_norm((param_type, layer_num), param, run_name)
-                if norm_record:
-                    norm_record['step'] = step
-                    records.append(norm_record)
-        
-        # Save records
-        log_dir = Path("research_logs") / run_name / "parameter_analysis"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        log_file = log_dir / f"step_{step:06d}.json"
-        with open(log_file, 'w') as f:
-            json.dump(records, f, indent=2)
-        
-        print(f"SVD logging completed for step {step}, saved {len(records)} records")

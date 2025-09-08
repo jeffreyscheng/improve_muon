@@ -90,11 +90,6 @@ def get_weight_matrices(model, only_hidden: bool = True) -> GPTLayerProperty:
     )
 
 
-def get_research_log_path(run_name: str) -> Path:
-    """Get path to research logs directory."""
-    return Path("research_logs") / run_name
-
-
 def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) -> GPTLayerProperty:
     """
     Combine multiple layer properties using a function.

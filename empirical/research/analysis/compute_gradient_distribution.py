@@ -32,14 +32,14 @@ from empirical.research.training.training_core import (
     distributed_data_generator
 )
 from empirical.research.analysis.model_utilities import (
-    get_weight_matrices, get_research_log_path, get_accumulated_gradient_matrices,
+    get_weight_matrices, get_accumulated_gradient_matrices,
     combine_layer_properties, gather_layer_properties_to_rank_zero, GPTLayerProperty
 )
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
-    stable_rank_from_tensor, batched_svd, single_svd, 
+    stable_rank_from_tensor, safe_svd, 
     compute_basis_cosine_similarity, compute_spectral_projection_coefficients_from_cosines,
-    compute_spectral_projection_coefficients_direct, compute_innovation_statistics
+    compute_innovation_statistics
 )
 from empirical.research.analysis.core_visualization import (
     create_visualization_frames, finalize_gifs
@@ -58,9 +58,9 @@ ANALYSIS_PIPELINE = [
     PropertySpec("mean_gradient", ["per_minibatch_gradient"], 
                 lambda grads: grads.mean(dim=0)),
     PropertySpec("minibatch_gradient_svd", ["per_minibatch_gradient"], 
-                batched_svd),
+                safe_svd),
     PropertySpec("mean_gradient_svd", ["mean_gradient"], 
-                single_svd),
+                safe_svd),
     
     # Singular value analysis
     PropertySpec("minibatch_singular_values", ["minibatch_gradient_svd"], 
@@ -104,11 +104,6 @@ def precompile_svd_kernels(device: torch.device, rank: int):
     
     if rank == 0:
         print("SVD kernel compilation complete.")
-
-
-def extract_step_from_checkpoint_path(checkpoint_path: Path) -> int:
-    """Extract step number from checkpoint filename."""
-    return int(checkpoint_path.stem.split('_')[1])
 
 
 def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
@@ -249,13 +244,13 @@ def save_analysis_results(results: GPTLayerProperty, step: int):
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     """Find all checkpoint files for the given run."""
-    log_dir = get_research_log_path(run_id)
+    log_dir = Path("research_logs") / run_id
     checkpoint_pattern = log_dir / "step_*.pt"
     
     checkpoints = []
     for path in sorted(log_dir.glob("step_*.pt")):
         try:
-            step = extract_step_from_checkpoint_path(path)
+            step = int(path.stem.split('_')[1])
             checkpoints.append((step, str(path)))
         except (ValueError, IndexError):
             continue
