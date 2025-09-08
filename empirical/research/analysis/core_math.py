@@ -191,7 +191,12 @@ def compute_spectral_projection_coefficients_from_cosines(
     Returns:
         Spectral projection coefficients [B, K]
     """
-    return left_cosines * right_cosines
+    # Truncate to minimum rank for non-square matrices
+    min_rank = min(left_cosines.shape[-1], right_cosines.shape[-1])
+    left_truncated = left_cosines[..., :min_rank]
+    right_truncated = right_cosines[..., :min_rank]
+    
+    return left_truncated * right_truncated
 
 
 def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
