@@ -26,6 +26,7 @@ import torch
 torch._inductor.config.coordinate_descent_tuning = False
 import torch.distributed as dist
 import numpy as np
+import pandas as pd
 
 from empirical.research.training.training_core import (
     setup_distributed_training, Hyperparameters, warmup_kernels,
@@ -108,19 +109,22 @@ def precompile_svd_kernels(device: torch.device, rank: int):
 
 def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     """Load model from checkpoint with proper device placement."""
-    from empirical.research.training.training_core import GPT
+    from empirical.research.training.architecture import GPT
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_file, map_location=device)
     
-    # Create model with same config as training
-    model_config = checkpoint['model_args']
-    model = GPT(model_config)
-    model.load_state_dict(checkpoint['model'])
-    model = model.to(device)
-    model.eval()
+    # Create model with hardcoded args like original
+    args = Hyperparameters()
+    model = GPT(args.vocab_size, 16, 8, 1024, max(args.train_seq_len, args.val_seq_len)).to(device)
     
-    return model, checkpoint['step']
+    # Load state dict with _orig_mod prefix handling
+    state_dict = checkpoint['model_state_dict']
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    
+    return model, checkpoint.get('step', 0)
 
 
 def compute_analysis_for_step(
@@ -135,17 +139,20 @@ def compute_analysis_for_step(
     
     # 1. Setup (5 LOC)
     model, _ = setup_model_from_checkpoint(checkpoint_file, device)
-    setup_distributed_training(rank)
     warmup_kernels(model, [torch.optim.SGD(model.parameters(), lr=1.0)], 
                   Hyperparameters())
     precompile_svd_kernels(device, rank)
     
+    # Synchronize after setup
+    if dist.is_initialized():
+        dist.barrier()
+    
     # 2. Get initial layer properties (10 LOC) 
     weights = get_weight_matrices(model)
     
-    # Create dummy data loader for gradient computation
+    # Create data loader for gradient computation
     args = Hyperparameters()
-    data_loader = distributed_data_generator(args, rank, world_size)
+    data_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
     gradients = get_accumulated_gradient_matrices(
         model, args, step, num_minibatches=num_minibatches
@@ -164,6 +171,10 @@ def compute_analysis_for_step(
             print(f"  Analyzed {completed}/{total} layers")
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
+    
+    # Synchronize ranks before gathering
+    if dist.is_initialized():
+        dist.barrier()
     
     # 4. Distributed coordination (10 LOC)
     if rank == 0:
@@ -233,7 +244,6 @@ def save_analysis_results(results: GPTLayerProperty, step: int):
         step_records.append(record)
     
     # Save to CSV (simplified version - expand as needed)
-    import pandas as pd
     df = pd.DataFrame(step_records)
     
     if not df.empty:
@@ -244,18 +254,21 @@ def save_analysis_results(results: GPTLayerProperty, step: int):
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     """Find all checkpoint files for the given run."""
-    log_dir = Path("research_logs") / run_id
-    checkpoint_pattern = log_dir / "step_*.pt"
+    import glob
+    import re
     
-    checkpoints = []
-    for path in sorted(log_dir.glob("step_*.pt")):
-        try:
-            step = int(path.stem.split('_')[1])
-            checkpoints.append((step, str(path)))
-        except (ValueError, IndexError):
-            continue
+    checkpoints_dir = Path("research_logs/checkpoints")
+    checkpoint_pattern = str(checkpoints_dir / run_id / "model_step_*.pt")
+    checkpoint_files = glob.glob(checkpoint_pattern)
     
-    return checkpoints
+    unique_steps = {}
+    for file in checkpoint_files:
+        step_match = re.search(r'step_(\d+)', str(file))
+        if step_match:
+            step = int(step_match.group(1))
+            unique_steps[step] = file
+    
+    return [(step, unique_steps[step]) for step in sorted(unique_steps.keys())]
 
 
 def main():
@@ -269,9 +282,7 @@ def main():
     force_recompute = "--force" in sys.argv
     
     # Distributed setup
-    rank = int(os.environ.get('RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    _, rank, world_size, device, master_process = setup_distributed_training()
     
     if rank == 0:
         print(f"Starting gradient distribution analysis for run: {run_id}")
