@@ -117,34 +117,81 @@ def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) 
     return result
 
 
-def gather_layer_properties_to_rank_zero(*props):
-    """Gather layer properties from all ranks to rank 0."""
+# empirical/research/analysis/model_utilities.py
+
+from typing import Dict, Tuple, Any, Optional
+import torch.distributed as dist
+
+def _merge_dicts(dicts):
+    merged = {}
+    for d in dicts:
+        if not d:
+            continue
+        # later ranks overwrite on duplicate keys (your sharding should prevent conflicts)
+        merged.update(d)
+    return merged
+
+def gather_layer_properties_to_rank_zero(local_props: Dict[Tuple[str, int], Dict[str, Any]]
+                                        ) -> Optional[Dict[Tuple[str, int], Dict[str, Any]]]:
+    """
+    Gather arbitrary (picklable) Python objects from all ranks to rank 0.
+
+    Rank 0 returns the merged dict. Non-zero ranks return None.
+    All ranks must call this function.
+    """
     if not dist.is_initialized():
-        return props[0] if props else {}
-    
+        # single process fallback
+        return local_props
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    
-    # Get the local properties to gather
-    local_props = props[0] if props else {}
-    
+
+    # Fast path: use gather_object when available
+    if hasattr(dist, "gather_object"):
+        obj_list = [None] * world_size if rank == 0 else None
+        # Every rank sends its local_props to dst=0
+        dist.gather_object(local_props, obj_list, dst=0)
+        if rank == 0:
+            return _merge_dicts(obj_list)
+        return None
+
+    # ===== Fallback for very old PyTorch: tensor-based gather =====
+    # Serialize to bytes -> ByteTensor on CPU, gather sizes then payloads.
+    import io, pickle
+    import torch
+
+    buf = io.BytesIO()
+    pickle.dump(local_props, buf, protocol=pickle.HIGHEST_PROTOCOL)
+    byte_arr = bytearray(buf.getbuffer())
+    local_len = torch.tensor([len(byte_arr)], dtype=torch.int64, device="cpu")
+
+    # Gather lengths to rank 0
     if rank == 0:
-        # Rank 0 collects from all ranks
-        combined_props = {}
-        combined_props.update(local_props)  # Add rank 0's data
-        
-        # Collect from other ranks one by one to avoid memory spikes
-        for src_rank in range(1, world_size):
-            received_props = {}
-            dist.recv_object(received_props, src=src_rank)
-            if received_props:
-                combined_props.update(received_props)
-        
-        return combined_props
+        lens = [torch.empty_like(local_len) for _ in range(world_size)]
     else:
-        # Other ranks send their data to rank 0
-        dist.send_object(local_props, dst=0)
-        return {}
+        lens = None
+    dist.gather(local_len, gather_list=lens, dst=0)
+
+    # Send payloads
+    if rank == 0:
+        recv_bufs = []
+        for i in range(world_size):
+            recv_bufs.append(torch.empty(int(lens[i].item()), dtype=torch.uint8, device="cpu"))
+        # Rank 0 copies its own bytes
+        recv_bufs[0].copy_(torch.tensor(list(byte_arr), dtype=torch.uint8))
+        # Receive from others
+        for src in range(1, world_size):
+            dist.recv(recv_bufs[src], src=src)
+        # Deserialize and merge
+        objs = []
+        for t in recv_bufs:
+            b = bytes(memoryview(t.numpy()))
+            objs.append(pickle.loads(b))
+        return _merge_dicts(objs)
+    else:
+        payload = torch.tensor(list(byte_arr), dtype=torch.uint8, device="cpu")
+        dist.send(payload, dst=0)
+        return None
 
 
 def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int, assigned_params: set = None) -> GPTLayerProperty:

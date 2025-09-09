@@ -189,7 +189,7 @@ def compute_analysis_for_step(
     my_param_keys = set(all_param_keys[start_idx:end_idx])
     
     if rank == 0:
-        print(f"    Rank {rank}: Processing {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
+        print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
     
     # Get sharded gradients (only for my assigned parameters)
     gradients = get_accumulated_gradient_matrices(
@@ -213,22 +213,21 @@ def compute_analysis_for_step(
             print(f"  Analyzed {completed}/{total} layers")
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
-    
-    # Convert to compact record format for efficient gathering
     local_records = convert_pipeline_results_to_record_format(local_results)
-    
-    # Synchronize ranks before gathering
+    local_viz = extract_viz_from_pipeline_results(local_results)
+
     if dist.is_initialized():
         dist.barrier()
-    
-    # 4. Distributed coordination (10 LOC)
+
     if rank == 0:
         all_records = gather_layer_properties_to_rank_zero(local_records)
-        print(f"Step {step}: Analysis complete for {len(all_records)} layers")
-        return all_records
+        all_viz = gather_layer_properties_to_rank_zero(local_viz)
+        print(f"Step {step}: Analysis complete for {len(all_records)} layers (viz: {len(all_viz)})")
+        return all_records, all_viz
     else:
         gather_layer_properties_to_rank_zero(local_records)
-        return {}
+        gather_layer_properties_to_rank_zero(local_viz)
+        return {}, {}
 
 
 def convert_pipeline_results_to_record_format(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
@@ -335,12 +334,27 @@ def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     
     return [(step, unique_steps[step]) for step in sorted(unique_steps.keys())]
 
+def extract_viz_from_pipeline_results(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    viz = {}
+    for key, props in layer_props.items():
+        if "innovation_statistics" not in props:
+            continue
+        innov = props["innovation_statistics"]
+        # keep tensors; they’re picklable and small per-layer; convert to numpy later if you want
+        viz[key] = {
+            "innovation_samples": innov["innovation_samples"],            # Tensor [K, ...] or similar
+            "beta": float(innov["beta"]),
+            "innovation_singular_values": innov["innovation_singular_values"],  # Tensor
+            "minibatch_singular_values": props["minibatch_singular_values"],    # Tensor [B, r]
+            "spectral_projection_coefficients": props["spectral_projection_coefficients"],  # Tensor
+        }
+    return viz
 
 def main():
     """Main entry point with clean argument parsing."""
     if len(sys.argv) < 2:
         print("Usage: python compute_gradient_distribution.py <run_id> [--testing] [--force]")
-        sys.exit(1)
+        return 1
     
     run_id = sys.argv[1]
     testing_mode = "--testing" in sys.argv
@@ -361,8 +375,9 @@ def main():
     # Find checkpoints
     checkpoints = find_all_checkpoints(run_id)
     if not checkpoints:
-        print(f"No checkpoints found for run {run_id}")
-        sys.exit(1)
+        if rank == 0:
+            print(f"No checkpoints found for run {run_id}")
+        return 1
     
     if testing_mode:
         checkpoints = checkpoints[:2]  # Only process first 2 steps
@@ -380,20 +395,27 @@ def main():
             start_time = time.time()
         
         # Run analysis
-        results = compute_analysis_for_step(
+        records, viz_payload = compute_analysis_for_step(
             step, checkpoint_file, num_minibatches, rank, world_size, device
         )
-        
-        # Save results and create visualizations (rank 0 only)
+
         if rank == 0:
-            save_analysis_results(results, step)
-            
-            viz_stats = create_compact_visualization_stats(results)
+            save_analysis_results(records, step)
+
+            # Optionally convert tensors -> numpy for plotting here (keeps gather smaller & simpler)
+            viz_stats = {
+                k: {
+                    "innovation_sample": v["innovation_samples"].cpu().numpy(),
+                    "beta": v["beta"],
+                    "sigma_hat": float(v["innovation_singular_values"].median().item()),
+                    "per_minibatch_singular_values": v["minibatch_singular_values"].cpu().numpy(),
+                    "spectral_projection_coefficients": v["spectral_projection_coefficients"].cpu().numpy(),
+                }
+                for k, v in viz_payload.items()
+            }
+
             vis_output_dir = Path("research_logs/visualizations/noise_estimation")
             create_visualization_frames(step, viz_stats, gif_frames, vis_output_dir, rank)
-            
-            elapsed = time.time() - start_time
-            print(f"Step {step} completed in {elapsed:.1f}s")
     
     # Create final GIFs
     if rank == 0:
@@ -402,6 +424,19 @@ def main():
         finalize_gifs(gif_frames, vis_output_dir, rank=rank)
         print("Analysis complete!")
 
+    # Ensure all ranks reach a common point before teardown
+    if dist.is_initialized():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dist.barrier()
+
+    return 0
+
+
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    # Global teardown (no try/except)
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+    sys.exit(0 if exit_code is None else exit_code)
