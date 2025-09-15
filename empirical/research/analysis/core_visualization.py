@@ -167,7 +167,8 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     mu = predict_counts_from_tabulated(bins, table, sigma_hat, total=len(all_innov))
     centers = 0.5 * (bins[1:] + bins[:-1])
     density_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
-    density_pred = np.clip(density_pred, 1e-12, None)
+    # Clip to log-safe minimum so the line is visible on log-y
+    density_pred = np.clip(density_pred, 1e-8, None)
     ax.plot(centers, density_pred, ls='--', lw=2, color='tab:orange', label=f"Wishart FS (σ̂={sigma_hat:.3g})")
     # Edge line
     ax.axvline(edge, color='k', lw=1.0, ls=':', label='τ̂')
@@ -245,56 +246,7 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
             ax.plot(xs, pred, color=color, lw=1.0)
 
 
-def plot_bulk_residual(ax, param_type: str, layer_data_list: List, viridis, max_layers: int):
-    """Plot residual density: empirical minus predicted Wishart density."""
-    ax.set_title(f'{param_type} residual')
-    ax.set_xlabel('Singular value (log scale)')
-    ax.set_ylabel('Residual density (emp - pred)')
-    ax.set_xscale('log')
-    ax.grid(True, alpha=0.3)
-
-    # Opinionated inputs come from viz_stats
-    samples, betas, sigmas = [], [], []
-    for _, data in layer_data_list:
-        assert 'innovation_sample' in data, "innovation_sample missing in viz_stats"
-        assert 'beta' in data, "beta missing in viz_stats"
-        assert 'sigma_hat' in data, "sigma_hat missing in viz_stats"
-        s = np.asarray(data['innovation_sample'], dtype=float)
-        s = s[s > 0]
-        if s.size:
-            samples.append(np.ascontiguousarray(s))
-            betas.append(float(data['beta']))
-            sigmas.append(float(data['sigma_hat']))
-    if not samples:
-        ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center')
-        return
-    all_innov = np.ascontiguousarray(np.concatenate(samples))
-    if all_innov.size == 0:
-        return
-
-    beta = float(np.median(np.asarray(betas))) if betas else 1.0
-    sigma_hat = float(np.median(np.asarray(sigmas))) if sigmas else 1e-8
-
-    # Need shape to select table
-    assert layer_data_list and 'shape' in layer_data_list[0][1], f"shape missing in viz_stats for {param_type}"
-    p, n = map(int, layer_data_list[0][1]['shape'])
-    table = select_table(_SV_TABLES, p, n)
-
-    # Bins from global x-range (set by wrapper) or data-driven fallback
-    x_min = float(all_innov.min())
-    x_max = float(all_innov.max() * 1.05)
-    x_min = max(x_min, 1e-8)
-    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
-        return
-    bins = np.geomspace(x_min, x_max, 60)
-    counts_emp, _ = np.histogram(all_innov, bins=bins)
-    dens_emp = counts_emp.astype(np.float64) / (len(all_innov) * np.diff(bins))
-    mu = predict_counts_from_tabulated(bins, table, sigma_hat, total=len(all_innov))
-    dens_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
-    centers = 0.5 * (bins[1:] + bins[:-1])
-    residual = dens_emp - dens_pred
-    ax.axhline(0.0, color='k', lw=1.0, ls=':')
-    ax.plot(centers, residual, lw=1.5, color='tab:purple')
+## removed residual panel per user request
 
 
 ## removed unused plot_stable_rank_evolution
@@ -420,11 +372,6 @@ def create_visualization_frames(
                 'plot_fn': _wrap_bulk(plot_bulk_vs_spike),
                 'title': f'Bulk vs Spike Estimation - Step {step_num}',
                 'filename': f"bulk_spike_{step_num:06d}.png"
-            },
-            'bulk_residual': {
-                'plot_fn': _wrap_spc(plot_bulk_residual),
-                'title': f'Residual (Emp − Pred) - Step {step_num}',
-                'filename': f"bulk_residual_{step_num:06d}.png"
             },
             'spc_singular': {
                 'plot_fn': _wrap_spc(plot_spc_vs_singular_values),
@@ -558,20 +505,24 @@ def load_noise_model_data(sv_dir: Path) -> dict:
 
 
 def compute_visualization_axis_ranges(data):
-    """Compute consistent x-axis ranges across all data for each param type."""
+    """Compute consistent x-axis ranges across all data for each param type (log-aware)."""
     ranges = {}
     for param_type in PARAM_TYPES:
-        # Collect x values
         x_vals = []
         for step_data in data.values():
             for (p_type, layer_num), layer_data in step_data.items():
                 if p_type == param_type and layer_num >= 0:
                     x_vals.extend(layer_data.get('per_minibatch_singular_values', []))
-        x_vals = np.array(x_vals)
-        x_vals = x_vals[x_vals > 0]
-        if len(x_vals) > 0:
-            x_min, x_max = np.percentile(x_vals, [1, 99])
-            x_range = (x_min * 0.8, x_max * 1.2)
+        x_vals = np.array(x_vals, dtype=float)
+        x_vals = x_vals[np.isfinite(x_vals) & (x_vals > 0)]
+        if x_vals.size > 0:
+            logs = np.log10(x_vals)
+            lo_p, hi_p = np.percentile(logs, [1, 99])
+            lo, hi = float(10 ** (lo_p - 0.1)), float(10 ** (hi_p + 0.1))
+            lo = max(lo, 1e-8)
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo, hi = 1e-3, 1e1
+            x_range = (lo, hi)
         else:
             x_range = (1e-3, 1e1)
         ranges[param_type] = {'x': x_range}
