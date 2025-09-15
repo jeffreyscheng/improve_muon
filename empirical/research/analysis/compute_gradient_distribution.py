@@ -58,9 +58,6 @@ from empirical.research.analysis.wishart import (
     set_current_shape,
     precompute_quantile_table_for_shape,
 )
-from empirical.research.training.architecture import GPT
-import empirical.research.training.training_core as training_core
-from empirical.research.training.training_core import _global_print0
 
 
 ANALYSIS_SPECS = [
@@ -133,6 +130,8 @@ def precompile_svd_kernels(device: torch.device, rank: int):
 
 def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     """Load model from checkpoint with proper device placement."""
+    from empirical.research.training.architecture import GPT
+    import empirical.research.training.training_core as training_core
     rank = dist.get_rank()
     if rank == 0:
         print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
@@ -519,10 +518,10 @@ def main():
             step, checkpoint_file, num_minibatches, rank, world_size, device
         )
 
+        # Ensure all ranks have flushed their CSVs before reading for visualization
+        if dist.is_initialized():
+            dist.barrier()
         if rank == 0:
-            # Ensure all ranks have flushed their CSVs before reading for visualization
-            if dist.is_initialized():
-                dist.barrier()
             # Build viz stats from the pipeline results (or read from CSVs inside viz)
             viz_stats = _build_viz_stats_from_pipeline(viz_payload)
             vis_output_dir = Path("research_logs/visualizations/noise_estimation")
