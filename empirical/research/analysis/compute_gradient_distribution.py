@@ -13,7 +13,6 @@ Usage:
 
 import os
 import sys
-import json
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -38,17 +37,24 @@ from empirical.research.analysis.model_utilities import (
 )
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
-    stable_rank_from_tensor, safe_svd, 
+    stable_rank_from_tensor, safe_svd,
     compute_basis_cosine_similarity, compute_spectral_projection_coefficients_from_cosines,
-    compute_innovation_statistics
+    compute_innovation_spectrum, matrix_shape_beta
 )
 from empirical.research.analysis.core_visualization import (
     create_visualization_frames, finalize_gifs
 )
+from empirical.research.analysis.wishart import (
+    fit_sigma_with_wishart,
+    aspect_ratio_beta as wishart_aspect_ratio_beta,
+    squared_true_signal_from_quadratic_formula,
+    predict_spectral_projection_coefficient_from_squared_true_signal,
+    set_sv_tables_from_npz,
+    set_current_shape,
+)
 
 
-# The complete analysis pipeline specification - direct function references
-ANALYSIS_PIPELINE = [
+ANALYSIS_SPECS = [
     # Stable rank computations
     PropertySpec("weights_stable_rank", ["checkpoint_weights"], 
                 stable_rank_from_tensor),
@@ -82,9 +88,18 @@ ANALYSIS_PIPELINE = [
     PropertySpec("spectral_projection_coefficients", ["basis_cosine_similarities"],
                 lambda cosines: compute_spectral_projection_coefficients_from_cosines(*cosines)),
     
-    # Innovation statistics for visualization
-    PropertySpec("innovation_statistics", ["per_minibatch_gradient", "mean_gradient"],
-                compute_innovation_statistics),
+    PropertySpec("innovation_spectrum", ["per_minibatch_gradient", "mean_gradient"],
+                compute_innovation_spectrum),
+
+    # Strict Wishart-based estimates
+    PropertySpec("noise_sigma", ["minibatch_singular_values", "checkpoint_weights"],
+                lambda sv, w: (set_current_shape(w.shape), float(fit_sigma_with_wishart(sv)))[1]),
+    PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
+                lambda w: float(wishart_aspect_ratio_beta(w))),
+    PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
+                squared_true_signal_from_quadratic_formula),
+    PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
+                predict_spectral_projection_coefficient_from_squared_true_signal),
 ]
 
 
@@ -149,7 +164,7 @@ def compute_analysis_for_step(
     num_minibatches: int,
     rank: int,
     world_size: int,
-    device: torch.device
+    device: torch.device,
 ) -> GPTLayerProperty:
     """Core analysis function - clean and focused."""
     
@@ -161,7 +176,6 @@ def compute_analysis_for_step(
     small_seq_len = 128  # Much smaller than training's 8192
     vocab_size = args.vocab_size
     inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
-    sliding_window_blocks = 1  # Minimal sliding window
     
     # Single warmup pass
     window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
@@ -206,7 +220,7 @@ def compute_analysis_for_step(
     )
     
     # 3. Execute analysis pipeline (5 LOC)
-    pipeline = PropertyPipeline(ANALYSIS_PIPELINE)
+    pipeline = PropertyPipeline(ANALYSIS_SPECS)
     
     def progress_callback(completed: int, total: int):
         if rank == 0 and completed % 5 == 0:
@@ -214,102 +228,91 @@ def compute_analysis_for_step(
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
     local_records = convert_pipeline_results_to_record_format(local_results)
-    local_viz = extract_viz_from_pipeline_results(local_results)
 
     if dist.is_initialized():
         dist.barrier()
 
     if rank == 0:
         all_records = gather_layer_properties_to_rank_zero(local_records)
-        all_viz = gather_layer_properties_to_rank_zero(local_viz)
-        print(f"Step {step}: Analysis complete for {len(all_records)} layers (viz: {len(all_viz)})")
-        return all_records, all_viz
+        all_results = gather_layer_properties_to_rank_zero(local_results)
+        print(f"Step {step}: Analysis complete for {len(all_records)} layers (viz: {len(all_results)})")
+        return all_records, all_results
     else:
         gather_layer_properties_to_rank_zero(local_records)
-        gather_layer_properties_to_rank_zero(local_viz)
+        gather_layer_properties_to_rank_zero(local_results)
         return {}, {}
 
 
 def convert_pipeline_results_to_record_format(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
-    """Convert pipeline results to compact record format for gathering."""
-    import numpy as np
-    
+    """Convert pipeline results to compact, serializable record format."""
     records = {}
-    
+
     def safe_tensor_to_numpy(value, default_value=0.0):
-        """Safely convert tensor or float to numpy array."""
         if isinstance(value, torch.Tensor):
-            return value.cpu().numpy()
+            return value.detach().cpu().numpy()
         elif isinstance(value, (int, float)):
             return np.array(value)
         else:
             return np.array(default_value)
-    
+
     for (param_type, layer_num), props in layer_props.items():
         record = {
-            'weight_stable_rank': float(props.get('weights_stable_rank', 0)),
-            'per_minibatch_gradient_stable_rank': safe_tensor_to_numpy(props.get('gradients_stable_rank', 0.0)),
+            'weight_stable_rank': float(props.get('weights_stable_rank', 0.0)),
+            'per_minibatch_gradient_stable_rank': safe_tensor_to_numpy(props.get('gradients_stable_rank', [])),
             'per_minibatch_gradient_singular_values': safe_tensor_to_numpy(props.get('minibatch_singular_values', [])),
             'gradient_singular_value_standard_deviations': safe_tensor_to_numpy(props.get('singular_value_std', [])),
-            'spectral_projection_coefficients_from_8x_mean_gradient': safe_tensor_to_numpy(props.get('spectral_projection_coefficients', []))
+            'spectral_projection_coefficients_from_8x_mean_gradient': safe_tensor_to_numpy(props.get('spectral_projection_coefficients', [])),
         }
         records[(param_type, layer_num)] = record
-    
+
     return records
 
 
-def create_compact_visualization_stats(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
-    """Extract compact statistics for visualization."""
-    viz_stats = {}
-    
-    for (param_type, layer_num), props in layer_props.items():
-        if "innovation_statistics" not in props:
+def _build_viz_stats_from_pipeline(viz_payload: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    """Map pipeline outputs to the per-layer viz dict used by plotting."""
+    viz_stats: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for k, props in viz_payload.items():
+        if 'innovation_spectrum' not in props:
             continue
-            
-        innov_stats = props["innovation_statistics"]
-        
-        viz_stats[(param_type, layer_num)] = {
-            "innovation_sample": innov_stats["innovation_samples"].cpu().numpy(),
-            "beta": float(innov_stats["beta"]),
-            "sigma_hat": float(torch.median(innov_stats["innovation_singular_values"]).item()),
-            "per_minibatch_singular_values": props["minibatch_singular_values"].cpu().numpy(),
-            "spectral_projection_coefficients": props["spectral_projection_coefficients"].cpu().numpy(),
+        innov_s = props['innovation_spectrum']
+        beta = matrix_shape_beta(props['checkpoint_weights'].shape)
+        B = int(innov_s.shape[0]) if isinstance(innov_s, torch.Tensor) and innov_s.ndim >= 2 else 1
+        sigma_eff = float(props['noise_sigma']) * (max(B - 1, 1) / max(B, 1)) ** 0.5
+        viz_stats[k] = {
+            'innovation_sample': innov_s[:, :min(100, innov_s.shape[1])].cpu().numpy(),
+            'beta': float(beta),
+            'sigma_hat': sigma_eff,
+            'per_minibatch_singular_values': props['minibatch_singular_values'].cpu().numpy(),
+            'spectral_projection_coefficients': props['spectral_projection_coefficients'].cpu().numpy(),
+            'shape': tuple(int(x) for x in props['checkpoint_weights'].shape),
         }
-    
     return viz_stats
 
 
 def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: int):
     """Save analysis results to CSV files."""
-    # Create output directories  
+    # Create output directory
     base_dir = Path("research_logs/singular_values_distribution")
     sv_dir = base_dir
     sv_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Convert to record format for CSV
+
+    # Convert to flat records for CSV
     step_records = []
-    
     for (param_type, layer_num), record_data in results.items():
-        if layer_num < 0:  # Skip invalid layers
+        if layer_num < 0:
             continue
-            
-        # Create record in original format
-        import json
-        record = {
-            "param_type": param_type,
-            "layer_num": layer_num,
-            "weight_stable_rank": record_data.get('weight_stable_rank', 0),
-            "per_minibatch_gradient_singular_values": json.dumps(record_data.get('per_minibatch_gradient_singular_values', []).tolist()),
-            "gradient_singular_value_standard_deviations": json.dumps(record_data.get('gradient_singular_value_standard_deviations', []).tolist()),
-            "per_minibatch_gradient_stable_rank": json.dumps(record_data.get('per_minibatch_gradient_stable_rank', []).tolist()),
-            "spectral_projection_coefficients_from_8x_mean_gradient": json.dumps(record_data.get('spectral_projection_coefficients_from_8x_mean_gradient', []).tolist())
-        }
-        
-        step_records.append(record)
-    
-    # Save to CSV in original format
+        import json as _json
+        step_records.append({
+            'param_type': param_type,
+            'layer_num': layer_num,
+            'weight_stable_rank': record_data.get('weight_stable_rank', 0.0),
+            'per_minibatch_gradient_singular_values': _json.dumps(record_data.get('per_minibatch_gradient_singular_values', []).tolist()),
+            'gradient_singular_value_standard_deviations': _json.dumps(record_data.get('gradient_singular_value_standard_deviations', []).tolist()),
+            'per_minibatch_gradient_stable_rank': _json.dumps(record_data.get('per_minibatch_gradient_stable_rank', []).tolist()),
+            'spectral_projection_coefficients_from_8x_mean_gradient': _json.dumps(record_data.get('spectral_projection_coefficients_from_8x_mean_gradient', []).tolist()),
+        })
+
     df = pd.DataFrame(step_records)
-    
     if not df.empty:
         csv_path = sv_dir / f"step_{step:06d}.csv"
         df.to_csv(csv_path, index=False)
@@ -334,28 +337,106 @@ def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     
     return [(step, unique_steps[step]) for step in sorted(unique_steps.keys())]
 
-def extract_viz_from_pipeline_results(layer_props: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
-    viz = {}
-    for key, props in layer_props.items():
-        if "innovation_statistics" not in props:
-            continue
-        innov = props["innovation_statistics"]
-        # keep tensors; they’re picklable and small per-layer; convert to numpy later if you want
-        viz[key] = {
-            "innovation_samples": innov["innovation_samples"],            # Tensor [K, ...] or similar
-            "beta": float(innov["beta"]),
-            "innovation_singular_values": innov["innovation_singular_values"],  # Tensor
-            "minibatch_singular_values": props["minibatch_singular_values"],    # Tensor [B, r]
-            "spectral_projection_coefficients": props["spectral_projection_coefficients"],  # Tensor
-        }
-    return viz
-
 def main():
     """Main entry point with clean argument parsing."""
     if len(sys.argv) < 2:
         print("Usage: python compute_gradient_distribution.py <run_id> [--testing] [--force]")
         return 1
     
+    # Lightweight local mock mode (CPU-only, no distributed, synthetic data)
+    if "--local-mock" in sys.argv:
+        torch.manual_seed(0)
+        device = torch.device("cpu")
+        rank, world_size = 0, 1
+
+        # Create tiny synthetic layer properties for 2 layers
+        def _make_local_mock_initial_props(num_layers: int = 2, batch: int = 8, h: int = 32, w: int = 32):
+            param_types = ['Attention Q', 'Attention K', 'Attention V', 'Attention O', 'MLP Input', 'MLP Output']
+            initial = {}
+            for layer in range(num_layers):
+                for ptype in param_types:
+                    cw = torch.randn(h, w, device=device, dtype=torch.float32)
+                    mb = torch.randn(batch, h, w, device=device, dtype=torch.float32)
+                    initial[(ptype, layer)] = {"checkpoint_weights": cw, "per_minibatch_gradient": mb}
+            return initial
+
+        # Ensure the finite-size Wishart table contains the mock shape; precompute if missing
+        def _ensure_sv_table_shape(npz_path: str, shape: tuple[int, int]):
+            from pathlib import Path as _Path
+            from test_precompute import precompute_quantile_table_for_shape
+            p, n = int(shape[0]), int(shape[1])
+            path = _Path(npz_path)
+            base_keys = set()
+            blob = None
+            if path.exists():
+                blob = np.load(npz_path, allow_pickle=True)
+                base_keys = {k[:-2] for k in blob.files if k.endswith(("_u", "_q"))}
+            has_shape = (f"{p}x{n}" in base_keys) or (f"{n}x{p}" in base_keys)
+            if not has_shape:
+                tbl = precompute_quantile_table_for_shape((p, n), draws=80)
+                out = {}
+                if blob is not None:
+                    for k in blob.files:
+                        out[k] = blob[k]
+                out[f"{p}x{n}_u"] = tbl.u_grid
+                out[f"{p}x{n}_q"] = tbl.q_singular_sigma1
+                np.savez_compressed(npz_path, **out)
+
+        mock_shape = (32, 32)
+        _ensure_sv_table_shape("sv_quantiles_sigma1.npz", mock_shape)
+        set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
+
+        NUM_CHECKPOINTS = 24
+        pipeline = PropertyPipeline(ANALYSIS_SPECS)
+        from pathlib import Path
+        from collections import defaultdict
+        gif_frames = defaultdict(list)
+        vis_output_dir = Path("research_logs/visualizations/noise_estimation")
+
+        for step_idx in range(NUM_CHECKPOINTS):
+            # Build synthetic grads that yield innovations like test_wishart_fitting:
+            # G_b = S + sigma * E_b, then pipeline will form innovations as G_b - mean(G)
+            def _make_signal(h: int, w: int, r: int = 8):
+                r = min(r, h, w)
+                U, _ = torch.linalg.qr(torch.randn(h, r, device=device, dtype=torch.float32))
+                V, _ = torch.linalg.qr(torch.randn(w, r, device=device, dtype=torch.float32))
+                a = (2.0/3.0) ** 0.5
+                s = torch.pow(torch.full((r,), a, device=device, dtype=torch.float32), torch.arange(0, r, device=device, dtype=torch.float32))
+                s = s * s.max()  # scale
+                return (U * s) @ V.T
+
+            def _make_local_props_with_innov(num_layers: int = 2, batch: int = 8, h: int = 32, w: int = 32):
+                param_types = ['Attention Q', 'Attention K', 'Attention V', 'Attention O', 'MLP Input', 'MLP Output']
+                props = {}
+                for layer in range(num_layers):
+                    # shared signal per layer (cancels in innovations after mean)
+                    S = _make_signal(h, w, r=min(8, h, w))
+                    # choose noise sigma per layer (log-uniform)
+                    sigma = float(10.0 ** torch.empty(1).uniform_(-3.5, -1.5).item())
+                    for ptype in param_types:
+                        E = torch.randn(batch, h, w, device=device, dtype=torch.float32)
+                        G = S.unsqueeze(0) + sigma * E
+                        props[(ptype, layer)] = {
+                            "checkpoint_weights": torch.randn(h, w, device=device, dtype=torch.float32),
+                            "per_minibatch_gradient": G,
+                        }
+                return props
+
+            initial_props = _make_local_props_with_innov(batch=8)
+            local_results = pipeline.execute_for_all_layers(initial_props)
+
+            # Save CSV per checkpoint
+            records = convert_pipeline_results_to_record_format(local_results)
+            save_analysis_results(records, step=step_idx)
+
+            # Build viz stats for this checkpoint
+            viz_payload = local_results
+            viz_stats = _build_viz_stats_from_pipeline(viz_payload)
+            create_visualization_frames(step_idx, viz_stats, gif_frames, vis_output_dir, rank)
+
+        finalize_gifs(gif_frames, vis_output_dir, rank=rank)
+        return 0
+
     run_id = sys.argv[1]
     testing_mode = "--testing" in sys.argv
     force_recompute = "--force" in sys.argv
@@ -384,9 +465,13 @@ def main():
     
     if rank == 0:
         print(f"Found {len(checkpoints)} checkpoints to process")
-    
+
+    # Load finite-size Wishart tables (strict)
+    set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
+
     # Process each checkpoint
     gif_frames = defaultdict(list)
+    total_expected_frames = 0
     num_minibatches = 8  # Match training configuration
     
     for step, checkpoint_file in checkpoints:
@@ -401,27 +486,19 @@ def main():
 
         if rank == 0:
             save_analysis_results(records, step)
-
-            # Optionally convert tensors -> numpy for plotting here (keeps gather smaller & simpler)
-            viz_stats = {
-                k: {
-                    "innovation_sample": v["innovation_samples"].cpu().numpy(),
-                    "beta": v["beta"],
-                    "sigma_hat": float(v["innovation_singular_values"].median().item()),
-                    "per_minibatch_singular_values": v["minibatch_singular_values"].cpu().numpy(),
-                    "spectral_projection_coefficients": v["spectral_projection_coefficients"].cpu().numpy(),
-                }
-                for k, v in viz_payload.items()
-            }
-
+            # Build viz stats from the pipeline results
+            viz_stats = _build_viz_stats_from_pipeline(viz_payload)
             vis_output_dir = Path("research_logs/visualizations/noise_estimation")
             create_visualization_frames(step, viz_stats, gif_frames, vis_output_dir, rank)
+            # Accumulate expected frames based on minibatch dimension
+            any_entry = next(iter(viz_stats.values())) if viz_stats else None
+            total_expected_frames += int(any_entry['innovation_sample'].shape[0]) if any_entry is not None else 1
     
     # Create final GIFs
     if rank == 0:
         print("\nCreating visualization GIFs...")
         vis_output_dir = Path("research_logs/visualizations/noise_estimation")
-        finalize_gifs(gif_frames, vis_output_dir, rank=rank)
+        finalize_gifs(gif_frames, vis_output_dir, rank=rank, expected_len=total_expected_frames)
         print("Analysis complete!")
 
     # Ensure all ranks reach a common point before teardown

@@ -1,8 +1,8 @@
 # medium_full_svd.py - Medium experiment with full SVD polar backend and serialization
 from empirical.research.training.training_core import *
 from empirical.research.training.zeropower import get_zeropower_function
-from empirical.research.analysis.online_logging import serialize_model_checkpoint
-from empirical.research.analysis.offline_logging import is_logging_step_piecewise_log
+from empirical.research.analysis.logging_utilities import serialize_model_checkpoint
+from empirical.research.analysis.logging_utilities import is_logging_step_piecewise_log
 
 args = Hyperparameters()
 args.max_minibatches = 1000  # Run for 1000 steps
