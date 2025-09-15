@@ -145,16 +145,15 @@ def setup_distributed_training():
     return run_id, rank, world_size, device, master_process
 
 def safe_torch_compile(model, **compile_kwargs):
+    """Standard torch.compile wrapper with an opt-out via env.
+
+    Set TORCH_COMPILE_DISABLE=1 (or TORCHINDUCTOR_DISABLE/AOT_INDUCTOR_DISABLE) to skip compilation,
+    useful on clusters where Triton/PTX versions are incompatible.
     """
-    Standard torch.compile wrapper (cache directories set at import time).
-    
-    Args:
-        model: PyTorch model to compile
-        **compile_kwargs: Arguments passed to torch.compile (e.g., dynamic=False)
-    
-    Returns:
-        Compiled model
-    """
+    if os.environ.get("TORCH_COMPILE_DISABLE") == "1" or \
+       os.environ.get("TORCHINDUCTOR_DISABLE") == "1" or \
+       os.environ.get("AOT_INDUCTOR_DISABLE") == "1":
+        return model
     return torch.compile(model, **compile_kwargs)
 
 def setup_logging(run_id, master_process):
