@@ -148,12 +148,19 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
         print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
     checkpoint_data = torch.load(checkpoint_file, map_location=device)
     state_dict = checkpoint_data['model_state_dict']
+
+    # If compiling wrapped the module, load into the original module
+    target = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    # Normalize checkpoints that may contain '_orig_mod.' prefix in keys
     if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
-        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+        state_dict = {k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v for k, v in state_dict.items()}
+
+    target.load_state_dict(state_dict)
+
     # Broadcast parameters so all ranks are in sync with rank 0
     if dist.is_initialized():
-        for param in model.parameters():
+        for param in target.parameters():
             dist.broadcast(param.detach(), 0)
     return checkpoint_data.get('step', 0)
 
