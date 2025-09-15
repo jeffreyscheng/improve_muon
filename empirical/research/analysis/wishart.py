@@ -44,6 +44,44 @@ def predict_counts_from_tabulated(bin_edges: np.ndarray, table: tuple[np.ndarray
     return total * np.maximum(cdf_b - cdf_a, 0.0)
 
 
+# --------------------------- Table precompute (σ=1) ---------------------------
+from dataclasses import dataclass
+
+
+@dataclass
+class QuantileTableMini:
+    u_grid: np.ndarray
+    q_singular_sigma1: np.ndarray
+
+
+def precompute_quantile_table_for_shape(shape: tuple[int, int], draws: int = 80, L: int = 2048,
+                                        u_min: float = 1e-6, u_max: float = 0.995) -> QuantileTableMini:
+    p, n = int(shape[0]), int(shape[1])
+    use_left = (p <= n)
+    s_all: list[np.ndarray] = []
+    for _ in range(draws):
+        E = np.random.normal(0.0, 1.0, size=(p, n))
+        if use_left:
+            G = E @ E.T
+            ev = np.linalg.eigh(G)[0]
+        else:
+            H = E.T @ E
+            ev = np.linalg.eigh(H)[0]
+        ev = np.clip(ev, 0.0, None)
+        s_all.append(np.sqrt(ev))
+    s_all = np.concatenate(s_all)
+    s_all.sort()
+    N = s_all.size
+
+    L_log = L // 3
+    u_log = np.geomspace(u_min, 0.01, num=L_log, endpoint=False)
+    u_lin = np.linspace(0.01, u_max, num=L - L_log)
+    u = np.concatenate([u_log, u_lin])
+    idx = np.clip((u * (N - 1)).astype(int), 0, N - 1)
+    q = s_all[idx].astype(np.float64)
+    return QuantileTableMini(u_grid=u, q_singular_sigma1=q)
+
+
 def set_current_shape(shape: tuple[int, int]) -> None:
     global CURRENT_SHAPE
     CURRENT_SHAPE = (int(shape[0]), int(shape[1]))

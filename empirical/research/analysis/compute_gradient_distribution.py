@@ -54,11 +54,11 @@ from empirical.research.analysis.wishart import (
     predict_spectral_projection_coefficient_from_squared_true_signal,
     set_sv_tables_from_npz,
     set_current_shape,
+    precompute_quantile_table_for_shape,
 )
 from empirical.research.training.architecture import GPT
 import empirical.research.training.training_core as training_core
 from empirical.research.training.training_core import _global_print0
-from test_precompute import precompute_quantile_table_for_shape
 
 
 ANALYSIS_SPECS = [
@@ -362,10 +362,8 @@ def main():
 
         # Ensure the finite-size Wishart table contains the mock shape; precompute if missing
         def _ensure_sv_table_shape(npz_path: str, shape: tuple[int, int]):
-            from pathlib import Path as _Path
-            from test_precompute import precompute_quantile_table_for_shape
             p, n = int(shape[0]), int(shape[1])
-            path = _Path(npz_path)
+            path = Path(npz_path)
             base_keys = set()
             blob = None
             if path.exists():
