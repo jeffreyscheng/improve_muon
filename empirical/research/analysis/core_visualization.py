@@ -467,11 +467,12 @@ def compute_visualization_axis_ranges(data):
     """Compute consistent x-axis ranges across all data for each param type."""
     ranges = {}
     for param_type in PARAM_TYPES:
+        # Collect x values
         x_vals = []
         for step_data in data.values():
             for (p_type, layer_num), layer_data in step_data.items():
                 if p_type == param_type and layer_num >= 0:
-                    x_vals.extend(layer_data['per_minibatch_singular_values'])
+                    x_vals.extend(layer_data.get('per_minibatch_singular_values', []))
         x_vals = np.array(x_vals)
         x_vals = x_vals[x_vals > 0]
         if len(x_vals) > 0:
