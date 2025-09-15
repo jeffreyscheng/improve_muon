@@ -18,6 +18,8 @@ import glob
 import re
 import json
 from pathlib import Path
+import csv
+import os
 from collections import defaultdict
 from typing import Dict, Tuple, Any
 
@@ -244,19 +246,18 @@ def compute_analysis_for_step(
             print(f"  Analyzed {completed}/{total} layers")
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
-    local_records = convert_pipeline_results_to_record_format(local_results)
+
+    # Stream results to per-rank CSV to avoid large in-memory payloads
+    stream_write_analysis_results(local_results, step, rank)
+    local_records = {}
 
     if dist.is_initialized():
         dist.barrier()
 
     if rank == 0:
-        all_records = gather_layer_properties_to_rank_zero(local_records)
-        all_results = gather_layer_properties_to_rank_zero(local_results)
-        print(f"Step {step}: Analysis complete for {len(all_records)} layers (viz: {len(all_results)})")
-        return all_records, all_results
+        print(f"Step {step}: Analysis complete (streamed to CSV)")
+        return {}, {}
     else:
-        gather_layer_properties_to_rank_zero(local_records)
-        gather_layer_properties_to_rank_zero(local_results)
         return {}, {}
 
 
@@ -333,6 +334,43 @@ def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: 
         csv_path = sv_dir / f"step_{step:06d}.csv"
         df.to_csv(csv_path, index=False)
         print(f"Saved analysis results to {csv_path}")
+
+
+def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank: int):
+    base_dir = Path("research_logs/singular_values_distribution")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
+
+    fieldnames = [
+        'param_type', 'layer_num', 'weight_stable_rank',
+        'per_minibatch_gradient_singular_values',
+        'gradient_singular_value_standard_deviations',
+        'per_minibatch_gradient_stable_rank',
+        'spectral_projection_coefficients_from_8x_mean_gradient',
+    ]
+
+    write_header = not csv_path.exists()
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+
+        for (param_type, layer_num), props in layer_props.items():
+            def to_np16(x):
+                if isinstance(x, torch.Tensor):
+                    return x.detach().to(torch.float16).cpu().numpy()
+                return np.asarray(x)
+
+            row = {
+                'param_type': param_type,
+                'layer_num': layer_num,
+                'weight_stable_rank': float(props.get('weights_stable_rank', 0.0)),
+                'per_minibatch_gradient_singular_values': json.dumps(to_np16(props.get('minibatch_singular_values', [])).tolist()),
+                'gradient_singular_value_standard_deviations': json.dumps(to_np16(props.get('singular_value_std', [])).tolist()),
+                'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props.get('gradients_stable_rank', [])).tolist()),
+                'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props.get('spectral_projection_coefficients', [])).tolist()),
+            }
+            writer.writerow(row)
 
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
@@ -494,8 +532,10 @@ def main():
         )
 
         if rank == 0:
-            save_analysis_results(records, step)
-            # Build viz stats from the pipeline results
+            # Ensure all ranks have flushed their CSVs before reading for visualization
+            if dist.is_initialized():
+                dist.barrier()
+            # Build viz stats from the pipeline results (or read from CSVs inside viz)
             viz_stats = _build_viz_stats_from_pipeline(viz_payload)
             vis_output_dir = Path("research_logs/visualizations/noise_estimation")
             create_visualization_frames(step, viz_stats, gif_frames, vis_output_dir, rank)

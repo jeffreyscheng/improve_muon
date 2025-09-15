@@ -260,6 +260,14 @@ def create_visualization_frames(
     all_data = load_noise_model_data(sv_dir)
     axis_ranges = compute_visualization_axis_ranges(all_data)
 
+    # If per-step stats not provided, load them from CSVs
+    provided = viz_stats if isinstance(viz_stats, dict) else {}
+    top_keys = list(provided.keys())
+    if not top_keys or isinstance(top_keys[0], int):
+        per_step_stats = all_data.get(step, {})
+    else:
+        per_step_stats = provided
+
     # Precompute global y-limits for bulk panel (density) per param_type
     bulk_ymax: Dict[str, float] = {}
     for param_type in PARAM_TYPES:
