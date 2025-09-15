@@ -30,10 +30,19 @@ _original_trace_structured = trace_structured
 # Global print function for the patch - will be set by setup_logging
 _global_print0 = lambda s, console=False: None
 
-def _patched_trace_structured(name, metadata_fn, **kwargs):
-    if name == "inductor_output_code":
-        _global_print0(f"inductor_output_code: {metadata_fn().get('filename', 'Unknown')}")
-    _original_trace_structured(name, metadata_fn, **kwargs)
+def _patched_trace_structured(*args, **kwargs):
+    # Support both (name, metadata_fn, **kwargs) and (name, **kwargs) forms
+    name = args[0] if args else kwargs.get("name")
+    metadata_fn = kwargs.get("metadata_fn")
+    if metadata_fn is None and len(args) >= 2 and callable(args[1]):
+        metadata_fn = args[1]
+    try:
+        if name == "inductor_output_code" and callable(metadata_fn):
+            meta = metadata_fn() or {}
+            _global_print0(f"inductor_output_code: {meta.get('filename', 'Unknown')}")
+    except Exception:
+        pass
+    return _original_trace_structured(*args, **kwargs)
 
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
