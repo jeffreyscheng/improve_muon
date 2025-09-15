@@ -386,8 +386,6 @@ def main():
 
         NUM_CHECKPOINTS = 24
         pipeline = PropertyPipeline(ANALYSIS_SPECS)
-        from pathlib import Path
-        from collections import defaultdict
         gif_frames = defaultdict(list)
         vis_output_dir = Path("research_logs/visualizations/noise_estimation")
 
