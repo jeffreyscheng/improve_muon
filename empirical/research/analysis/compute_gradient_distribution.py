@@ -131,7 +131,7 @@ def precompile_svd_kernels(device: torch.device, rank: int):
         print("SVD kernel compilation complete.")
 
 
-def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device, compile_model: bool = True):
+def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     """Load model from checkpoint with proper device placement."""
     rank = dist.get_rank()
     if rank == 0:
@@ -155,9 +155,8 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device, comp
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     
-    # Optionally compile model (Inductor); can be disabled by caller
-    if compile_model:
-        model = training_core.safe_torch_compile(model, dynamic=False)
+    # Compile model using distributed-safe compilation (may crash if backend is incompatible)
+    model = training_core.safe_torch_compile(model, dynamic=False)
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
@@ -176,7 +175,7 @@ def compute_analysis_for_step(
     """Core analysis function - clean and focused."""
     
     # 1. Setup (5 LOC)
-    model, _ = setup_model_from_checkpoint(checkpoint_file, device, compile_model=True)
+    model, _ = setup_model_from_checkpoint(checkpoint_file, device)
     
     # Lightweight warmup for analysis - use small sequence to avoid OOM
     args = Hyperparameters()
@@ -184,23 +183,12 @@ def compute_analysis_for_step(
     vocab_size = args.vocab_size
     inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
     
-    # Single warmup pass with compile fallback on backend failures (e.g., Triton/PTX)
-    try:
-        window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
-        model(inputs.to(torch.int32), targets, window_size_blocks).backward()
-        model.zero_grad(set_to_none=True)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        if rank == 0:
-            print(f"Warmup failed under compiled model, falling back to eager: {e}")
-        # Recreate uncompiled model and retry warmup once
-        model, _ = setup_model_from_checkpoint(checkpoint_file, device, compile_model=False)
-        window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
-        model(inputs.to(torch.int32), targets, window_size_blocks).backward()
-        model.zero_grad(set_to_none=True)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    # Single warmup pass
+    window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
+    model(inputs.to(torch.int32), targets, window_size_blocks).backward()
+    model.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     precompile_svd_kernels(device, rank)
     
