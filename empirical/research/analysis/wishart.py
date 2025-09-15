@@ -44,6 +44,17 @@ def predict_counts_from_tabulated(bin_edges: np.ndarray, table: tuple[np.ndarray
     return total * np.maximum(cdf_b - cdf_a, 0.0)
 
 
+def F_noise_sigma(s: np.ndarray, table: tuple[np.ndarray, np.ndarray], sigma: float) -> np.ndarray:
+    """Finite-size noise CDF at scale sigma using σ=1 quantile table.
+
+    Fσ(s) = F1(s/σ) with clamping to the table's domain.
+    """
+    u1, q1 = table
+    s = np.asarray(s, dtype=np.float64)
+    x = np.clip(s / max(float(sigma), 1e-30), q1[0], q1[-1])
+    return np.interp(x, q1, u1)
+
+
 # --------------------------- Table precompute (σ=1) ---------------------------
 from dataclasses import dataclass
 
