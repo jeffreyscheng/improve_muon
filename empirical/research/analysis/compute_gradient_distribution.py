@@ -322,7 +322,19 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'noise_sigma',
     ]
 
-    write_header = not csv_path.exists()
+    # If file exists with an older/different schema, replace it to keep CSV consistent
+    write_header = True
+    if csv_path.exists():
+        try:
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                existing_header = next(reader, [])
+            if existing_header == fieldnames:
+                write_header = False
+            else:
+                csv_path.unlink()  # remove stale file with incompatible header
+        except Exception:
+            csv_path.unlink(missing_ok=True)
     with open(csv_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
@@ -487,6 +499,15 @@ def main():
     
     if rank == 0:
         print(f"Found {len(checkpoints)} checkpoints to process")
+
+    # Clean stale per-step CSVs before processing (rank 0), then sync
+    if rank == 0:
+        sv_dir = Path("research_logs/singular_values_distribution")
+        if sv_dir.exists():
+            for csv_file in sv_dir.glob("step_*.csv"):
+                csv_file.unlink()
+    if dist.is_initialized():
+        dist.barrier()
 
     # Load finite-size Wishart tables (strict)
     set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
