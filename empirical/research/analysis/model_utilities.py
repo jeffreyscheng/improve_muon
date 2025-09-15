@@ -121,6 +121,8 @@ def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) 
 
 from typing import Dict, Tuple, Any, Optional
 import torch.distributed as dist
+from empirical.research.training.training_core import distributed_data_generator, get_window_size_blocks
+import io, pickle
 
 def _merge_dicts(dicts):
     merged = {}
@@ -157,8 +159,6 @@ def gather_layer_properties_to_rank_zero(local_props: Dict[Tuple[str, int], Dict
 
     # ===== Fallback for very old PyTorch: tensor-based gather =====
     # Serialize to bytes -> ByteTensor on CPU, gather sizes then payloads.
-    import io, pickle
-    import torch
 
     buf = io.BytesIO()
     pickle.dump(local_props, buf, protocol=pickle.HIGHEST_PROTOCOL)
@@ -210,9 +210,6 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     Returns:
         GPTLayerProperty containing per-minibatch gradient tensors
     """
-    from empirical.research.training.training_core import distributed_data_generator
-    import torch.distributed as dist
-    
     # Get data generator
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -240,7 +237,6 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 model.train()  # Brief switch to train mode for gradient computation
                 
                 # Get sliding window blocks for this step
-                from empirical.research.training.training_core import get_window_size_blocks
                 window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(inputs.device)
                 
                 # Call model with all required arguments

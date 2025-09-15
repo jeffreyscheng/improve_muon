@@ -14,6 +14,9 @@ Usage:
 import os
 import sys
 import time
+import glob
+import re
+import json
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Tuple, Any
@@ -52,6 +55,10 @@ from empirical.research.analysis.wishart import (
     set_sv_tables_from_npz,
     set_current_shape,
 )
+from empirical.research.training.architecture import GPT
+import empirical.research.training.training_core as training_core
+from empirical.research.training.training_core import _global_print0
+from test_precompute import precompute_quantile_table_for_shape
 
 
 ANALYSIS_SPECS = [
@@ -124,9 +131,6 @@ def precompile_svd_kernels(device: torch.device, rank: int):
 
 def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     """Load model from checkpoint with proper device placement."""
-    from empirical.research.training.architecture import GPT
-    from empirical.research.training.training_core import safe_torch_compile
-    
     rank = dist.get_rank()
     if rank == 0:
         print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
@@ -150,7 +154,7 @@ def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
     model.load_state_dict(state_dict)
     
     # Compile model using distributed-safe compilation
-    model = safe_torch_compile(model, dynamic=False)
+    model = training_core.safe_torch_compile(model, dynamic=False)
     
     if rank == 0:
         print(f"Rank {rank}: Model loaded and compiled")
@@ -301,15 +305,14 @@ def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: 
     for (param_type, layer_num), record_data in results.items():
         if layer_num < 0:
             continue
-        import json as _json
         step_records.append({
             'param_type': param_type,
             'layer_num': layer_num,
             'weight_stable_rank': record_data.get('weight_stable_rank', 0.0),
-            'per_minibatch_gradient_singular_values': _json.dumps(record_data.get('per_minibatch_gradient_singular_values', []).tolist()),
-            'gradient_singular_value_standard_deviations': _json.dumps(record_data.get('gradient_singular_value_standard_deviations', []).tolist()),
-            'per_minibatch_gradient_stable_rank': _json.dumps(record_data.get('per_minibatch_gradient_stable_rank', []).tolist()),
-            'spectral_projection_coefficients_from_8x_mean_gradient': _json.dumps(record_data.get('spectral_projection_coefficients_from_8x_mean_gradient', []).tolist()),
+            'per_minibatch_gradient_singular_values': json.dumps(record_data.get('per_minibatch_gradient_singular_values', []).tolist()),
+            'gradient_singular_value_standard_deviations': json.dumps(record_data.get('gradient_singular_value_standard_deviations', []).tolist()),
+            'per_minibatch_gradient_stable_rank': json.dumps(record_data.get('per_minibatch_gradient_stable_rank', []).tolist()),
+            'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(record_data.get('spectral_projection_coefficients_from_8x_mean_gradient', []).tolist()),
         })
 
     df = pd.DataFrame(step_records)
@@ -321,9 +324,6 @@ def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: 
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     """Find all checkpoint files for the given run."""
-    import glob
-    import re
-    
     checkpoints_dir = Path("research_logs/checkpoints")
     checkpoint_pattern = str(checkpoints_dir / run_id / "model_step_*.pt")
     checkpoint_files = glob.glob(checkpoint_pattern)

@@ -148,17 +148,16 @@ def predict_spectral_projection_coefficient_from_squared_true_signal(
             val[mask] = out
         return val
     else:  # numpy path
-        import numpy as _np
-        t = _np.asarray(squared_true_signal_t, dtype=_np.float64)
-        t = _np.clip(t, 1e-12, None)
+        t = np.asarray(squared_true_signal_t, dtype=np.float64)
+        t = np.clip(t, 1e-12, None)
         beta = float(beta_scalar)
-        thresh = _np.sqrt(max(beta, 0.0))
-        val = _np.zeros_like(t)
+        thresh = np.sqrt(max(beta, 0.0))
+        val = np.zeros_like(t)
         mask = t >= thresh
         if mask.any():
             tt = t[mask]
             num = (1.0 - beta / (tt * tt)) * (1.0 - 1.0 / (tt * tt))
             den = (1.0 + beta / tt) * (1.0 + 1.0 / tt)
-            out = _np.sqrt(_np.clip(num / _np.clip(den, 1e-30, None), 0.0, None))
+            out = np.sqrt(np.clip(num / np.clip(den, 1e-30, None), 0.0, None))
             val[mask] = out
         return val

@@ -401,9 +401,10 @@ def finalize_gifs(
 
 # Additional visualization functions consolidated from visualize_noise_models.py
 
+from empirical.research.training.zeropower import NEWTON_SCHULZ_QUINTIC_COEFFICIENTS
+
 def newton_schulz_quintic_function(x):
     """Newton-Schulz quintic function for overlay."""
-    from empirical.research.training.zeropower import NEWTON_SCHULZ_QUINTIC_COEFFICIENTS
     out = x
     for a, b, c in NEWTON_SCHULZ_QUINTIC_COEFFICIENTS:
         out = a * out + b * (out **3) + c * (out ** 5)
