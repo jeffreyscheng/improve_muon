@@ -321,10 +321,10 @@ def create_visualization_frames(
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compute consistent axis ranges across all steps seen so far (from saved CSVs)
+    # Compute consistent SPC x-axis ranges across all steps (from saved CSVs)
     sv_dir = Path("research_logs/singular_values_distribution")
     all_data = load_noise_model_data(sv_dir)
-    axis_ranges = compute_visualization_axis_ranges(all_data)
+    spc_axis_ranges = compute_visualization_axis_ranges(all_data)
 
     # If per-step stats not provided, load them from CSVs
     provided = viz_stats if isinstance(viz_stats, dict) else {}
@@ -334,40 +334,61 @@ def create_visualization_frames(
     else:
         per_step_stats = provided
 
-    # Precompute global y-limits for bulk panel (density) per param_type
+    # Compute bulk x-axis ranges from innovation samples (preferably across steps)
+    def compute_bulk_axis_ranges(viz: Dict) -> Dict[str, Tuple[float, float]]:
+        ranges: Dict[str, Tuple[float, float]] = {}
+        # Detect timeseries: top-level keys are ints
+        if viz and isinstance(next(iter(viz.keys())), int):
+            steps = sorted(viz.keys())
+            per_step = [viz[s] for s in steps]
+        else:
+            per_step = [viz]
+        for param_type in PARAM_TYPES:
+            vals = []
+            for step_dict in per_step:
+                for (p_type, _), d in step_dict.items():
+                    if p_type == param_type and 'innovation_sample' in d:
+                        s = np.asarray(d['innovation_sample'], dtype=float)
+                        s = s[np.isfinite(s) & (s > 0)]
+                        if s.size:
+                            vals.append(s)
+            if not vals:
+                continue
+            all_s = np.concatenate(vals)
+            logs = np.log10(all_s)
+            lo_p, hi_p = np.percentile(logs, [1, 99])
+            lo, hi = float(10 ** (lo_p - 0.1)), float(10 ** (hi_p + 0.1))
+            lo = max(lo, 1e-8)
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                ranges[param_type] = (lo, hi)
+        return ranges
+
+    bulk_axis_ranges = compute_bulk_axis_ranges(viz_stats)
+    # Also compute a simple global y max per param type for bulk (from current step data, log-safe)
     bulk_ymax: Dict[str, float] = {}
     for param_type in PARAM_TYPES:
-        rng = axis_ranges.get(param_type)
-        if not rng or 'x' not in rng:
+        if param_type not in bulk_axis_ranges:
             continue
-        lo, hi = rng['x']
-        lo = max(float(lo), 1e-8)
-        hi = float(hi)
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            continue
+        lo, hi = bulk_axis_ranges[param_type]
         bins = np.geomspace(lo, hi, 60)
-        # Gather all singulars across steps for this param_type
         xs = []
-        for step_data in all_data.values():
-            for (p_type, layer_num), layer_data in step_data.items():
-                if p_type == param_type and layer_num >= 0:
-                    x = np.asarray(layer_data.get('per_minibatch_singular_values', []), dtype=float)
-                    if x.size:
-                        xs.append(x)
-        if not xs:
-            continue
-        all_x = np.concatenate(xs)
-        all_x = all_x[np.isfinite(all_x) & (all_x > 0)]
-        counts, _ = np.histogram(all_x, bins=bins)
-        dens = counts.astype(np.float64) / (max(len(all_x), 1) * np.diff(bins))
-        bulk_ymax[param_type] = float(dens.max() * 1.1 if dens.size else 1.0)
+        for (p_type, _), d in (per_step_stats.items() if isinstance(per_step_stats, dict) else []):
+            if p_type == param_type and 'innovation_sample' in d:
+                s = np.asarray(d['innovation_sample'], dtype=float)
+                s = s[np.isfinite(s) & (s > 0)]
+                if s.size:
+                    xs.append(s)
+        if xs:
+            all_s = np.concatenate(xs)
+            counts, _ = np.histogram(all_s, bins=bins)
+            dens = counts.astype(np.float64) / (len(all_s) * np.diff(bins))
+            bulk_ymax[param_type] = float(dens.max() * 1.1 if dens.size else 1.0)
 
     def _wrap_bulk(base_plot_fn):
         def _wrapped(ax, param_type, layer_data_list, viridis, max_layers):
             base_plot_fn(ax, param_type, layer_data_list, viridis, max_layers)
-            rng = axis_ranges.get(param_type)
-            if rng and 'x' in rng:
-                lo, hi = rng['x']
+            if param_type in bulk_axis_ranges:
+                lo, hi = bulk_axis_ranges[param_type]
                 lo = max(float(lo), 1e-8)
                 if hi > lo:
                     ax.set_xlim(lo, float(hi))
@@ -378,7 +399,7 @@ def create_visualization_frames(
     def _wrap_spc(base_plot_fn):
         def _wrapped(ax, param_type, layer_data_list, viridis, max_layers):
             base_plot_fn(ax, param_type, layer_data_list, viridis, max_layers)
-            rng = axis_ranges.get(param_type)
+            rng = spc_axis_ranges.get(param_type)
             if rng and 'x' in rng:
                 lo, hi = rng['x']
                 lo = max(float(lo), 1e-8)
