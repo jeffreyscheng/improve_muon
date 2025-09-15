@@ -23,6 +23,7 @@ from .wishart import (
     select_table,
     predict_counts_from_tabulated,
     predict_spectral_projection_coefficient_from_squared_true_signal,
+    F_noise_sigma,
 )
 
 
@@ -151,6 +152,8 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
         return
         
     bins = np.geomspace(x_min, x_max, 60)
+    counts_emp, _ = np.histogram(all_innov, bins=bins)
+    dens_emp = counts_emp.astype(np.float64) / (len(all_innov) * np.diff(bins))
     ax.hist(all_innov, bins=bins, density=True, alpha=0.35, label="Empirical spectrum")
 
     # Finite-size Wishart overlay (expected counts as density curve) — requires shape in viz_stats
@@ -166,6 +169,19 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     density_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
     density_pred = np.clip(density_pred, 1e-12, None)
     ax.plot(centers, density_pred, ls='--', lw=2, color='tab:orange', label=f"Wishart FS (σ̂={sigma_hat:.3g})")
+    # Edge line
+    ax.axvline(edge, color='k', lw=1.0, ls=':', label='τ̂')
+
+    # Metrics: KS distance and mass above edge
+    s_sorted = np.sort(all_innov)
+    F_emp = np.arange(1, len(s_sorted) + 1, dtype=np.float64) / float(len(s_sorted))
+    F_pred = F_noise_sigma(s_sorted, table, sigma_hat)
+    ks = float(np.max(np.abs(F_emp - F_pred))) if s_sorted.size else 0.0
+    mass_above = float(np.mean(all_innov > edge)) if all_innov.size else 0.0
+    txt = (f"β={beta:.3f}\nσ̂={sigma_hat:.3e}\nτ̂={edge:.3e}\n"
+           f"KS={ks:.3f}\nP(s>τ̂)={mass_above:.1%}")
+    ax.text(0.02, 0.98, txt, transform=ax.transAxes, va='top', ha='left', fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, lw=0.0))
     ax.legend(loc='upper right', fontsize=8, frameon=False)
 
 
@@ -227,6 +243,58 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
             pred = predict_spectral_projection_coefficient_from_squared_true_signal(t, beta)
             color = viridis(layer_num / denom)
             ax.plot(xs, pred, color=color, lw=1.0)
+
+
+def plot_bulk_residual(ax, param_type: str, layer_data_list: List, viridis, max_layers: int):
+    """Plot residual density: empirical minus predicted Wishart density."""
+    ax.set_title(f'{param_type} residual')
+    ax.set_xlabel('Singular value (log scale)')
+    ax.set_ylabel('Residual density (emp - pred)')
+    ax.set_xscale('log')
+    ax.grid(True, alpha=0.3)
+
+    # Opinionated inputs come from viz_stats
+    samples, betas, sigmas = [], [], []
+    for _, data in layer_data_list:
+        assert 'innovation_sample' in data, "innovation_sample missing in viz_stats"
+        assert 'beta' in data, "beta missing in viz_stats"
+        assert 'sigma_hat' in data, "sigma_hat missing in viz_stats"
+        s = np.asarray(data['innovation_sample'], dtype=float)
+        s = s[s > 0]
+        if s.size:
+            samples.append(np.ascontiguousarray(s))
+            betas.append(float(data['beta']))
+            sigmas.append(float(data['sigma_hat']))
+    if not samples:
+        ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center')
+        return
+    all_innov = np.ascontiguousarray(np.concatenate(samples))
+    if all_innov.size == 0:
+        return
+
+    beta = float(np.median(np.asarray(betas))) if betas else 1.0
+    sigma_hat = float(np.median(np.asarray(sigmas))) if sigmas else 1e-8
+
+    # Need shape to select table
+    assert layer_data_list and 'shape' in layer_data_list[0][1], f"shape missing in viz_stats for {param_type}"
+    p, n = map(int, layer_data_list[0][1]['shape'])
+    table = select_table(_SV_TABLES, p, n)
+
+    # Bins from global x-range (set by wrapper) or data-driven fallback
+    x_min = float(all_innov.min())
+    x_max = float(all_innov.max() * 1.05)
+    x_min = max(x_min, 1e-8)
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+        return
+    bins = np.geomspace(x_min, x_max, 60)
+    counts_emp, _ = np.histogram(all_innov, bins=bins)
+    dens_emp = counts_emp.astype(np.float64) / (len(all_innov) * np.diff(bins))
+    mu = predict_counts_from_tabulated(bins, table, sigma_hat, total=len(all_innov))
+    dens_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
+    centers = 0.5 * (bins[1:] + bins[:-1])
+    residual = dens_emp - dens_pred
+    ax.axhline(0.0, color='k', lw=1.0, ls=':')
+    ax.plot(centers, residual, lw=1.5, color='tab:purple')
 
 
 ## removed unused plot_stable_rank_evolution
@@ -331,6 +399,11 @@ def create_visualization_frames(
                 'plot_fn': _wrap_bulk(plot_bulk_vs_spike),
                 'title': f'Bulk vs Spike Estimation - Step {step_num}',
                 'filename': f"bulk_spike_{step_num:06d}.png"
+            },
+            'bulk_residual': {
+                'plot_fn': _wrap_spc(plot_bulk_residual),
+                'title': f'Residual (Emp − Pred) - Step {step_num}',
+                'filename': f"bulk_residual_{step_num:06d}.png"
             },
             'spc_singular': {
                 'plot_fn': _wrap_spc(plot_spc_vs_singular_values),
