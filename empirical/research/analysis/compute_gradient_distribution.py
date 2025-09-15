@@ -128,39 +128,34 @@ def precompile_svd_kernels(device: torch.device, rank: int):
         print("SVD kernel compilation complete.")
 
 
-def setup_model_from_checkpoint(checkpoint_file: str, device: torch.device):
-    """Load model from checkpoint with proper device placement."""
+def build_compiled_model(device: torch.device):
+    """Build and compile the model once per process."""
     from empirical.research.training.architecture import GPT
     import empirical.research.training.training_core as training_core
-    rank = dist.get_rank()
-    if rank == 0:
-        print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
-    
-    # Create fresh model exactly like training does
     args = Hyperparameters()
     model = GPT(args.vocab_size, 16, 8, 1024, max(args.train_seq_len, args.val_seq_len)).cuda()
     for m in model.modules():
         if isinstance(m, torch.nn.Embedding):
             m.bfloat16()
-    
-    # Broadcast parameters like training does
-    for param in model.parameters():
-        dist.broadcast(param.detach(), 0)
-    
-    # Load checkpoint weights
+    model = training_core.safe_torch_compile(model, dynamic=False)
+    return model
+
+
+def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device: torch.device):
+    """Load checkpoint weights into an existing compiled model and broadcast from rank 0."""
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
     checkpoint_data = torch.load(checkpoint_file, map_location=device)
     state_dict = checkpoint_data['model_state_dict']
     if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
-    
-    # Compile model using distributed-safe compilation (may crash if backend is incompatible)
-    model = training_core.safe_torch_compile(model, dynamic=False)
-    
-    if rank == 0:
-        print(f"Rank {rank}: Model loaded and compiled")
-    
-    return model, checkpoint_data.get('step', 0)
+    # Broadcast parameters so all ranks are in sync with rank 0
+    if dist.is_initialized():
+        for param in model.parameters():
+            dist.broadcast(param.detach(), 0)
+    return checkpoint_data.get('step', 0)
 
 
 def compute_analysis_for_step(
@@ -170,30 +165,12 @@ def compute_analysis_for_step(
     rank: int,
     world_size: int,
     device: torch.device,
+    model: torch.nn.Module,
 ) -> GPTLayerProperty:
     """Core analysis function - clean and focused."""
     
-    # 1. Setup (5 LOC)
-    model, _ = setup_model_from_checkpoint(checkpoint_file, device)
-    
-    # Lightweight warmup for analysis - use small sequence to avoid OOM
+    # 1. (Model already built and compiled; weights loaded by caller)
     args = Hyperparameters()
-    small_seq_len = 128  # Much smaller than training's 8192
-    vocab_size = args.vocab_size
-    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
-    
-    # Single warmup pass
-    window_size_blocks = get_window_size_blocks(0, args.num_iterations).to(device)
-    model(inputs.to(torch.int32), targets, window_size_blocks).backward()
-    model.zero_grad(set_to_none=True)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    precompile_svd_kernels(device, rank)
-    
-    # Synchronize after setup
-    if dist.is_initialized():
-        dist.barrier()
     
     # 2. Parameter sharding - each rank gets subset of parameters
     args = Hyperparameters()
@@ -243,7 +220,7 @@ def compute_analysis_for_step(
 
     if rank == 0:
         print(f"Step {step}: Analysis complete (streamed to CSV)")
-        return {}, {}
+        return {}, local_results
     else:
         return {}, {}
 
@@ -334,6 +311,8 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'gradient_singular_value_standard_deviations',
         'per_minibatch_gradient_stable_rank',
         'spectral_projection_coefficients_from_8x_mean_gradient',
+        'shape',
+        'noise_sigma',
     ]
 
     write_header = not csv_path.exists()
@@ -356,6 +335,8 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props.get('singular_value_std', [])).tolist()),
                 'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props.get('gradients_stable_rank', [])).tolist()),
                 'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props.get('spectral_projection_coefficients', [])).tolist()),
+                'shape': json.dumps(list(props.get('checkpoint_weights', torch.empty(0)).shape[-2:])),
+                'noise_sigma': float(props.get('noise_sigma', 0.0)) if isinstance(props.get('noise_sigma', None), (int, float)) else float(props.get('noise_sigma', torch.tensor(0.0)).item() if isinstance(props.get('noise_sigma', None), torch.Tensor) else 0.0),
             }
             writer.writerow(row)
 
@@ -503,6 +484,22 @@ def main():
     # Load finite-size Wishart tables (strict)
     set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
 
+    # Build and warm up model once per process
+    model = build_compiled_model(device)
+    # Lightweight warmup for analysis - use small sequence to avoid OOM
+    args_local = Hyperparameters()
+    small_seq_len = 128
+    vocab_size = args_local.vocab_size
+    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
+    window_size_blocks = get_window_size_blocks(0, args_local.num_iterations).to(device)
+    model(inputs.to(torch.int32), targets, window_size_blocks).backward()
+    model.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    precompile_svd_kernels(device, rank)
+    if dist.is_initialized():
+        dist.barrier()
+
     # Process each checkpoint
     gif_frames = defaultdict(list)
     total_expected_frames = 0
@@ -514,8 +511,9 @@ def main():
             start_time = time.time()
         
         # Run analysis
+        _ = load_weights_into_model(checkpoint_file, model, device)
         records, viz_payload = compute_analysis_for_step(
-            step, checkpoint_file, num_minibatches, rank, world_size, device
+            step, checkpoint_file, num_minibatches, rank, world_size, device, model
         )
 
         # Ensure all ranks have flushed their CSVs before reading for visualization

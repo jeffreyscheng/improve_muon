@@ -74,26 +74,23 @@ def zeropower_via_svd_polar(G: Tensor) -> Tensor:
     """
     SVD-based polar decomposition for orthogonalization.
     """
-    try:
-        # Handle non-square matrices like Newton-Schulz does
-        was_transposed = False
-        X = G.float()
-        if G.size(-2) > G.size(-1):
-            X = X.mT
-            was_transposed = True
-        
-        # Use modern linalg.svd instead of deprecated torch.svd
-        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-        # Note: torch.linalg.svd returns Vh (V hermitian), not V
-        result = U @ Vh
-        
-        if was_transposed:
-            result = result.mT
-            
-        return result.to(G.dtype)
-    except Exception:
-        # Fallback to Newton-Schulz if SVD fails
-        return zeropower_via_newtonschulz5(G)
+    assert G.ndim >= 2, "zeropower_via_svd_polar requires a matrix/tensor with ndim>=2"
+    # Handle non-square matrices like Newton-Schulz does
+    was_transposed = False
+    X = G.float()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+        was_transposed = True
+
+    # Use modern linalg.svd instead of deprecated torch.svd
+    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    # Note: torch.linalg.svd returns Vh (V hermitian), not V
+    result = U @ Vh
+
+    if was_transposed:
+        result = result.mT
+
+    return result.to(G.dtype)
 
 def zeropower_via_classic_newton_schulz(G: Tensor, num_iters: int = 15) -> Tensor:
     """

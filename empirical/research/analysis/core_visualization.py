@@ -117,17 +117,20 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     setup_log_scale_axis(ax)
     ax.set_yscale('log')
 
-    # Collect downsampled singular values from layers
+    # Collect singular values from layers (opinionated: requires innovation_sample, beta, sigma_hat)
     samples, betas, sigmas = [], [], []
     for _, data in layer_data_list:
-        s = np.asarray(data["innovation_sample"], dtype=float)
+        assert 'innovation_sample' in data, "innovation_sample missing in viz_stats"
+        assert 'beta' in data, "beta missing in viz_stats"
+        assert 'sigma_hat' in data, "sigma_hat missing in viz_stats"
+        s = np.asarray(data['innovation_sample'], dtype=float)
         if s.size:
             # Only positive for log scale
             s = s[s > 0]
             if s.size:
                 samples.append(np.ascontiguousarray(s))
-                betas.append(float(data["beta"]))
-                sigmas.append(float(data["sigma_hat"]))
+                betas.append(float(data['beta']))
+                sigmas.append(float(data['sigma_hat']))
     
     if not samples:
         ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center')
@@ -150,13 +153,11 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     bins = np.geomspace(x_min, x_max, 60)
     ax.hist(all_innov, bins=bins, density=True, alpha=0.35, label="Empirical spectrum")
 
-    # Finite-size Wishart overlay (expected counts as density curve)
-    # Use actual layer shape carried in data (all layers for a param_type should share shape)
+    # Finite-size Wishart overlay (expected counts as density curve) — requires shape in viz_stats
     if not layer_data_list:
         return
     first_data = layer_data_list[0][1]
-    if 'shape' not in first_data:
-        raise KeyError(f"shape not provided in viz_stats for param_type {param_type}")
+    assert 'shape' in first_data, f"shape missing in viz_stats for {param_type}"
     p, n = map(int, first_data['shape'])
     table = select_table(_SV_TABLES, p, n)
     counts, _ = np.histogram(all_innov, bins=bins)
@@ -208,12 +209,9 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
     # Overlay curves: Newton–Schulz quintic (black) and predicted SPC per layer (colored)
     if np.isfinite(x_min) and x_max > x_min:
         xs = np.geomspace(max(x_min, 1e-8), x_max, 256)
-        # Newton–Schulz quintic in black
-        try:
-            y_ns = newton_schulz_quintic_function(xs)
-            ax.plot(xs, y_ns, color='black', lw=1.5, label='Newton–Schulz quintic')
-        except Exception:
-            pass
+        # Newton–Schulz quintic in black (required)
+        y_ns = newton_schulz_quintic_function(xs)
+        ax.plot(xs, y_ns, color='black', lw=1.5, label='Newton–Schulz quintic')
         # Predicted SPC per layer using sigma_hat and beta (calls math util with piecewise rule)
         for layer_num, data in layer_data_list:
             if 'sigma_hat' not in data or 'beta' not in data:
@@ -425,13 +423,11 @@ def load_noise_model_data(sv_dir: Path) -> dict:
     
     def _parse_arrayish(val):
         if isinstance(val, str) and val:
-            try:
-                return np.array(json.loads(val))
-            except Exception:
-                return np.array([])
+            return np.array(json.loads(val))
         if isinstance(val, (list, tuple, np.ndarray)):
             return np.array(val)
-        return np.array([])
+        # Opinionated: must be provided in expected schema
+        raise ValueError("Expected JSON string or array for array-like CSV field")
 
     for csv_file in sv_dir.glob("step_*.csv"):
         step_num = int(csv_file.stem.split('_')[1])
@@ -445,9 +441,14 @@ def load_noise_model_data(sv_dir: Path) -> dict:
             
             gradient_svs = _parse_arrayish(row.get('per_minibatch_gradient_singular_values'))
             
-            layer_data = {
-                'per_minibatch_singular_values': gradient_svs.flatten(),
-            }
+            layer_data = {'per_minibatch_singular_values': gradient_svs.flatten()}
+
+            # Optional derived fields if present in CSV
+            if 'shape' in row and pd.notna(row['shape']):
+                shp = json.loads(row['shape']) if isinstance(row['shape'], str) else row['shape']
+                layer_data['shape'] = tuple(int(x) for x in shp)
+            if 'noise_sigma' in row and pd.notna(row['noise_sigma']):
+                layer_data['noise_sigma'] = float(row['noise_sigma'])
             
             # Load spectral projection coefficients
             val_spc = row.get('spectral_projection_coefficients_from_8x_mean_gradient') if isinstance(row, dict) else row['spectral_projection_coefficients_from_8x_mean_gradient']
