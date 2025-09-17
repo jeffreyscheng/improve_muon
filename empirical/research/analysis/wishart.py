@@ -117,8 +117,8 @@ def fit_sigma_with_wishart(spectrum: torch.Tensor) -> float:
         uu = np.clip(u, u_tbl[0], u_tbl[-1])
         return np.interp(uu, u_tbl, q_tbl)
 
-    kmax = int(0.95 * spectrum)
-    kmin = int(0.05 * spectrum)
+    kmax = int(0.95 * len(spectrum))
+    kmin = int(0. * len(spectrum))
     idx_all = np.arange(1, kmax + 1, dtype=np.float64)
     u_all = (idx_all - 0.5) / m
 
