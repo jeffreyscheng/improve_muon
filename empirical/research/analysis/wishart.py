@@ -88,9 +88,6 @@ def precompute_quantile_table_for_shape(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     base_dir: str | Path = "wishart_cdfs",
-    use_svdvals: bool = True,
-    torch_compile: bool = False,
-    dtype: torch.dtype = torch.float32,
 ) -> pd.DataFrame:
     """Precompute σ=1 Wishart singular-value CDF for a given shape and save CSV.
 
@@ -116,39 +113,48 @@ def precompute_quantile_table_for_shape(
     else:
         device = torch.device(device)
 
-    # Collect singular values across all draws in streaming batches
+    # Collect singular values across all draws in streaming batches using
+    # direct Wishart sampling via lower-triangular construction (faster than tall SVD).
+    # If p_raw <= n_raw: sample W_p(I, n) and take eigvals; else sample W_n(I, p).
     num_batches = (int(draws) + batch_size - 1) // batch_size
     svals_list: list[np.ndarray] = []
 
-    def _one_batch(cur_bs: int) -> np.ndarray:
-        with torch.no_grad():
-            E = torch.randn(cur_bs, p_raw, n_raw, device=device, dtype=dtype)
-            if use_svdvals:
-                X = E if E.dtype == torch.float32 else E.to(torch.float32)
-                s = torch.linalg.svdvals(X)  # (cur_bs, min(p_raw, n_raw))
-            else:
-                # Fallback via Gram eigvals
-                if p_raw <= n_raw:
-                    G = E @ E.transpose(-1, -2)
-                else:
-                    G = E.transpose(-1, -2) @ E
-                ev = torch.linalg.eigvalsh(G.to(torch.float32))
-                s = torch.sqrt(torch.clamp(ev, min=0.0))
-            return s.reshape(-1).to("cpu", dtype=torch.float64).numpy()
+    dim = min(p_raw, n_raw)
+    df = max(p_raw, n_raw)
 
-    run_batch = _one_batch
-    if torch_compile and hasattr(torch, "compile"):
-        try:
-            run_batch = torch.compile(_one_batch, fullgraph=False, dynamic=True)  # type: ignore[attr-defined]
-        except Exception:
-            run_batch = _one_batch
+    def run_batch(cur_bs: int) -> np.ndarray:
+        with torch.no_grad():
+            p = dim
+            n = df
+            dt = torch.float32
+            dev = device
+
+            # Build lower-triangular L for Wishart_p(I, n)
+            L = torch.zeros(cur_bs, p, p, device=dev, dtype=dt)
+
+            # Diagonal entries: sqrt(chi2_{n - i})
+            # Chi-square ν sampled as Gamma(ν/2, rate=1) * 2
+            for i in range(p):
+                nu = max(n - i, 1)
+                chi = torch.distributions.Gamma(float(nu) / 2.0, 1.0).sample((cur_bs,)).to(dev, dt) * 2.0
+                L[:, i, i] = torch.sqrt(torch.clamp(chi, min=0.0))
+
+            # Strict lower triangle: standard normals
+            idx = torch.tril_indices(row=p, col=p, offset=-1, device=dev)
+            if idx.numel() > 0:
+                L[:, idx[0], idx[1]] = torch.randn(cur_bs, idx.size(1), device=dev, dtype=dt)
+
+            # G = L L^T (Wishart draw)
+            G = L @ L.transpose(-1, -2)
+            evals = torch.linalg.eigvalsh(G)
+            s = torch.sqrt(torch.clamp(evals, min=0.0))
+            return s.reshape(-1).to("cpu", dtype=torch.float64).numpy()
 
     for b in range(num_batches):
         cur = int(min(batch_size, draws - b * batch_size))
         if cur <= 0:
             break
-        svals = run_batch(cur)
-        svals_list.append(svals)
+        svals_list.append(run_batch(cur))
 
     s_all = np.concatenate(svals_list) if svals_list else np.empty(0, dtype=np.float64)
     if s_all.size == 0:
