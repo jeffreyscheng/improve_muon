@@ -19,8 +19,7 @@ from matplotlib.ticker import LogLocator, LogFormatterMathtext, NullLocator
 
 # no direct math imports required here
 from .wishart import (
-    load_sv_quantile_tables_npz,
-    select_table,
+    get_wishart_cdf,
     predict_counts_from_tabulated,
     predict_spectral_projection_coefficient_from_squared_true_signal,
     F_noise_sigma,
@@ -34,7 +33,7 @@ PARAM_TYPES = [
 ]
 
 
-_SV_TABLES = load_sv_quantile_tables_npz("sv_quantiles_sigma1.npz")
+# CDF tables are loaded on-demand from CSV via get_wishart_cdf
 
 
 
@@ -162,9 +161,9 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     first_data = layer_data_list[0][1]
     assert 'shape' in first_data, f"shape missing in viz_stats for {param_type}"
     p, n = map(int, first_data['shape'])
-    table = select_table(_SV_TABLES, p, n)
+    cdf_df = get_wishart_cdf((p, n))
     counts, _ = np.histogram(all_innov, bins=bins)
-    mu = predict_counts_from_tabulated(bins, table, sigma_hat, total=len(all_innov))
+    mu = predict_counts_from_tabulated(bins, cdf_df, sigma_hat, total=len(all_innov))
     centers = 0.5 * (bins[1:] + bins[:-1])
     density_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
     # Clip to log-safe minimum so the line is visible on log-y
@@ -176,7 +175,7 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     # Metrics: KS distance and mass above edge
     s_sorted = np.sort(all_innov)
     F_emp = np.arange(1, len(s_sorted) + 1, dtype=np.float64) / float(len(s_sorted))
-    F_pred = F_noise_sigma(s_sorted, table, sigma_hat)
+    F_pred = F_noise_sigma(s_sorted, cdf_df, sigma_hat)
     ks = float(np.max(np.abs(F_emp - F_pred))) if s_sorted.size else 0.0
     mass_above = float(np.mean(all_innov > edge)) if all_innov.size else 0.0
     txt = (f"β={beta:.3f}\nσ̂={sigma_hat:.3e}\nτ̂={edge:.3e}\n"

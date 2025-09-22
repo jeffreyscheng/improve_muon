@@ -9,6 +9,9 @@ the "how" (execution), we achieve dramatically improved readability and maintain
 
 Usage:
     torchrun --standalone --nproc_per_node=8 compute_gradient_distribution.py <run_id> [--testing] [--force]
+
+Local testing:
+    python -m empirical.research.analysis.compute_gradient_distribution --local-mock
 """
 
 import os
@@ -54,9 +57,8 @@ from empirical.research.analysis.wishart import (
     aspect_ratio_beta as wishart_aspect_ratio_beta,
     squared_true_signal_from_quadratic_formula,
     predict_spectral_projection_coefficient_from_squared_true_signal,
-    set_sv_tables_from_npz,
-    set_current_shape,
     precompute_quantile_table_for_shape,
+    wishart_cdf_path_for_shape,
 )
 
 
@@ -99,7 +101,7 @@ ANALYSIS_SPECS = [
 
     # Strict Wishart-based estimates
     PropertySpec("noise_sigma", ["minibatch_singular_values", "checkpoint_weights"],
-                lambda sv, w: (set_current_shape(w.shape), float(fit_sigma_with_wishart(sv)))[1]),
+                lambda sv, w: float(fit_sigma_with_wishart(sv, w.shape))),
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(wishart_aspect_ratio_beta(w))),
     PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
@@ -107,6 +109,30 @@ ANALYSIS_SPECS = [
     PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
                 predict_spectral_projection_coefficient_from_squared_true_signal),
 ]
+
+# Mock analysis specs (can diverge from real pipeline if needed)
+MOCK_SPECS = ANALYSIS_SPECS
+
+
+def _make_mock_step_props(num_layers: int, batch: int, h: int, w: int, device: torch.device):
+    def _signal(r: int):
+        r = min(r, h, w)
+        U, _ = torch.linalg.qr(torch.randn(h, r, device=device, dtype=torch.float32))
+        V, _ = torch.linalg.qr(torch.randn(w, r, device=device, dtype=torch.float32))
+        a = (2.0/3.0) ** 0.5
+        s = torch.pow(torch.full((r,), a, device=device, dtype=torch.float32), torch.arange(0, r, device=device, dtype=torch.float32))
+        s = s * s.max()
+        return (U * s) @ V.T
+    param_types = ['Attention Q', 'Attention K', 'Attention V', 'Attention O', 'MLP Input', 'MLP Output']
+    props = {}
+    for layer in range(num_layers):
+        S = _signal(r=min(8, h, w))
+        sigma = float(10.0 ** torch.empty(1, device=device).uniform_(-3.5, -1.5).item())
+        for ptype in param_types:
+            E = torch.randn(batch, h, w, device=device, dtype=torch.float32)
+            G = S.unsqueeze(0) + sigma * E
+            props[(ptype, layer)] = {"checkpoint_weights": torch.randn(h, w, device=device), "per_minibatch_gradient": G}
+    return props
 
 
 def precompile_svd_kernels(device: torch.device, rank: int):
@@ -173,44 +199,38 @@ def compute_analysis_for_step(
     world_size: int,
     device: torch.device,
     model: torch.nn.Module,
+    *,
+    initial_props: GPTLayerProperty | None = None,
+    specs: list[PropertySpec] | None = None,
 ) -> GPTLayerProperty:
     """Core analysis function - clean and focused."""
     
-    # 1. (Model already built and compiled; weights loaded by caller)
+    # 1. Build initial properties (either provided for mock, or computed from model)
     args = Hyperparameters()
     
-    # 2. Parameter sharding - each rank gets subset of parameters
-    args = Hyperparameters()
-    
-    # Get all parameters for sharding
-    all_weights = get_weight_matrices(model, only_hidden=True)
-    all_param_keys = list(all_weights.keys())
-    
-    # Shard parameters across ranks
-    params_per_rank = len(all_param_keys) // world_size
-    start_idx = rank * params_per_rank
-    end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
-    my_param_keys = set(all_param_keys[start_idx:end_idx])
-    
-    if rank == 0:
-        print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
-    
-    # Get sharded gradients (only for my assigned parameters)
-    gradients = get_accumulated_gradient_matrices(
-        model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys
-    )
-    
-    # Filter weights to only assigned parameters
-    my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
-    
-    # Create initial properties only for assigned parameters
-    initial_props = combine_layer_properties(
-        lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
-        my_weights, gradients
-    )
+    if initial_props is None:
+        # Get all parameters for sharding
+        all_weights = get_weight_matrices(model, only_hidden=True)
+        all_param_keys = list(all_weights.keys())
+        # Shard parameters across ranks
+        params_per_rank = len(all_param_keys) // world_size
+        start_idx = rank * params_per_rank
+        end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
+        my_param_keys = set(all_param_keys[start_idx:end_idx])
+        if rank == 0:
+            print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
+        # Get sharded gradients
+        gradients = get_accumulated_gradient_matrices(
+            model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys
+        )
+        my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
+        initial_props = combine_layer_properties(
+            lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
+            my_weights, gradients
+        )
     
     # 3. Execute analysis pipeline (5 LOC)
-    pipeline = PropertyPipeline(ANALYSIS_SPECS)
+    pipeline = PropertyPipeline(specs or ANALYSIS_SPECS)
     
     def progress_callback(completed: int, total: int):
         if rank == 0 and completed % 5 == 0:
@@ -267,6 +287,9 @@ def _build_viz_stats_from_pipeline(viz_payload: GPTLayerProperty) -> Dict[Tuple[
         beta = matrix_shape_beta(props['checkpoint_weights'].shape)
         B = int(innov_s.shape[0]) if isinstance(innov_s, torch.Tensor) and innov_s.ndim >= 2 else 1
         sigma_eff = float(props['noise_sigma']) * (max(B - 1, 1) / max(B, 1)) ** 0.5
+        # positive-only for min computation on log scale
+        innov_np = innov_s.detach().cpu().numpy()
+        innov_pos = innov_np[innov_np > 0]
         viz_stats[k] = {
             'innovation_sample': innov_s[:, :min(100, innov_s.shape[1])].cpu().numpy(),
             'beta': float(beta),
@@ -274,6 +297,8 @@ def _build_viz_stats_from_pipeline(viz_payload: GPTLayerProperty) -> Dict[Tuple[
             'per_minibatch_singular_values': props['minibatch_singular_values'].cpu().numpy(),
             'spectral_projection_coefficients': props['spectral_projection_coefficients'].cpu().numpy(),
             'shape': tuple(int(x) for x in props['checkpoint_weights'].shape),
+            'innovation_min': float(innov_pos.min()) if innov_pos.size else 1e-8,
+            'innovation_max': float(innov_np.max()) if innov_np.size else 1.0,
         }
     return viz_stats
 
@@ -381,8 +406,13 @@ def main():
         print("Usage: python compute_gradient_distribution.py <run_id> [--testing] [--force]")
         return 1
     
-    # Lightweight local mock mode (CPU-only, no distributed, synthetic data)
-    if "--local-mock" in sys.argv:
+    # Shared visualization accumulators
+    gif_frames = defaultdict(list)
+    viz_timeseries: Dict[int, Dict[Tuple[str, int], Dict[str, Any]]] = {}
+    vis_output_dir = Path("research_logs/visualizations/noise_estimation")
+    expected_len = 0
+    is_mock = "--local-mock" in sys.argv
+    if is_mock:
         torch.manual_seed(0)
         device = torch.device("cpu")
         rank, world_size = 0, 1
@@ -398,34 +428,16 @@ def main():
                     initial[(ptype, layer)] = {"checkpoint_weights": cw, "per_minibatch_gradient": mb}
             return initial
 
-        # Ensure the finite-size Wishart table contains the mock shape; precompute if missing
-        def _ensure_sv_table_shape(npz_path: str, shape: tuple[int, int]):
-            p, n = int(shape[0]), int(shape[1])
-            path = Path(npz_path)
-            base_keys = set()
-            blob = None
-            if path.exists():
-                blob = np.load(npz_path, allow_pickle=True)
-                base_keys = {k[:-2] for k in blob.files if k.endswith(("_u", "_q"))}
-            has_shape = (f"{p}x{n}" in base_keys) or (f"{n}x{p}" in base_keys)
-            if not has_shape:
-                tbl = precompute_quantile_table_for_shape((p, n), draws=80)
-                out = {}
-                if blob is not None:
-                    for k in blob.files:
-                        out[k] = blob[k]
-                out[f"{p}x{n}_u"] = tbl.u_grid
-                out[f"{p}x{n}_q"] = tbl.q_singular_sigma1
-                np.savez_compressed(npz_path, **out)
+        # Ensure the finite-size Wishart table CSV exists for the mock shape; precompute if missing
+        def _ensure_wishart_csv(shape: tuple[int, int], draws: int = 2000):
+            csv_path = wishart_cdf_path_for_shape(shape)
+            if not csv_path.exists():
+                precompute_quantile_table_for_shape(shape, draws=draws)
 
         mock_shape = (32, 32)
-        _ensure_sv_table_shape("sv_quantiles_sigma1.npz", mock_shape)
-        set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
+        _ensure_wishart_csv(mock_shape, draws=2000)
 
         NUM_CHECKPOINTS = 24
-        pipeline = PropertyPipeline(ANALYSIS_SPECS)
-        gif_frames = defaultdict(list)
-        vis_output_dir = Path("research_logs/visualizations/noise_estimation")
 
         for step_idx in range(NUM_CHECKPOINTS):
             # Build synthetic grads that yield innovations like test_wishart_fitting:
@@ -457,110 +469,96 @@ def main():
                 return props
 
             initial_props = _make_local_props_with_innov(batch=8)
-            local_results = pipeline.execute_for_all_layers(initial_props)
+            _, viz_payload = compute_analysis_for_step(
+                step_idx, "mock", num_minibatches=0, rank=rank, world_size=world_size,
+                device=device, model=None, initial_props=initial_props, specs=MOCK_SPECS
+            )
+            viz_timeseries[step_idx] = _build_viz_stats_from_pipeline(viz_payload)
+        expected_len = NUM_CHECKPOINTS
 
-            # Save CSV per checkpoint
-            records = convert_pipeline_results_to_record_format(local_results)
-            save_analysis_results(records, step=step_idx)
-
-            # Build viz stats for this checkpoint
-            viz_payload = local_results
-            viz_stats = _build_viz_stats_from_pipeline(viz_payload)
-            create_visualization_frames(step_idx, viz_stats, gif_frames, vis_output_dir, rank)
-
-        finalize_gifs(gif_frames, vis_output_dir, rank=rank)
-        return 0
-
-    run_id = sys.argv[1]
-    testing_mode = "--testing" in sys.argv
-    force_recompute = "--force" in sys.argv
+    if not is_mock:
+        run_id = sys.argv[1]
+        testing_mode = "--testing" in sys.argv
+        force_recompute = "--force" in sys.argv
     
     # Distributed setup
-    _, rank, world_size, device, master_process = setup_distributed_training()
+    if not is_mock:
+        _, rank, world_size, device, master_process = setup_distributed_training()
     
     # Initialize global print function for training_core patch
     from empirical.research.training.training_core import _global_print0
     import empirical.research.training.training_core as training_core
     training_core._global_print0 = lambda s, console=False: print(s) if rank == 0 else None
     
-    if rank == 0:
+    if not is_mock and rank == 0:
         print(f"Starting gradient distribution analysis for run: {run_id}")
         print(f"Testing mode: {testing_mode}, Force recompute: {force_recompute}")
     
     # Find checkpoints
-    checkpoints = find_all_checkpoints(run_id)
-    if not checkpoints:
-        if rank == 0:
-            print(f"No checkpoints found for run {run_id}")
-        return 1
+    if not is_mock:
+        checkpoints = find_all_checkpoints(run_id)
+        if not checkpoints:
+            if rank == 0:
+                print(f"No checkpoints found for run {run_id}")
+            return 1
     
-    if testing_mode:
+    if not is_mock and testing_mode:
         checkpoints = checkpoints[:2]  # Only process first 2 steps
     
-    if rank == 0:
+    if not is_mock and rank == 0:
         print(f"Found {len(checkpoints)} checkpoints to process")
 
     # Clean stale per-step CSVs before processing (rank 0), then sync
-    if rank == 0:
+    if not is_mock and rank == 0:
         sv_dir = Path("research_logs/singular_values_distribution")
         if sv_dir.exists():
             for csv_file in sv_dir.glob("step_*.csv"):
                 csv_file.unlink()
-    if dist.is_initialized():
+    if not is_mock and dist.is_initialized():
         dist.barrier()
 
-    # Load finite-size Wishart tables (strict)
-    set_sv_tables_from_npz("sv_quantiles_sigma1.npz")
+    # Finite-size Wishart tables are loaded on-demand from CSVs
 
     # Build and warm up model once per process
-    model = build_compiled_model(device)
+    if not is_mock:
+        model = build_compiled_model(device)
     # Lightweight warmup for analysis - use small sequence to avoid OOM
-    args_local = Hyperparameters()
-    small_seq_len = 128
-    vocab_size = args_local.vocab_size
-    inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
-    window_size_blocks = get_window_size_blocks(0, args_local.num_iterations).to(device)
-    model(inputs.to(torch.int32), targets, window_size_blocks).backward()
-    model.zero_grad(set_to_none=True)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    precompile_svd_kernels(device, rank)
-    if dist.is_initialized():
-        dist.barrier()
-
-    # Process each checkpoint
-    gif_frames = defaultdict(list)
-    total_expected_frames = 0
-    num_minibatches = 8  # Match training configuration
-    
-    for step, checkpoint_file in checkpoints:
-        if rank == 0:
-            print(f"\nProcessing step {step}...")
-            start_time = time.time()
-        
-        # Run analysis
-        _ = load_weights_into_model(checkpoint_file, model, device)
-        records, viz_payload = compute_analysis_for_step(
-            step, checkpoint_file, num_minibatches, rank, world_size, device, model
-        )
-
-        # Ensure all ranks have flushed their CSVs before reading for visualization
+    if not is_mock:
+        args_local = Hyperparameters()
+        small_seq_len = 128
+        vocab_size = args_local.vocab_size
+        inputs = targets = torch.randint(0, vocab_size, size=(small_seq_len,), device=device)
+        window_size_blocks = get_window_size_blocks(0, args_local.num_iterations).to(device)
+        model(inputs.to(torch.int32), targets, window_size_blocks).backward()
+        model.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        precompile_svd_kernels(device, rank)
         if dist.is_initialized():
             dist.barrier()
-        if rank == 0:
-            # Build viz stats from the pipeline results (or read from CSVs inside viz)
-            viz_stats = _build_viz_stats_from_pipeline(viz_payload)
-            vis_output_dir = Path("research_logs/visualizations/noise_estimation")
-            create_visualization_frames(step, viz_stats, gif_frames, vis_output_dir, rank)
-            # Accumulate expected frames based on minibatch dimension
-            any_entry = next(iter(viz_stats.values())) if viz_stats else None
-            total_expected_frames += int(any_entry['innovation_sample'].shape[0]) if any_entry is not None else 1
+
+    # Process each checkpoint
+    if not is_mock:
+        num_minibatches = 8  # Match training configuration
+        for step, checkpoint_file in checkpoints:
+            if rank == 0:
+                print(f"\nProcessing step {step}...")
+                start_time = time.time()
+            _ = load_weights_into_model(checkpoint_file, model, device)
+            records, viz_payload = compute_analysis_for_step(
+                step, checkpoint_file, num_minibatches, rank, world_size, device, model
+            )
+            if dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                viz_timeseries[step] = _build_viz_stats_from_pipeline(viz_payload)
     
     # Create final GIFs
-    if rank == 0:
+    # Common visualization (single call for mock and real)
+    if (is_mock or (not is_mock and rank == 0)):
         print("\nCreating visualization GIFs...")
-        vis_output_dir = Path("research_logs/visualizations/noise_estimation")
-        finalize_gifs(gif_frames, vis_output_dir, rank=rank, expected_len=total_expected_frames)
+        create_visualization_frames(0, viz_timeseries, gif_frames, vis_output_dir, rank if not is_mock else 0)
+        finalize_gifs(gif_frames, vis_output_dir, rank=(rank if not is_mock else 0))
         print("Analysis complete!")
 
     # Ensure all ranks reach a common point before teardown
