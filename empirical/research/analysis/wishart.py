@@ -90,6 +90,7 @@ def precompute_quantile_table_for_shape(
     base_dir: str | Path = "wishart_cdfs",
     use_svdvals: bool = True,
     torch_compile: bool = False,
+    dtype: torch.dtype = torch.float32,
 ) -> pd.DataFrame:
     """Precompute σ=1 Wishart singular-value CDF for a given shape and save CSV.
 
@@ -121,16 +122,17 @@ def precompute_quantile_table_for_shape(
 
     def _one_batch(cur_bs: int) -> np.ndarray:
         with torch.no_grad():
-            E = torch.randn(cur_bs, p_raw, n_raw, device=device, dtype=torch.float32)
+            E = torch.randn(cur_bs, p_raw, n_raw, device=device, dtype=dtype)
             if use_svdvals:
-                s = torch.linalg.svdvals(E)  # (cur_bs, min(p_raw, n_raw))
+                X = E if E.dtype == torch.float32 else E.to(torch.float32)
+                s = torch.linalg.svdvals(X)  # (cur_bs, min(p_raw, n_raw))
             else:
                 # Fallback via Gram eigvals
                 if p_raw <= n_raw:
                     G = E @ E.transpose(-1, -2)
                 else:
                     G = E.transpose(-1, -2) @ E
-                ev = torch.linalg.eigvalsh(G)
+                ev = torch.linalg.eigvalsh(G.to(torch.float32))
                 s = torch.sqrt(torch.clamp(ev, min=0.0))
             return s.reshape(-1).to("cpu", dtype=torch.float64).numpy()
 
