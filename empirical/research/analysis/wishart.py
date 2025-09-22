@@ -88,6 +88,8 @@ def precompute_quantile_table_for_shape(
     batch_size: int | None = None,
     device: str | torch.device | None = None,
     base_dir: str | Path = "wishart_cdfs",
+    use_svdvals: bool = True,
+    torch_compile: bool = False,
 ) -> pd.DataFrame:
     """Precompute σ=1 Wishart singular-value CDF for a given shape and save CSV.
 
@@ -116,24 +118,35 @@ def precompute_quantile_table_for_shape(
     # Collect singular values across all draws in streaming batches
     num_batches = (int(draws) + batch_size - 1) // batch_size
     svals_list: list[np.ndarray] = []
+
+    def _one_batch(cur_bs: int) -> np.ndarray:
+        with torch.no_grad():
+            E = torch.randn(cur_bs, p_raw, n_raw, device=device, dtype=torch.float32)
+            if use_svdvals:
+                s = torch.linalg.svdvals(E)  # (cur_bs, min(p_raw, n_raw))
+            else:
+                # Fallback via Gram eigvals
+                if p_raw <= n_raw:
+                    G = E @ E.transpose(-1, -2)
+                else:
+                    G = E.transpose(-1, -2) @ E
+                ev = torch.linalg.eigvalsh(G)
+                s = torch.sqrt(torch.clamp(ev, min=0.0))
+            return s.reshape(-1).to("cpu", dtype=torch.float64).numpy()
+
+    run_batch = _one_batch
+    if torch_compile and hasattr(torch, "compile"):
+        try:
+            run_batch = torch.compile(_one_batch, fullgraph=False, dynamic=True)  # type: ignore[attr-defined]
+        except Exception:
+            run_batch = _one_batch
+
     for b in range(num_batches):
         cur = int(min(batch_size, draws - b * batch_size))
         if cur <= 0:
             break
-        E = torch.randn(cur, p_raw, n_raw, device=device, dtype=torch.float32)
-        # Form Gram on the smaller side based on raw dims; eigvalsh is batched and robust
-        if p_raw <= n_raw:
-            G = E @ E.transpose(-1, -2)  # (cur, p, p)
-        else:
-            G = E.transpose(-1, -2) @ E  # (cur, n, n)
-        ev = torch.linalg.eigvalsh(G)  # (cur, m)
-        ev = torch.clamp(ev, min=0.0)
-        svals = torch.sqrt(ev).reshape(-1).to("cpu", dtype=torch.float64).numpy()
+        svals = run_batch(cur)
         svals_list.append(svals)
-        # free memory early
-        del E, G, ev
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     s_all = np.concatenate(svals_list) if svals_list else np.empty(0, dtype=np.float64)
     if s_all.size == 0:
