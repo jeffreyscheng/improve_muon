@@ -376,7 +376,25 @@ def optimize_step(model, optimizers, step, args):
     
     # Create parameter mapping
     opt2params = {opt: opt_params(opt) for opt in optimizers}
-    
+    # Identify Muon optimizer and its params (Muon is second as per create_gpt_with_muon)
+    muon_opt = optimizers[1] if len(optimizers) > 1 else None
+    muon_params = opt2params.get(muon_opt, [])
+
+    # 0) Compute local normalized squared norms for Muon grads (A numerator) before any grad averaging
+    #    A = E_i[(1/N)||G_i||_F^2] is obtained via AVG all_reduce over ranks of these local values
+    if muon_opt is not None and len(muon_params) > 0:
+        a_local = torch.zeros(len(muon_params), device=torch.device("cuda"), dtype=torch.float32)
+        for idx, p in enumerate(muon_params):
+            if p.grad is not None:
+                g = p.grad.float()
+                a_local[idx] = (g.mul(g).sum() / p.numel())
+            else:
+                a_local[idx] = 0.0
+        # Average across ranks to get A
+        dist.all_reduce(a_local, op=dist.ReduceOp.AVG)
+    else:
+        a_local = None
+
     # 1. Create async all_reduce futures for each optimizer's parameters
     opt2futures = {
         opt: [dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future() for p in params]
@@ -394,11 +412,41 @@ def optimize_step(model, optimizers, step, args):
             frac = min(step / 300, 1)
             group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     
-    # 4. Wait for gradient sync, step optimizers, zero gradients
+    # 4. Wait for gradient sync
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
+
+    # 5. With averaged grads, compute B for Muon and derive sigma
+    #    B = (1/N)||Ḡ||_F^2, sigma^2 = clamp((A - B)/W, 0)
+    if muon_opt is not None and len(muon_params) > 0 and a_local is not None:
+        W = dist.get_world_size() if dist.is_initialized() else 1
+        b_vec = torch.zeros_like(a_local)
+        for idx, p in enumerate(muon_params):
+            if p.grad is not None:
+                gbar = p.grad.float()
+                b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
+            else:
+                b_vec[idx] = 0.0
+        sigma2 = torch.clamp_min(a_local - b_vec, 0.0) / max(W, 1)
+        sigma_vec = torch.sqrt(sigma2)
+    else:
+        sigma_vec = None
+
+    # 6. Step optimizers
+    for opt in optimizers:
         opt.step()
-    
+
+    # 7. Record sigma in Muon optimizer state after step initialization
+    if muon_opt is not None and len(muon_params) > 0 and sigma_vec is not None:
+        sigma_cpu = sigma_vec.detach().cpu()
+        for idx, p in enumerate(muon_params):
+            try:
+                muon_opt.state[p]["sigma"] = float(sigma_cpu[idx])
+            except Exception:
+                # Be robust to first-step initialization timing or unexpected states
+                pass
+
+    # 8. Zero gradients
     # Zero gradients
     model.zero_grad(set_to_none=True)
 

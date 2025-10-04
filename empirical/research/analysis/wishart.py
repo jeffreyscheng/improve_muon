@@ -235,6 +235,64 @@ def aspect_ratio_beta(matrix: torch.Tensor) -> float:
     return float(matrix_shape_beta(matrix.shape))
 
 
+def plot_wishart_hist_with_fit(singular_values, shape: tuple[int, int]):
+    """Plot a log-log histogram of singular values with an overlaid finite-size Wishart fit.
+
+    Parameters
+    - singular_values: array-like of nonnegative singular values
+    - shape: (p, n) matrix shape corresponding to the Wishart table to use
+
+    Behavior
+    - Fits σ via bottom-tail regression using fit_sigma_with_wishart
+    - Loads the CSV-backed CDF for the given shape
+    - Builds log-spaced bins from data and overlays the predicted density curve
+      derived from predicted bin counts (i.e., counts normalized by N*bin_width)
+
+    Returns
+    - (sigma_hat, ax): the fitted noise scale and the matplotlib Axes used
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    sv = np.asarray(singular_values, dtype=float).reshape(-1)
+    sv = sv[np.isfinite(sv) & (sv > 0)]
+    if sv.size < 8:
+        raise ValueError("Need at least 8 positive singular values to fit σ.")
+
+    # Fit σ and load CDF
+    s_tensor = torch.from_numpy(sv.astype(np.float32))
+    sigma_hat = fit_sigma_with_wishart(s_tensor, shape)
+    cdf_df = get_wishart_cdf(shape)
+
+    # Log-spaced bins
+    lo, hi = float(sv.min()), float(sv.max())
+    edges = np.geomspace(max(lo, 1e-12), hi, 60 + 1)
+
+    # Empirical density histogram (log-x equal-width bins → normalized by bin widths)
+    counts, _ = np.histogram(sv, bins=edges)
+    dens_emp = counts.astype(np.float64) / (sv.size * np.diff(edges))
+
+    # Predicted density from finite-size CDF table
+    mu = predict_counts_from_tabulated(edges, cdf_df, sigma_hat, total=sv.size)
+    dens_pred = mu.astype(np.float64) / (sv.size * np.diff(edges))
+
+    centers = np.sqrt(edges[:-1] * edges[1:])  # geometric centers for log-x
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(sv, bins=edges, density=True, alpha=0.35, label="Empirical")
+    ax.plot(centers, np.clip(dens_pred, 1e-12, None), lw=2, ls='--', color='tab:red',
+            label=f"Wishart fit (σ̂={sigma_hat:.3g})")
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel("Singular value")
+    ax.set_ylabel("Density")
+    ax.set_title("Singular Value Histogram with Wishart Fit (log–log)")
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    return float(sigma_hat), ax
+
+
 def squared_true_signal_from_quadratic_formula(
     spectrum: torch.Tensor,
     noise_sigma: float,
