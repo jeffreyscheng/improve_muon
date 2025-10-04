@@ -43,40 +43,45 @@ def is_logging_step_piecewise_log(step: int, total_steps: int) -> bool:
 
 
 def serialize_model_checkpoint(
-    model, 
-    step: int, 
-    model_args: Dict[str, Any], 
+    model,
+    _optimizer_unused,
+    other_state: Dict[str, Any],
+    run_name: str,
     checkpoint_dir: Path,
-    rank: int = 0
-) -> Path:
+):
     """
-    Serialize model checkpoint with metadata.
-    
-    Args:
-        model: PyTorch model to serialize
-        step: Training step number
-        model_args: Model configuration arguments
-        checkpoint_dir: Directory to save checkpoint
-        rank: Process rank (only rank 0 saves)
-        
-    Returns:
-        Path to saved checkpoint file
+    Callback-style model checkpoint serializer.
+
+    Expected signature for use with training.run_loggers:
+      serialize_model_checkpoint(model, optimizer, other_state, checkpoint_dir)
+
+    - model: PyTorch model to serialize
+    - optimizer: unused placeholder to match callback interface
+    - other_state: dict containing at least {'run_name': str, 'step': int}
+    - checkpoint_dir: base directory to save checkpoints (Path or str)
+
+    Writes checkpoints as {checkpoint_dir}/{run_name}/step_{step:06d}.pt on rank 0.
     """
-    if rank == 0:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_file = checkpoint_dir / f"step_{step:06d}.pt"
-        
-        checkpoint = {
-            'model': model.state_dict(),
-            'step': step,
-            'model_args': model_args,
-            'timestamp': time.time()
-        }
-        
-        torch.save(checkpoint, checkpoint_file)
-        return checkpoint_file
-    
-    return None
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return None
+
+    # Expect strict schema for other_state
+    step = int(other_state["step"])  # KeyError if missing
+    model_args = other_state["model_args"] if "model_args" in other_state else {}
+
+    run_dir = Path(checkpoint_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = run_dir / f"step_{step:06d}.pt"
+
+    checkpoint = {
+        'model': model.state_dict(),
+        'step': step,
+        'model_args': model_args,
+        'timestamp': time.time(),
+    }
+    torch.save(checkpoint, checkpoint_file)
+    return checkpoint_file
 
 
 def deserialize_model_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
@@ -223,5 +228,3 @@ def dummy_logging(
     """
     if rank == 0:
         print(f"Dummy logging at step {step} for run {run_name}")
-
-
