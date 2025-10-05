@@ -38,7 +38,7 @@ from empirical.research.analysis.model_utilities import (
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
     stable_rank_from_tensor, safe_svd,
-    compute_basis_cosine_similarity, compute_spectral_projection_coefficients_from_cosines,
+    compute_spc_from_svds,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -75,15 +75,10 @@ ANALYSIS_SPECS = [
                 ["minibatch_singular_values", "mean_singular_values"],
                 lambda mb_sv, mean_sv: torch.std(mb_sv, dim=0)),
     
-    # Spectral projection analysis
-    PropertySpec("basis_cosine_similarities", 
+    # Spectral projection analysis (with Procrustes alignment)
+    PropertySpec("spectral_projection_coefficients",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
-                lambda mb_svd, mean_svd: (
-                    compute_basis_cosine_similarity(mb_svd[0], mean_svd[0]),  # U matrices
-                    compute_basis_cosine_similarity(mb_svd[2], mean_svd[2])   # Vh matrices
-                )),
-    PropertySpec("spectral_projection_coefficients", ["basis_cosine_similarities"],
-                lambda cosines: compute_spectral_projection_coefficients_from_cosines(*cosines)),
+                compute_spc_from_svds),
     
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
@@ -402,12 +397,14 @@ def main():
     spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
-        _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
-        if rank == 0:
+        _, local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
+        # Gather layer properties from all ranks to rank 0 so we plot all layers
+        aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
+        if rank == 0 and aggregated_payload is not None:
             # Pred vs actual SPC: GPTLayerProperty mapping (ptype, layer) -> 2xN [pred; actual]
             pred_actual_gptlp: GPTLayerProperty = {}
             spc_singular_gptlp: GPTLayerProperty = {}
-            for key, props in payload.items():
+            for key, props in aggregated_payload.items():
                 pred = props['predicted_spectral_projection_coefficient'].detach().cpu().numpy().flatten()
                 actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
                 n = min(len(pred), len(actual))

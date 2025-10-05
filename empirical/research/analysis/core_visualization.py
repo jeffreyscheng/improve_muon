@@ -34,6 +34,7 @@ def create_subplot_grid(
     title: str,
     figsize: Tuple[int, int] = (20, 10),
     layout: str = "constrained",
+    num_layers: int = 16,
 ) -> plt.Figure:
     """
     Generic subplot grid creator for 6-panel visualizations.
@@ -60,10 +61,8 @@ def create_subplot_grid(
         if p_type in props_by_type:
             props_by_type[p_type][(p_type, layer_num)] = arr
 
-    def _max_layer(prop: Dict[Tuple[str, int], Any]) -> int:
-        return max(ln for (_pt, ln) in prop.keys())
-    
-    global_max_layers = max((_max_layer(prop) for prop in props_by_type.values()), default=-1) + 1
+    # Fixed layer count for coloring (GPT‑medium has 16 blocks: 0..15)
+    global_max_layers = max(1, int(num_layers))
 
     for i, param_type in enumerate(PARAM_TYPES):
         ax = axes[i]
@@ -73,10 +72,15 @@ def create_subplot_grid(
     if layout == "tight":
         plt.tight_layout()
 
-    sm = cm.ScalarMappable(cmap=viridis, norm=mcolors.Normalize(vmin=0, vmax=max(global_max_layers - 1, 1)))
+    sm = cm.ScalarMappable(cmap=viridis, norm=mcolors.Normalize(vmin=0, vmax=global_max_layers - 1))
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes, location='right', fraction=0.02, pad=0.02)
     cbar.set_label('Layer', rotation=270, labelpad=12)
+    try:
+        cbar.set_ticks(list(range(0, global_max_layers)))
+        cbar.set_ticklabels([str(i) for i in range(global_max_layers)])
+    except Exception:
+        pass
     
     plt.close(fig)
     return fig

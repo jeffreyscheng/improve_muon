@@ -80,54 +80,52 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
         return U.clone(), s.clone(), Vh.clone()
 
 
-def compute_basis_cosine_similarity(
-    batched_basis: torch.Tensor, 
-    reference_basis: torch.Tensor
+def compute_spc_from_svds(
+    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
     """
-    Compute cosine similarities between batched and reference bases.
-    
-    Args:
-        batched_basis: [B, H, K] or [B, K, W] basis vectors
-        reference_basis: [H, K] or [K, W] reference basis
-        
-    Returns:
-        Cosine similarities [B, K]
-    """
-    if batched_basis.dim() == 3 and reference_basis.dim() == 2:
-        # Compute cosine similarity for each basis vector
-        if batched_basis.shape[1] == reference_basis.shape[0]:
-            # Left singular vectors: [B, H, K] @ [H, K] -> [B, K]
-            cosines = torch.einsum('bhk,hk->bk', batched_basis, reference_basis)
-        else:
-            # Right singular vectors: [B, K, W] @ [K, W] -> [B, K]
-            cosines = torch.einsum('bkw,kw->bk', batched_basis, reference_basis)
-    else:
-        raise ValueError(f"Unsupported shapes: {batched_basis.shape}, {reference_basis.shape}")
-    
-    return torch.abs(cosines)  # Take absolute value
+    Compute spectral projection coefficients via Procrustes alignment.
 
-
-def compute_spectral_projection_coefficients_from_cosines(
-    left_cosines: torch.Tensor, 
-    right_cosines: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute spectral projection coefficients from basis cosine similarities.
-    
     Args:
-        left_cosines: [B, K] left singular vector similarities
-        right_cosines: [B, K] right singular vector similarities
-        
+        mb_svd: (U_b, S_b, Vh_b) from batched SVD of per-minibatch gradients
+                U_b: [B, H, K], S_b: [B, K], Vh_b: [B, K, W]
+        mean_svd: (U_m, S_m, Vh_m) from SVD of mean gradient
+                U_m: [H, K], S_m: [K], Vh_m: [K, W]
+
     Returns:
-        Spectral projection coefficients [B, K]
+        SPC tensor [B, K] where each entry is the product of principal
+        correlations (cosines) between aligned left/right singular subspaces.
     """
-    # Truncate to minimum rank for non-square matrices
-    min_rank = min(left_cosines.shape[-1], right_cosines.shape[-1])
-    left_truncated = left_cosines[..., :min_rank]
-    right_truncated = right_cosines[..., :min_rank]
-    
-    return left_truncated * right_truncated
+    U_b, _, Vh_b = mb_svd
+    U_m, _, Vh_m = mean_svd
+
+    # Truncate to common rank K
+    K = min(U_b.shape[-1], U_m.shape[-1], Vh_b.shape[-2], Vh_m.shape[-2])
+    U_b = U_b[..., :K]            # [B, H, K]
+    U_m = U_m[..., :K]            # [H, K]
+    Vh_b = Vh_b[..., :K, :]       # [B, K, W]
+    Vh_m = Vh_m[..., :K, :]       # [K, W]
+
+    B = U_b.shape[0]
+
+    # Left subspace alignment: C_u = U_b^T U_m  -> [B, K, K]
+    C_u = torch.einsum('bhk,hk->bkk', U_b, U_m)
+    # Right subspace alignment: C_v = V_b^T V_m -> [B, K, K]
+    V_b = Vh_b.transpose(-2, -1)          # [B, W, K]
+    V_m = Vh_m.transpose(-2, -1)          # [W, K]
+    C_v = torch.einsum('bwk,wk->bkk', V_b, V_m)
+
+    # Singular values of C_u and C_v are principal correlations (cosines)
+    sigma_u = torch.linalg.svdvals(C_u)    # [B, K]
+    sigma_v = torch.linalg.svdvals(C_v)    # [B, K]
+
+    # Sort descending and take elementwise product for SPC
+    sigma_u_sorted, _ = torch.sort(sigma_u, dim=-1, descending=True)
+    sigma_v_sorted, _ = torch.sort(sigma_v, dim=-1, descending=True)
+    Kc = min(sigma_u_sorted.shape[-1], sigma_v_sorted.shape[-1])
+    spc = sigma_u_sorted[..., :Kc] * sigma_v_sorted[..., :Kc]
+    return spc
 
 
 def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
