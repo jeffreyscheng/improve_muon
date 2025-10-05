@@ -72,7 +72,7 @@ def serialize_model_checkpoint(
 
     run_dir = Path(checkpoint_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_file = run_dir / f"step_{step:06d}.pt"
+    checkpoint_file = run_dir / f"model_step_{step:06d}.pt"
 
     # Collect per-parameter Muon sigma if available (attached by training_core.optimize_step)
     muon_sigma: Dict[str, float] = {}

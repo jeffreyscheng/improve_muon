@@ -622,12 +622,12 @@ def main():
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
-    if rank == 0:
-        frames = []
-        out_dir = Path("research_logs/visualizations/spc_pred_vs_actual"); out_dir.mkdir(parents=True, exist_ok=True)
-        for step, ckpt in checkpoints:
-            load_weights_into_model(ckpt, model, device)
-            _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model)
+    frames = []
+    out_dir = Path("research_logs/visualizations/spc_pred_vs_actual"); out_dir.mkdir(parents=True, exist_ok=True)
+    for step, ckpt in checkpoints:
+        load_weights_into_model(ckpt, model, device)
+        _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model)
+        if rank == 0:
             # Build property map: (ptype,layer)->2xN [pred; actual]
             prop_all: Dict[Tuple[str,int], Any] = {}
             for key, props in payload.items():
@@ -639,6 +639,9 @@ def main():
             frame_path = out_dir / f"pred_vs_actual_spc_{step:06d}.png"
             create_subplot_grid(PARAM_TYPES, (20,10), prop_all, _plot_pred_vs_actual, f"Predicted vs Actual SPC - Step {step}", frame_path, wants_colorbar=True)
             frames.append(str(frame_path))
+        if dist.is_initialized():
+            dist.barrier()
+    if rank == 0:
         finalize_gifs({'spc_pred_vs_actual': frames}, out_dir, gif_configs={'spc_pred_vs_actual': 'pred_vs_actual_spc.gif'}, rank=0)
     if dist.is_initialized():
         dist.destroy_process_group()
