@@ -386,6 +386,10 @@ def main():
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
+    # Skip step 0 checkpoints (many weights are zero-initialized there)
+    checkpoints = [(s, p) for (s, p) in checkpoints if s > 0]
+    if rank == 0:
+        print(f"Filtered checkpoints (skip step 0): {len(checkpoints)} found")
     # Optional testing flag: only run on first 2 checkpoints
     testing_mode = "--testing" in sys.argv
     if testing_mode:
