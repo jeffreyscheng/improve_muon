@@ -8,7 +8,7 @@ applied across model layers. By separating the "what" (property definitions) fro
 the "how" (execution), we achieve dramatically improved readability and maintainability.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id>
+    torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id> [--testing]
 """
 
 import os
@@ -225,6 +225,24 @@ def compute_analysis_for_step(
     stream_write_analysis_results(local_results, step, rank)
     local_records = {}
 
+    # Aggressive debug: on rank 0, print singular value stats per layer
+    if rank == 0:
+        try:
+            for (ptype, layer), props in list(local_results.items())[:32]:  # cap to first 32 layers for readability
+                sv = props.get('minibatch_singular_values', None)
+                if isinstance(sv, torch.Tensor):
+                    sv_cpu = sv.detach().float().cpu().reshape(-1)
+                    if sv_cpu.numel() > 0:
+                        pos = sv_cpu[sv_cpu > 0]
+                        n_pos = int(pos.numel())
+                        n = int(sv_cpu.numel())
+                        sv_min = float(torch.min(sv_cpu).item())
+                        sv_max = float(torch.max(sv_cpu).item())
+                        frac_pos = (n_pos / n) if n > 0 else 0.0
+                        print(f"[rank0] SV stats {ptype} L{layer}: n={n} pos={n_pos} ({frac_pos:.2%}) min={sv_min:.3e} max={sv_max:.3e}")
+        except Exception:
+            pass
+
     if dist.is_initialized():
         dist.barrier()
 
@@ -368,6 +386,12 @@ def main():
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
+    # Optional testing flag: only run on first 2 checkpoints
+    testing_mode = "--testing" in sys.argv
+    if testing_mode:
+        checkpoints = checkpoints[:2]
+        if rank == 0:
+            print(f"Testing mode enabled: processing {len(checkpoints)} checkpoints")
     # Collect time series for two GIFs (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}

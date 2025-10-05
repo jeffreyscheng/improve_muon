@@ -218,8 +218,10 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     # Storage for per-minibatch gradients
     per_minibatch_grads = {}
     
+    # Original behavior: eval mode outside; enable grads only for forward/backward block
     model.eval()  # Set to eval mode for consistent analysis
-    
+    rank_str = f"[rank{rank}]"
+    print(f"{rank_str} accumulate {num_minibatches} minibatches for gradient analysis")
     with torch.no_grad():
         for minibatch_idx in range(num_minibatches):
             try:
@@ -232,19 +234,12 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
             # Zero gradients
             model.zero_grad()
             
-            # Forward pass
+            # Forward pass with grads enabled in a tight scope
             with torch.enable_grad():
-                model.train()  # Brief switch to train mode for gradient computation
-                
-                # Get sliding window blocks for this step
+                model.train()  # Briefly switch to train for grad computation
                 window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(inputs.device)
-                
-                # Call model with all required arguments
                 loss = model(inputs.to(torch.int32), targets, window_size_blocks)
-                
-                # Backward pass
                 loss.backward()
-                
                 model.eval()  # Back to eval mode
             
             # Collect gradients for this minibatch
@@ -290,5 +285,20 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     for key, grad_list in per_minibatch_grads.items():
         if grad_list:
             result[key] = torch.stack(grad_list, dim=0)  # Shape: [num_minibatches, ...]
-    
+
+    # Debug summary: print a few stats to help diagnose zero/NaN gradients
+    try:
+        total_layers = len(per_minibatch_grads)
+        sample_keys = list(per_minibatch_grads.keys())[:min(5, total_layers)]
+        print(f"{rank_str} collected gradients for {total_layers} layers; sample stats:")
+        for k in sample_keys:
+            g = per_minibatch_grads[k][-1]
+            finite = torch.isfinite(g)
+            frac_finite = float(finite.float().mean().item())
+            gmin = float(torch.nan_to_num(g).min().item()) if g.numel() else 0.0
+            gmax = float(torch.nan_to_num(g).max().item()) if g.numel() else 0.0
+            print(f"{rank_str}  {k}: shape={tuple(g.shape)} finite={frac_finite:.3f} min={gmin:.3e} max={gmax:.3e}")
+    except Exception:
+        pass
+
     return result
