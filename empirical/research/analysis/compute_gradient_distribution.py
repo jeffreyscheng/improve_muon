@@ -165,8 +165,9 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank == 0:
         print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
-    checkpoint_data = torch.load(checkpoint_file, map_location=device)
-    state_dict = checkpoint_data['model_state_dict']
+    # Use the unified deserializer; schema expects 'model'
+    checkpoint_data = deserialize_model_checkpoint(Path(checkpoint_file))
+    state_dict = checkpoint_data['model']
 
     # If compiling wrapped the module, load into the original module
     target = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -181,7 +182,7 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
     if dist.is_initialized():
         for param in target.parameters():
             dist.broadcast(param.detach(), 0)
-    return checkpoint_data.get('step', 0)
+    return int(checkpoint_data['step'])
 
 
 def compute_analysis_for_step(
