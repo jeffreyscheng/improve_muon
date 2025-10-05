@@ -623,7 +623,10 @@ def main():
     model = build_compiled_model(device)
     checkpoints = find_all_checkpoints(run_id)
     frames = []
-    out_dir = Path("research_logs/visualizations/spc_pred_vs_actual"); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(f"research_logs/visualizations/{run_id}"); out_dir.mkdir(parents=True, exist_ok=True)
+    # Accumulate SPC-vs-Singular visualization stats across steps (rank 0 only)
+    viz_timeseries: Dict[int, Dict[Tuple[str, int], Dict[str, Any]]] = {}
+    gif_frames = {'spc_singular': []}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model)
@@ -639,10 +642,18 @@ def main():
             frame_path = out_dir / f"pred_vs_actual_spc_{step:06d}.png"
             create_subplot_grid(PARAM_TYPES, (20,10), prop_all, _plot_pred_vs_actual, f"Predicted vs Actual SPC - Step {step}", frame_path, wants_colorbar=True)
             frames.append(str(frame_path))
+            # Build viz stats for spc_vs_singular gif (SPC vs singular value)
+            viz_timeseries[step] = _build_viz_stats_from_pipeline(payload)
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
+        # Finalize predicted vs actual SPC gif under run folder
         finalize_gifs({'spc_pred_vs_actual': frames}, out_dir, gif_configs={'spc_pred_vs_actual': 'pred_vs_actual_spc.gif'}, rank=0)
+        # Render and finalize SPC vs Singular Values gif under run folder
+        from empirical.research.analysis.core_visualization import create_visualization_frames
+        create_visualization_frames(0, viz_timeseries, gif_frames, out_dir, rank=0, frame_types=['spc_singular'])
+        from empirical.research.analysis.core_visualization import finalize_gifs as finalize_gifs2
+        finalize_gifs2(gif_frames, out_dir, rank=0)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
