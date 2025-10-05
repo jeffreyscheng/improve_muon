@@ -45,7 +45,7 @@ def build_sigma_time_series(checkpoint_root: Path) -> GPTLayerProperty:
     # We'll discover keys as we parse the first checkpoint.
 
     for idx, ckpt_path in enumerate(ckpts):
-        data = torch.load(ckpt_path, map_location='cpu')
+        data = deserialize_model_checkpoint(ckpt_path)
         step = int(data['step'])
         sigma_map: Dict[str, float] = data['muon_sigma']
 
