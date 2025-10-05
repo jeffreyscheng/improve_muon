@@ -16,7 +16,7 @@ model, optimizers, train_loader = create_gpt_with_muon(
 )
 
 # Configure explicit checkpoint directory and run name
-checkpoint_dir = Path("research_logs")
+checkpoint_dir = Path("research_logs/checkpoints")
 run_name = f"medium_{date.today().strftime('%Y%m%d')}"
 loggers = [partial(serialize_model_checkpoint, run_name=run_name, checkpoint_dir=checkpoint_dir)]
 
