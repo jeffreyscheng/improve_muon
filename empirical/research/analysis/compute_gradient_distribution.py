@@ -146,6 +146,7 @@ def compute_analysis_for_step(
     *,
     initial_props: GPTLayerProperty | None = None,
     specs: list[PropertySpec] | None = None,
+    run_id: str | None = None,
 ) -> GPTLayerProperty:
     """Core analysis function - clean and focused."""
     
@@ -222,7 +223,7 @@ def compute_analysis_for_step(
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
 
     # Stream results to per-rank CSV to avoid large in-memory payloads
-    stream_write_analysis_results(local_results, step, rank)
+    stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
     local_records = {}
 
     # Aggressive debug: on rank 0, print singular value stats per layer
@@ -257,8 +258,8 @@ def compute_analysis_for_step(
 
 
 
-def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank: int):
-    base_dir = Path("research_logs/singular_values_distribution")
+def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank: int, run_id: str):
+    base_dir = Path(f"research_logs/per_layer_statistics/{run_id}")
     if dist.is_initialized():
         (rank == 0) and base_dir.mkdir(parents=True, exist_ok=True)
         dist.barrier()
@@ -401,7 +402,7 @@ def main():
     spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
-        _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model)
+        _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
         if rank == 0:
             # Pred vs actual SPC: GPTLayerProperty mapping (ptype, layer) -> 2xN [pred; actual]
             pred_actual_gptlp: GPTLayerProperty = {}
