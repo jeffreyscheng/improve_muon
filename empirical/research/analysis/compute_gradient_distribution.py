@@ -358,7 +358,11 @@ def save_analysis_results(results: Dict[Tuple[str, int], Dict[str, Any]], step: 
 
 def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank: int):
     base_dir = Path("research_logs/singular_values_distribution")
-    base_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        (rank == 0) and base_dir.mkdir(parents=True, exist_ok=True)
+        dist.barrier()
+    else:
+        base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
 
     fieldnames = [
