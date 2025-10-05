@@ -46,15 +46,15 @@ def create_gif_from_frames(frame_paths: List[str], gif_path: Path, fps: int = 12
 
 
 def create_subplot_grid(
-    param_types: List[str], 
+    param_types: List[str],
     figsize: Tuple[int, int],
-    get_data_fn: Callable[[str], List[Tuple[int, Dict]]],
-    plot_fn: Callable,
+    get_data_fn: Callable[[str], Dict[Tuple[str, int], Any]],
+    plot_fn: Callable[[plt.Axes, Dict[Tuple[str, int], Any], str, mcolors.Colormap, int], List[Any]],
     title: str,
     output_path: Path,
     layout: str = "constrained",
     wants_colorbar: bool = False,
-):
+) -> plt.Figure:
     """
     Generic subplot grid creator for 6-panel visualizations.
     
@@ -77,13 +77,20 @@ def create_subplot_grid(
     viridis = plt.cm.viridis
 
     # Precompute global max layer index for consistent colorbar mapping
-    layer_lists = {pt: get_data_fn(pt) for pt in param_types}
-    global_max_layers = max((max([ln for ln, _ in lst], default=-1) for lst in layer_lists.values()), default=-1) + 1
+    props_by_type = {pt: get_data_fn(pt) for pt in param_types}
+    def _max_layer(prop: Dict[Tuple[str, int], Any]) -> int:
+        if not prop:
+            return -1
+        try:
+            return max(ln for (_pt, ln) in prop.keys())
+        except ValueError:
+            return -1
+    global_max_layers = max((_max_layer(prop) for prop in props_by_type.values()), default=-1) + 1
 
     for i, param_type in enumerate(param_types):
         ax = axes[i]
-        layer_data_list = layer_lists[param_type]
-        plot_fn(ax, param_type, layer_data_list, viridis, global_max_layers)
+        prop = props_by_type[param_type]
+        plot_fn(ax, prop, param_type, viridis, global_max_layers)
     
     if layout == "tight":
         plt.tight_layout()
@@ -96,7 +103,8 @@ def create_subplot_grid(
         cbar.set_label('Layer', rotation=270, labelpad=12)
     
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    plt.close(fig)
+    return fig
 
 
 def setup_log_scale_axis(ax, xlabel: str = "singular value s (log scale)", ylabel: str = "density"):
@@ -111,26 +119,21 @@ def setup_log_scale_axis(ax, xlabel: str = "singular value s (log scale)", ylabe
     ax.xaxis.set_major_formatter(LogFormatterMathtext())
 
 
-def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_layers: int):
+def plot_bulk_vs_spike(ax, prop: Dict[Tuple[str, int], Any], param_type: str, viridis, max_layers: int) -> List[Any]:
     """Plot bulk vs spike estimation with MP density overlay."""
     ax.set_title(f'{param_type}')
     setup_log_scale_axis(ax)
     ax.set_yscale('log')
 
-    # Collect singular values from layers (opinionated: requires innovation_sample, beta, sigma_hat)
-    samples, betas, sigmas = [], [], []
-    for _, data in layer_data_list:
-        assert 'innovation_sample' in data, "innovation_sample missing in viz_stats"
-        assert 'beta' in data, "beta missing in viz_stats"
-        assert 'sigma_hat' in data, "sigma_hat missing in viz_stats"
-        s = np.asarray(data['innovation_sample'], dtype=float)
+    # Collect singular values from layers: prop maps (param_type, layer)->1D array
+    artists: List[Any] = []
+    samples = []
+    for (_pt, _ln), arr in sorted(prop.items(), key=lambda x: x[0][1]):
+        s = np.asarray(arr, dtype=float)
         if s.size:
-            # Only positive for log scale
-            s = s[s > 0]
+            s = s[np.isfinite(s) & (s > 0)]
             if s.size:
                 samples.append(np.ascontiguousarray(s))
-                betas.append(float(data['beta']))
-                sigmas.append(float(data['sigma_hat']))
     
     if not samples:
         ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center')
@@ -140,8 +143,9 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     if all_innov.size == 0:
         return
         
-    beta = float(np.median(np.asarray(betas))) if betas else 1.0
-    sigma_hat = float(np.median(np.asarray(sigmas))) if sigmas else 1e-8
+    # Overlay parameters (beta, sigma_hat, shape) are set via closure attributes
+    beta = float(getattr(plot_bulk_vs_spike, "_beta", 1.0))
+    sigma_hat = float(getattr(plot_bulk_vs_spike, "_sigma_hat", 1e-8))
     edge = sigma_hat * (1.0 + np.sqrt(max(beta, 0.0)))
 
     # Log-safe binning
@@ -153,14 +157,12 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     bins = np.geomspace(x_min, x_max, 60)
     counts_emp, _ = np.histogram(all_innov, bins=bins)
     dens_emp = counts_emp.astype(np.float64) / (len(all_innov) * np.diff(bins))
-    ax.hist(all_innov, bins=bins, density=True, alpha=0.35, label="Empirical spectrum")
+    h = ax.hist(all_innov, bins=bins, density=True, alpha=0.35, label="Empirical spectrum")
+    artists.append(h[2])
 
     # Finite-size Wishart overlay (expected counts as density curve) — requires shape in viz_stats
-    if not layer_data_list:
-        return
-    first_data = layer_data_list[0][1]
-    assert 'shape' in first_data, f"shape missing in viz_stats for {param_type}"
-    p, n = map(int, first_data['shape'])
+    shape = getattr(plot_bulk_vs_spike, "_shape", (1, 1))
+    p, n = map(int, shape)
     cdf_df = get_wishart_cdf((p, n))
     counts, _ = np.histogram(all_innov, bins=bins)
     mu = predict_counts_from_tabulated(bins, cdf_df, sigma_hat, total=len(all_innov))
@@ -168,9 +170,11 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
     density_pred = mu.astype(np.float64) / (len(all_innov) * np.diff(bins))
     # Clip to log-safe minimum so the line is visible on log-y
     density_pred = np.clip(density_pred, 1e-8, None)
-    ax.plot(centers, density_pred, ls='--', lw=2, color='tab:orange', label=f"Wishart FS (σ̂={sigma_hat:.3g})")
+    line_overlay, = ax.plot(centers, density_pred, ls='--', lw=2, color='tab:orange', label=f"Wishart FS (σ̂={sigma_hat:.3g})")
+    artists.append(line_overlay)
     # Edge line
-    ax.axvline(edge, color='k', lw=1.0, ls=':', label='τ̂')
+    vline = ax.axvline(edge, color='k', lw=1.0, ls=':', label='τ̂')
+    artists.append(vline)
 
     # Metrics: KS distance and mass above edge
     s_sorted = np.sort(all_innov)
@@ -182,10 +186,12 @@ def plot_bulk_vs_spike(ax, param_type: str, layer_data_list: List, viridis, max_
            f"KS={ks:.3f}\nP(s>τ̂)={mass_above:.1%}")
     ax.text(0.02, 0.98, txt, transform=ax.transAxes, va='top', ha='left', fontsize=8,
             bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, lw=0.0))
-    ax.legend(loc='upper right', fontsize=8, frameon=False)
+    leg = ax.legend(loc='upper right', fontsize=8, frameon=False)
+    artists.append(leg)
+    return artists
 
 
-def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viridis, max_layers: int):
+def plot_spc_vs_singular_values(ax, prop: Dict[Tuple[str, int], Any], param_type: str, viridis, max_layers: int) -> List[Any]:
     """Plot spectral projection coefficients vs singular values."""
     ax.set_title(f'{param_type}')
     ax.set_xlabel('Singular value (log scale)')
@@ -196,13 +202,16 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
     
     denom = max(1, max_layers - 1)
     x_min, x_max = np.inf, 0.0
-    for layer_num, data in layer_data_list:
-        if 'per_minibatch_singular_values' not in data or 'spectral_projection_coefficients' not in data:
+    artists: List[Any] = []
+    for (_pt, layer_num), arr in sorted(prop.items(), key=lambda x: x[0][1]):
+        a = np.asarray(arr)
+        if a.ndim != 2 or (a.shape[0] != 2 and a.shape[1] != 2):
             continue
-            
+        if a.shape[0] == 2:
+            sv, spc = a[0], a[1]
+        else:
+            sv, spc = a[:, 0], a[:, 1]
         color = viridis(layer_num / denom)
-        sv = np.asarray(data['per_minibatch_singular_values'])
-        spc = np.asarray(data['spectral_projection_coefficients'])
         
         if sv.size > 0 and spc.size > 0:
             # Flatten if needed and plot
@@ -215,7 +224,8 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
                 sv_flat = sv_flat[indices]
                 spc_flat = spc_flat[indices]
             
-            ax.scatter(sv_flat, spc_flat, alpha=0.05, s=12, c=[color])
+            sc = ax.scatter(sv_flat, spc_flat, alpha=0.05, s=12, c=[color])
+            artists.append(sc)
             # Track x-range for curves
             pos = sv_flat[sv_flat > 0]
             if pos.size:
@@ -227,13 +237,14 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
         xs = np.geomspace(max(x_min, 1e-8), x_max, 256)
         # Newton–Schulz quintic in black (required)
         y_ns = newton_schulz_quintic_function(xs)
-        ax.plot(xs, y_ns, color='black', lw=1.5, label='Newton–Schulz quintic')
+        lns, = ax.plot(xs, y_ns, color='black', lw=1.5, label='Newton–Schulz quintic')
+        artists.append(lns)
         # Predicted SPC per layer using sigma_hat and beta (calls math util with piecewise rule)
-        for layer_num, data in layer_data_list:
-            if 'sigma_hat' not in data or 'beta' not in data:
+        sigma_beta_map = getattr(plot_spc_vs_singular_values, "_sigma_beta_map", {})
+        for (_pt, layer_num) in sorted(prop.keys(), key=lambda x: x[1]):
+            if layer_num not in sigma_beta_map:
                 continue
-            sigma = float(data['sigma_hat'])
-            beta = float(data['beta'])
+            sigma, beta = sigma_beta_map[layer_num]
             if sigma <= 0:
                 continue
             y2 = (xs / max(sigma, 1e-30))**2
@@ -242,7 +253,9 @@ def plot_spc_vs_singular_values(ax, param_type: str, layer_data_list: List, viri
             t = 0.5 * (-Bcoef + np.sqrt(disc))
             pred = predict_spectral_projection_coefficient_from_squared_true_signal(t, beta)
             color = viridis(layer_num / denom)
-            ax.plot(xs, pred, color=color, lw=1.0)
+            lp, = ax.plot(xs, pred, color=color, lw=1.0)
+            artists.append(lp)
+    return artists
 
 
 ## removed residual panel per user request
@@ -335,45 +348,95 @@ def create_visualization_frames(
             dens = counts.astype(np.float64) / (len(all_s) * np.diff(bins))
             bulk_ymax[param_type] = float(dens.max() * 1.1 if dens.size else 1.0)
 
-    def _wrap_bulk(base_plot_fn):
-        def _wrapped(ax, param_type, layer_data_list, viridis, max_layers):
-            base_plot_fn(ax, param_type, layer_data_list, viridis, max_layers)
-            if param_type in bulk_axis_ranges:
-                lo, hi = bulk_axis_ranges[param_type]
-                lo = max(float(lo), 1e-8)
-                if hi > lo:
-                    ax.set_xlim(lo, float(hi))
-            if param_type in bulk_ymax:
-                ax.set_ylim(1e-8, bulk_ymax[param_type])
-        return _wrapped
+    def _bulk_plot_with_ranges(ax, prop, param_type, viridis, max_layers):
+        # Axis range/cache via outer scope
+        artists = plot_bulk_vs_spike(ax, prop, param_type, viridis, max_layers)
+        if param_type in bulk_axis_ranges:
+            lo, hi = bulk_axis_ranges[param_type]
+            lo = max(float(lo), 1e-8)
+            if hi > lo:
+                ax.set_xlim(lo, float(hi))
+        if param_type in bulk_ymax:
+            ax.set_ylim(1e-8, bulk_ymax[param_type])
+        return artists
 
-    def _wrap_spc(base_plot_fn):
-        def _wrapped(ax, param_type, layer_data_list, viridis, max_layers):
-            base_plot_fn(ax, param_type, layer_data_list, viridis, max_layers)
-            rng = spc_axis_ranges.get(param_type)
-            if rng and 'x' in rng:
-                lo, hi = rng['x']
-                lo = max(float(lo), 1e-8)
-                if hi > lo:
-                    ax.set_xlim(lo, float(hi))
-        return _wrapped
+    def _spc_plot_with_ranges(ax, prop, param_type, viridis, max_layers):
+        artists = plot_spc_vs_singular_values(ax, prop, param_type, viridis, max_layers)
+        rng = spc_axis_ranges.get(param_type)
+        if rng and 'x' in rng:
+            lo, hi = rng['x']
+            lo = max(float(lo), 1e-8)
+            if hi > lo:
+                ax.set_xlim(lo, float(hi))
+        return artists
 
     def render_one_step(step_num: int, per_step_stats: Dict[Tuple[str, int], Dict[str, Any]]):
-        def get_layer_data_for_param_type(param_type: str):
-            items = []
+        # Build metadata for overlays
+        bulk_meta: Dict[str, Tuple[float, float, Tuple[int, int]]] = {}
+        for param_type in PARAM_TYPES:
+            betas, sigmas, shape = [], [], None
+            for (p_type, _), d in per_step_stats.items():
+                if p_type == param_type:
+                    if 'beta' in d:
+                        betas.append(float(d['beta']))
+                    if 'sigma_hat' in d:
+                        sigmas.append(float(d['sigma_hat']))
+                    if shape is None and 'shape' in d:
+                        shp = d['shape']
+                        shape = (int(shp[0]), int(shp[1]))
+            if betas or sigmas or shape:
+                beta_med = float(np.median(np.asarray(betas))) if betas else 1.0
+                sigma_med = float(np.median(np.asarray(sigmas))) if sigmas else 1e-8
+                bulk_meta[param_type] = (beta_med, sigma_med, shape or (1, 1))
+
+        # Attach overlay params to plot functions via attributes
+        def make_bulk_plot_fn_for_param(param_type: str):
+            beta, sigma_med, shape = bulk_meta.get(param_type, (1.0, 1e-8, (1, 1)))
+            # Set attributes read inside plot_bulk_vs_spike
+            setattr(plot_bulk_vs_spike, "_beta", beta)
+            setattr(plot_bulk_vs_spike, "_sigma_hat", sigma_med)
+            setattr(plot_bulk_vs_spike, "_shape", shape)
+            return _bulk_plot_with_ranges
+
+        # Build sigma/beta per-layer mapping for SPC overlay
+        sigma_beta_map: Dict[int, Tuple[float, float]] = {}
+        for (p_type, layer_num), d in per_step_stats.items():
+            if 'sigma_hat' in d and 'beta' in d:
+                sigma_beta_map[layer_num] = (float(d['sigma_hat']), float(d['beta']))
+        setattr(plot_spc_vs_singular_values, "_sigma_beta_map", sigma_beta_map)
+
+        def get_bulk_property(param_type: str) -> Dict[Tuple[str, int], Any]:
+            # Return GPTLayerProperty mapping (param_type, layer)->1D innovation samples
+            prop: Dict[Tuple[str, int], Any] = {}
             for (p_type, layer_num), d in per_step_stats.items():
-                if p_type == param_type and layer_num >= 0:
-                    items.append((layer_num, d))
-            return sorted(items, key=lambda x: x[0])
+                if p_type == param_type and 'innovation_sample' in d:
+                    s = np.asarray(d['innovation_sample'], dtype=float)
+                    s = s[np.isfinite(s) & (s > 0)]
+                    prop[(param_type, layer_num)] = s
+            return prop
+
+        def get_spc_property(param_type: str) -> Dict[Tuple[str, int], Any]:
+            # Return GPTLayerProperty mapping (param_type, layer)->2xN array [sv; spc]
+            prop: Dict[Tuple[str, int], Any] = {}
+            for (p_type, layer_num), d in per_step_stats.items():
+                if p_type == param_type and 'per_minibatch_singular_values' in d and 'spectral_projection_coefficients' in d:
+                    sv = np.asarray(d['per_minibatch_singular_values'], dtype=float).flatten()
+                    spc = np.asarray(d['spectral_projection_coefficients'], dtype=float).flatten()
+                    n = min(len(sv), len(spc))
+                    if n > 0:
+                        prop[(param_type, layer_num)] = np.vstack([sv[:n], spc[:n]])
+            return prop
 
         frame_configs = {
             'bulk_spike': {
-                'plot_fn': _wrap_bulk(plot_bulk_vs_spike),
+                'get_data_fn': get_bulk_property,
+                'plot_fn_factory': make_bulk_plot_fn_for_param,
                 'title': f'Bulk vs Spike Estimation - Step {step_num}',
                 'filename': f"bulk_spike_{step_num:06d}.png"
             },
             'spc_singular': {
-                'plot_fn': _wrap_spc(plot_spc_vs_singular_values),
+                'get_data_fn': get_spc_property,
+                'plot_fn_factory': lambda _pt: _spc_plot_with_ranges,
                 'title': f'SPC vs Singular Values - Step {step_num}',
                 'filename': f"spc_singular_{step_num:06d}.png"
             }
@@ -381,10 +444,15 @@ def create_visualization_frames(
 
         for frame_type, config in frame_configs.items():
             frame_path = frames_dir / config['filename']
+            def _get_data_for_param(pt: str):
+                return config['get_data_fn'](pt)
+            def _plot_fn(ax, prop, pt, viridis, max_layers):
+                plotter = config['plot_fn_factory'](pt)
+                return plotter(ax, prop, pt, viridis, max_layers)
             create_subplot_grid(
                 PARAM_TYPES, (20, 10),
-                get_layer_data_for_param_type,
-                config['plot_fn'],
+                _get_data_for_param,
+                _plot_fn,
                 config['title'],
                 frame_path,
                 wants_colorbar=(frame_type == 'spc_singular')
