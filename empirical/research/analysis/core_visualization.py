@@ -48,7 +48,7 @@ def create_gif_from_frames(frame_paths: List[str], gif_path: Path, fps: int = 12
 def create_subplot_grid(
     param_types: List[str],
     figsize: Tuple[int, int],
-    get_data_fn: Callable[[str], Dict[Tuple[str, int], Any]],
+    property_map: Dict[Tuple[str, int], Any],  # GPTLayerProperty for all panels
     plot_fn: Callable[[plt.Axes, Dict[Tuple[str, int], Any], str, mcolors.Colormap, int], List[Any]],
     title: str,
     output_path: Path,
@@ -77,7 +77,10 @@ def create_subplot_grid(
     viridis = plt.cm.viridis
 
     # Precompute global max layer index for consistent colorbar mapping
-    props_by_type = {pt: get_data_fn(pt) for pt in param_types}
+    props_by_type: Dict[str, Dict[Tuple[str, int], Any]] = {pt: {} for pt in param_types}
+    for (p_type, layer_num), arr in property_map.items():
+        if p_type in props_by_type:
+            props_by_type[p_type][(p_type, layer_num)] = arr
     def _max_layer(prop: Dict[Tuple[str, int], Any]) -> int:
         if not prop:
             return -1
@@ -444,14 +447,16 @@ def create_visualization_frames(
 
         for frame_type, config in frame_configs.items():
             frame_path = frames_dir / config['filename']
-            def _get_data_for_param(pt: str):
-                return config['get_data_fn'](pt)
+            # Build a single GPTLayerProperty covering all param types for this frame
+            prop_all: Dict[Tuple[str, int], Any] = {}
+            for pt in PARAM_TYPES:
+                prop_all.update(config['get_data_fn'](pt))
             def _plot_fn(ax, prop, pt, viridis, max_layers):
                 plotter = config['plot_fn_factory'](pt)
                 return plotter(ax, prop, pt, viridis, max_layers)
             create_subplot_grid(
                 PARAM_TYPES, (20, 10),
-                _get_data_for_param,
+                prop_all,
                 _plot_fn,
                 config['title'],
                 frame_path,
