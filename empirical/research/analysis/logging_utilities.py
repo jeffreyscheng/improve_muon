@@ -74,11 +74,21 @@ def serialize_model_checkpoint(
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = run_dir / f"step_{step:06d}.pt"
 
+    # Collect per-parameter Muon sigma if available (attached by training_core.optimize_step)
+    muon_sigma: Dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if hasattr(param, "_muon_sigma"):
+            try:
+                muon_sigma[name] = float(getattr(param, "_muon_sigma"))
+            except Exception:
+                pass
+
     checkpoint = {
         'model': model.state_dict(),
         'step': step,
         'model_args': model_args,
         'timestamp': time.time(),
+        'muon_sigma': muon_sigma,
     }
     torch.save(checkpoint, checkpoint_file)
     return checkpoint_file

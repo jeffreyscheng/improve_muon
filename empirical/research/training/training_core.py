@@ -442,6 +442,8 @@ def optimize_step(model, optimizers, step, args):
         for idx, p in enumerate(muon_params):
             try:
                 muon_opt.state[p]["sigma"] = float(sigma_cpu[idx])
+                # Also attach as a lightweight attribute on the Parameter for logging/serialization
+                setattr(p, "_muon_sigma", float(sigma_cpu[idx]))
             except Exception:
                 # Be robust to first-step initialization timing or unexpected states
                 pass
