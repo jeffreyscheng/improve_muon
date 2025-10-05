@@ -109,12 +109,12 @@ def compute_spc_from_svds(
 
     B = U_b.shape[0]
 
-    # Left subspace alignment: C_u = U_b^T U_m  -> [B, K, K]
-    C_u = torch.einsum('bhk,hk->bkk', U_b, U_m)
-    # Right subspace alignment: C_v = V_b^T V_m -> [B, K, K]
-    V_b = Vh_b.transpose(-2, -1)          # [B, W, K]
-    V_m = Vh_m.transpose(-2, -1)          # [W, K]
-    C_v = torch.einsum('bwk,wk->bkk', V_b, V_m)
+    # Left subspace alignment: C_u = U_b^T @ U_m  -> [B, K, K]
+    C_u = U_b.transpose(-2, -1) @ U_m      # [B, K, H] @ [H, K] -> [B, K, K]
+    # Right subspace alignment: C_v = V_b^T @ V_m -> [B, K, K]
+    V_b = Vh_b.transpose(-2, -1)           # [B, W, K]
+    V_m = Vh_m.transpose(-2, -1)           # [W, K]
+    C_v = V_b.transpose(-2, -1) @ V_m      # ([B, K, W] @ [W, K]) -> [B, K, K]
 
     # Singular values of C_u and C_v are principal correlations (cosines)
     sigma_u = torch.linalg.svdvals(C_u)    # [B, K]
