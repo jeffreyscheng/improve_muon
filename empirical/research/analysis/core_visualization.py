@@ -198,9 +198,10 @@ def plot_spc_vs_singular_values(ax, prop: Dict[Tuple[str, int], Any], param_type
     """Plot spectral projection coefficients vs singular values."""
     ax.set_title(f'{param_type}')
     ax.set_xlabel('Singular value (log scale)')
-    ax.set_ylabel('Spectral projection coefficient')
+    ax.set_ylabel('Spectral projection coefficient (log scale)')
     ax.set_xscale('log')
-    ax.set_ylim(-0.05, 1.05)
+    ax.set_yscale('log')
+    ax.set_ylim(1e-8, 1.05)
     ax.grid(True, alpha=0.3)
     
     denom = max(1, max_layers - 1)
@@ -220,6 +221,7 @@ def plot_spc_vs_singular_values(ax, prop: Dict[Tuple[str, int], Any], param_type
             # Flatten if needed and plot
             sv_flat = sv.flatten()
             spc_flat = spc.flatten()
+            spc_flat = np.clip(spc_flat, 1e-8, 1.0)
             
             # Subsample for visualization if too many points
             if len(sv_flat) > 1000:
@@ -240,6 +242,7 @@ def plot_spc_vs_singular_values(ax, prop: Dict[Tuple[str, int], Any], param_type
         xs = np.geomspace(max(x_min, 1e-8), x_max, 256)
         # Newton–Schulz quintic in black (required)
         y_ns = newton_schulz_quintic_function(xs)
+        y_ns = np.clip(y_ns, 1e-8, 1.0)
         lns, = ax.plot(xs, y_ns, color='black', lw=1.5, label='Newton–Schulz quintic')
         artists.append(lns)
         # Predicted SPC per layer using sigma_hat and beta (calls math util with piecewise rule)
@@ -255,6 +258,7 @@ def plot_spc_vs_singular_values(ax, prop: Dict[Tuple[str, int], Any], param_type
             disc = np.clip(Bcoef*Bcoef - 4.0*beta, 0.0, None)
             t = 0.5 * (-Bcoef + np.sqrt(disc))
             pred = predict_spectral_projection_coefficient_from_squared_true_signal(t, beta)
+            pred = np.clip(pred, 1e-8, 1.0)
             color = viridis(layer_num / denom)
             lp, = ax.plot(xs, pred, color=color, lw=1.0)
             artists.append(lp)
@@ -272,7 +276,8 @@ def create_visualization_frames(
     viz_stats: Dict[Tuple[str, int], Dict[str, Any]] | Dict[int, Dict[Tuple[str, int], Dict[str, Any]]],
     gif_frames: Dict[str, List[str]],
     output_dir: Path,
-    rank: int = 0
+    rank: int = 0,
+    frame_types: Optional[List[str]] = None,
 ):
     """
     Create visualization frames.
@@ -444,6 +449,8 @@ def create_visualization_frames(
                 'filename': f"spc_singular_{step_num:06d}.png"
             }
         }
+        if frame_types is not None:
+            frame_configs = {k: v for k, v in frame_configs.items() if k in frame_types}
 
         for frame_type, config in frame_configs.items():
             frame_path = frames_dir / config['filename']

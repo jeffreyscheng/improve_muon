@@ -101,7 +101,8 @@ class PropertyPipeline:
         # These are the "root" properties provided by the caller
         external_props = {
             "checkpoint_weights",
-            "per_minibatch_gradient"
+            "per_minibatch_gradient",
+            "noise_sigma",  # provided from serialized checkpoints, not computed here
         }
         return prop_name in external_props
     

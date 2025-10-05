@@ -53,13 +53,11 @@ from empirical.research.analysis.core_visualization import (
     create_visualization_frames, finalize_gifs
 )
 from empirical.research.analysis.wishart import (
-    fit_sigma_with_wishart,
     aspect_ratio_beta as wishart_aspect_ratio_beta,
     squared_true_signal_from_quadratic_formula,
     predict_spectral_projection_coefficient_from_squared_true_signal,
-    precompute_quantile_table_for_shape,
-    wishart_cdf_path_for_shape,
 )
+from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, categorize_parameter
 
 
 ANALYSIS_SPECS = [
@@ -96,12 +94,7 @@ ANALYSIS_SPECS = [
     PropertySpec("spectral_projection_coefficients", ["basis_cosine_similarities"],
                 lambda cosines: compute_spectral_projection_coefficients_from_cosines(*cosines)),
     
-    PropertySpec("innovation_spectrum", ["per_minibatch_gradient", "mean_gradient"],
-                compute_innovation_spectrum),
-
-    # Strict Wishart-based estimates
-    PropertySpec("noise_sigma", ["minibatch_singular_values", "checkpoint_weights"],
-                lambda sv, w: float(fit_sigma_with_wishart(sv, w.shape))),
+    # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(wishart_aspect_ratio_beta(w))),
     PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
@@ -228,6 +221,45 @@ def compute_analysis_for_step(
             lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
             my_weights, gradients
         )
+
+        # Inject noise_sigma from serialized checkpoint
+        try:
+            ckpt = deserialize_model_checkpoint(Path(checkpoint_file))
+            muon_sigma_map: Dict[str, float] = ckpt['muon_sigma']
+        except Exception as e:
+            muon_sigma_map = {}
+
+        # Build per-layer sigma mappings from parameter names
+        sigma_attention: Dict[int, float] = {}
+        sigma_mlp_in: Dict[int, float] = {}
+        sigma_mlp_out: Dict[int, float] = {}
+        for name, _param in model.named_parameters():
+            try:
+                ptype, layer = categorize_parameter(name)
+            except Exception:
+                continue
+            if layer < 0:
+                continue
+            if name in muon_sigma_map:
+                s = float(muon_sigma_map[name])
+                if ptype == 'attention':
+                    sigma_attention[layer] = s
+                elif ptype == 'mlp_input':
+                    sigma_mlp_in[layer] = s
+                elif ptype == 'mlp_output':
+                    sigma_mlp_out[layer] = s
+
+        # Attach noise_sigma to initial_props per (param_type, layer)
+        for (ptype, layer), props in initial_props.items():
+            if ptype.startswith('Attention '):
+                sigma = sigma_attention.get(layer, 0.0)
+            elif ptype == 'MLP Input':
+                sigma = sigma_mlp_in.get(layer, 0.0)
+            elif ptype == 'MLP Output':
+                sigma = sigma_mlp_out.get(layer, 0.0)
+            else:
+                sigma = 0.0
+            props['noise_sigma'] = float(sigma)
     
     # 3. Execute analysis pipeline (5 LOC)
     pipeline = PropertyPipeline(specs or ANALYSIS_SPECS)
@@ -278,28 +310,19 @@ def convert_pipeline_results_to_record_format(layer_props: GPTLayerProperty) -> 
 
 
 def _build_viz_stats_from_pipeline(viz_payload: GPTLayerProperty) -> Dict[Tuple[str, int], Dict[str, Any]]:
-    """Map pipeline outputs to the per-layer viz dict used by plotting."""
+    """Map pipeline outputs to the per-layer viz dict used by plotting (SPC only)."""
     viz_stats: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for k, props in viz_payload.items():
-        if 'innovation_spectrum' not in props:
-            continue
-        innov_s = props['innovation_spectrum']
         beta = matrix_shape_beta(props['checkpoint_weights'].shape)
-        B = int(innov_s.shape[0]) if isinstance(innov_s, torch.Tensor) and innov_s.ndim >= 2 else 1
-        sigma_eff = float(props['noise_sigma']) * (max(B - 1, 1) / max(B, 1)) ** 0.5
-        # positive-only for min computation on log scale
-        innov_np = innov_s.detach().cpu().numpy()
-        innov_pos = innov_np[innov_np > 0]
-        viz_stats[k] = {
-            'innovation_sample': innov_s[:, :min(100, innov_s.shape[1])].cpu().numpy(),
+        sigma_hat = float(props.get('noise_sigma', 0.0))
+        entry = {
             'beta': float(beta),
-            'sigma_hat': sigma_eff,
-            'per_minibatch_singular_values': props['minibatch_singular_values'].cpu().numpy(),
-            'spectral_projection_coefficients': props['spectral_projection_coefficients'].cpu().numpy(),
+            'sigma_hat': sigma_hat,
+            'per_minibatch_singular_values': props['minibatch_singular_values'].detach().cpu().numpy(),
+            'spectral_projection_coefficients': props['spectral_projection_coefficients'].detach().cpu().numpy(),
             'shape': tuple(int(x) for x in props['checkpoint_weights'].shape),
-            'innovation_min': float(innov_pos.min()) if innov_pos.size else 1e-8,
-            'innovation_max': float(innov_np.max()) if innov_np.size else 1.0,
         }
+        viz_stats[k] = entry
     return viz_stats
 
 
@@ -428,15 +451,6 @@ def main():
                     initial[(ptype, layer)] = {"checkpoint_weights": cw, "per_minibatch_gradient": mb}
             return initial
 
-        # Ensure the finite-size Wishart table CSV exists for the mock shape; precompute if missing
-        def _ensure_wishart_csv(shape: tuple[int, int], draws: int = 2000):
-            csv_path = wishart_cdf_path_for_shape(shape)
-            if not csv_path.exists():
-                precompute_quantile_table_for_shape(shape, draws=draws)
-
-        mock_shape = (32, 32)
-        _ensure_wishart_csv(mock_shape, draws=2000)
-
         NUM_CHECKPOINTS = 24
 
         for step_idx in range(NUM_CHECKPOINTS):
@@ -557,8 +571,10 @@ def main():
     # Common visualization (single call for mock and real)
     if (is_mock or (not is_mock and rank == 0)):
         print("\nCreating visualization GIFs...")
-        create_visualization_frames(0, viz_timeseries, gif_frames, vis_output_dir, rank if not is_mock else 0)
-        finalize_gifs(gif_frames, vis_output_dir, rank=(rank if not is_mock else 0))
+        create_visualization_frames(0, viz_timeseries, gif_frames, vis_output_dir, rank if not is_mock else 0, frame_types=['spc_singular'])
+        # Only finalize SPC GIF
+        gif_frames = {'spc_singular': gif_frames.get('spc_singular', [])}
+        finalize_gifs(gif_frames, vis_output_dir, rank=(rank if not is_mock else 0),)
         print("Analysis complete!")
 
     # Ensure all ranks reach a common point before teardown
