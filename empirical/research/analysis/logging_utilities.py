@@ -108,13 +108,25 @@ def deserialize_model_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
+    # Backward compatibility: normalize legacy keys
+    if 'model' not in checkpoint and 'model_state_dict' in checkpoint:
+        checkpoint['model'] = checkpoint['model_state_dict']
+    if 'model_args' not in checkpoint:
+        checkpoint['model_args'] = {}
+    if 'step' not in checkpoint:
+        # Try to parse from filename step_XXXX
+        try:
+            import re
+            m = re.search(r'step_(\d+)', str(checkpoint_path))
+            if m:
+                checkpoint['step'] = int(m.group(1))
+        except Exception:
+            pass
     # Validate checkpoint contents
     required_keys = ['model', 'step', 'model_args']
     for key in required_keys:
         if key not in checkpoint:
             raise KeyError(f"Missing required key '{key}' in checkpoint")
-    
     return checkpoint
 
 

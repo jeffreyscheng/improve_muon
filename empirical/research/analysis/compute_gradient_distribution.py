@@ -50,7 +50,7 @@ from empirical.research.analysis.core_math import (
     compute_innovation_spectrum, matrix_shape_beta
 )
 from empirical.research.analysis.core_visualization import (
-    create_visualization_frames, finalize_gifs
+    create_subplot_grid, finalize_gifs, PARAM_TYPES
 )
 from empirical.research.analysis.wishart import (
     aspect_ratio_beta as wishart_aspect_ratio_beta,
@@ -588,9 +588,62 @@ def main():
 
 
 
-if __name__ == "__main__":
-    exit_code = main()
-    # Global teardown (no try/except)
-    if dist.is_available() and dist.is_initialized():
+def _plot_pred_vs_actual(ax, prop: Dict[Tuple[str,int], Any], param_type: str, viridis, max_layers: int):
+    ax.set_title(param_type)
+    ax.set_xlabel('Predicted SPC (log scale)')
+    ax.set_ylabel('Actual SPC (log scale)')
+    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, alpha=0.3)
+    ax.set_xlim(1e-8, 1.0); ax.set_ylim(1e-8, 1.0)
+    denom = max(1, max_layers - 1)
+    for (pt, layer), arr in sorted(prop.items(), key=lambda x: x[0][1]):
+        if pt != param_type: continue
+        a = np.asarray(arr)
+        if a.ndim != 2 or (a.shape[0] != 2 and a.shape[1] != 2):
+            continue
+        if a.shape[0] == 2:
+            pred, actual = a[0], a[1]
+        else:
+            pred, actual = a[:, 0], a[:, 1]
+        pred = np.clip(pred.flatten(), 1e-8, 1.0)
+        actual = np.clip(actual.flatten(), 1e-8, 1.0)
+        color = viridis(layer / denom)
+        ax.scatter(pred, actual, s=6, alpha=0.2, c=[color])
+    # y=x reference
+    xs = np.geomspace(1e-8, 1.0, 200)
+    ax.plot(xs, xs, ls='--', lw=1.0, color='black')
+    return []
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python -m empirical.research.analysis.compute_gradient_distribution <run_id>")
+        return 1
+    run_id = sys.argv[1]
+    _, rank, world_size, device, _ = setup_distributed_training()
+    model = build_compiled_model(device)
+    checkpoints = find_all_checkpoints(run_id)
+    if rank == 0:
+        frames = []
+        out_dir = Path("research_logs/visualizations/spc_pred_vs_actual"); out_dir.mkdir(parents=True, exist_ok=True)
+        for step, ckpt in checkpoints:
+            load_weights_into_model(ckpt, model, device)
+            _, payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model)
+            # Build property map: (ptype,layer)->2xN [pred; actual]
+            prop_all: Dict[Tuple[str,int], Any] = {}
+            for key, props in payload.items():
+                pred = props['predicted_spectral_projection_coefficient'].detach().cpu().numpy().flatten()
+                actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+                n = min(len(pred), len(actual))
+                if n:
+                    prop_all[key] = np.vstack([pred[:n], actual[:n]])
+            frame_path = out_dir / f"pred_vs_actual_spc_{step:06d}.png"
+            create_subplot_grid(PARAM_TYPES, (20,10), prop_all, _plot_pred_vs_actual, f"Predicted vs Actual SPC - Step {step}", frame_path, wants_colorbar=True)
+            frames.append(str(frame_path))
+        finalize_gifs({'spc_pred_vs_actual': frames}, out_dir, gif_configs={'spc_pred_vs_actual': 'pred_vs_actual_spc.gif'}, rank=0)
+    if dist.is_initialized():
         dist.destroy_process_group()
-    sys.exit(0 if exit_code is None else exit_code)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
