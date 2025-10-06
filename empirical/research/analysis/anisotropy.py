@@ -420,6 +420,7 @@ def predicted_spc_soft(
     m_big: int = 1,
     g_accum: int = 1,
     gh_points: int = 100,
+    edge_scale_X: float = 1.0,
 ) -> torch.Tensor:
     """Compute softened SPC via log-normal anisotropy averaging.
 
@@ -451,9 +452,10 @@ def predicted_spc_soft(
     # y_base = s / (sigma_eff_mean * sqrt(m_big)) = (s / sigma) * sqrt(W*G / m_big)
     scale = math.sqrt((W * G) / float(mnorm))
     v = float(np.log1p(max(float(tau2), 0.0)))
+    X = max(float(edge_scale_X), 1e-30)
     if v <= 0.0:
         # No anisotropy → isotropic rule
-        y = (s / sigma) * scale
+        y = ((s / sigma) * scale) / X
         return _spc_iso_from_y(y, beta)
     # Gauss–Hermite nodes/weights for exp(-x^2)
     x, w = np.polynomial.hermite.hermgauss(gh_points)
@@ -464,7 +466,7 @@ def predicted_spc_soft(
     w_t = torch.from_numpy(w_norm).to(device=device)
     # y_j factor: exp(-0.5*sqrt(v) z + v/4)
     y_factor = torch.exp(-0.5 * math.sqrt(v) * z_t + 0.25 * v)
-    y0 = ((s / sigma) * scale).unsqueeze(-1)  # [N, 1]
+    y0 = (((s / sigma) * scale) / X).unsqueeze(-1)  # [N, 1]
     yj = y0 * y_factor  # broadcast over nodes → [N, M]
     fij = _spc_iso_from_y(yj, beta)  # [N, M]
     spc_avg = (fij * w_t).sum(dim=-1)
@@ -478,45 +480,23 @@ def predicted_spc_soft_plugin(
     beta: float,
     worker_count: int,
     m_big: int,
-    nu_dof: int,
+    edge_scale_X: float,
     g_accum: int = 1,
     gh_points: int = 100,
     gl_points: int = 7,
 ) -> torch.Tensor:
-    """Softened SPC with plug-in uncertainty merged into anisotropy dispersion.
+    """Alias to predicted_spc_soft using the provided edge-scale correction X.
 
-    Replaces explicit Gamma (Laguerre) integration with an equivalent variance
-    aggregation: tau2_total = tau2 + 2/nu_eff, where nu_eff = (W-1) * n * m
-    (or an effective DoF if provided). Delegates to predicted_spc_soft with the
-    same SNR normalization and Gauss–Hermite inner averaging.
-
-    Args:
-        s: singular values tensor
-        noise_sigma: per-entry sigma_eff at draw level
-        tau2: anisotropy dispersion scalar
-        beta: aspect ratio ≤ 1
-        worker_count: W
-        m_big: max(n, m)
-        nu_dof: ν = (W-1) * n * m (or effective DoF)
-        g_accum: microbatch accumulation factor
-        gh_points: Gauss–Hermite nodes for Θ averaging (default 100)
-        gl_points: unused (kept for API compatibility)
-
-    Returns:
-        torch.Tensor of SPCs in [0,1]
+    Kept for API compatibility; plug-in averaging is removed per spec.
     """
-    # Compute total dispersion adding plug-in variance of sigma estimator
-    if nu_dof is None or int(nu_dof) <= 0:
-        tau2_total = float(tau2)
-    else:
-        tau2_total = float(tau2) + 2.0 / max(float(nu_dof), 1.0)
     return predicted_spc_soft(
         s,
         noise_sigma,
-        tau2_total,
+        tau2,
         beta,
         worker_count=worker_count,
         m_big=m_big,
         g_accum=g_accum,
         gh_points=gh_points,
+        edge_scale_X=edge_scale_X,
     )
