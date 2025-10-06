@@ -417,7 +417,8 @@ def optimize_step(model, optimizers, step, args):
         torch.futures.collect_all(opt2futures[opt]).wait()
 
     # 5. With averaged grads, compute B for Muon and derive sigma
-    #    B = (1/N)||Ḡ||_F^2, sigma^2 = clamp((A - B)/W, 0)
+    #    B = (1/N)||Ḡ||_F^2, and under the simple i.i.d. noise model
+    #    A - B ≈ (1 - 1/W) * sigma^2  ⇒  sigma^2 ≈ (A - B) / (1 - 1/W)
     if muon_opt is not None and len(muon_params) > 0 and a_local is not None:
         W = dist.get_world_size() if dist.is_initialized() else 1
         b_vec = torch.zeros_like(a_local)
@@ -427,7 +428,12 @@ def optimize_step(model, optimizers, step, args):
                 b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
             else:
                 b_vec[idx] = 0.0
-        sigma2 = torch.clamp_min(a_local - b_vec, 0.0) / max(W, 1)
+        # Denominator (1 - 1/W); guard W=1 edge case
+        denom = 1.0 - (1.0 / float(max(W, 1)))
+        if denom <= 0.0:
+            sigma2 = torch.zeros_like(a_local)
+        else:
+            sigma2 = torch.clamp_min(a_local - b_vec, 0.0) / denom
         sigma_vec = torch.sqrt(sigma2)
     else:
         sigma_vec = None
