@@ -59,7 +59,7 @@ from empirical.research.analysis.anisotropy import (
     lanczos_condition_shrunk,
     matrix_normal_flipflop,
     anisotropy_dispersion_tau2,
-    predicted_spc_soft,
+    predicted_spc_soft_plugin,
 )
 import logging
 
@@ -98,6 +98,8 @@ ANALYSIS_SPECS = [
                 lambda w: float(wishart_aspect_ratio_beta(w))),
     PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
+    PropertySpec("nu_dof", ["per_minibatch_gradient", "checkpoint_weights"],
+                lambda g, w: int(max(g.shape[0]-1, 0) * int(w.shape[-2]) * int(w.shape[-1]))),
     PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
                 squared_true_signal_from_quadratic_formula),
     PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
@@ -113,8 +115,8 @@ ANALYSIS_SPECS = [
     PropertySpec("anisotropy_tau2", ["worker_centered_residuals"], anisotropy_dispersion_tau2),
 
     # Softened SPC using (sigma_eff, tau2, beta) and mean singular values
-    PropertySpec("predicted_spc_soft", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta", "worker_count", "m_big"],
-                predicted_spc_soft),
+    PropertySpec("predicted_spc_soft_plugin", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta", "worker_count", "m_big", "nu_dof"],
+                predicted_spc_soft_plugin),
 
 ]
 
@@ -394,7 +396,9 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         W_eff = int(d.get('W_eff', 1))
         # Softened SPC curve via anisotropy averaging
         xs_t = torch.from_numpy(xs.astype(np.float32))
-        y_pred_t = predicted_spc_soft(xs_t, sigma, tau2, beta, worker_count=W_eff, m_big=m_big)
+        # Approximate ν = (W-1) * n * m from layer shape and W
+        nu = int(max(W_eff - 1, 0) * p * n)
+        y_pred_t = predicted_spc_soft_plugin(xs_t, sigma, tau2, beta, worker_count=W_eff, m_big=m_big, nu_dof=nu)
         y_pred = y_pred_t.detach().cpu().numpy()
         color = viridis(layer / max(1, max_layers - 1))
         ax.plot(xs, y_pred, color=color, lw=1.0)
@@ -442,7 +446,7 @@ def main():
             klw = props.get('kappa_LW', None)
             mnk = props.get('matrix_normal_kappas', None)
             tau2 = props.get('anisotropy_tau2', None)
-            spc_soft = props.get('predicted_spc_soft', None)
+            spc_soft = props.get('predicted_spc_soft_plugin', None)
             prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
             if kd is not None:
                 logging.info(f"{prefix} metric=kappa_diag value={float(kd):.6g}")
