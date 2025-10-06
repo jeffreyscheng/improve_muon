@@ -18,6 +18,7 @@ the property pipeline.
 from typing import Tuple
 import math
 import torch
+import numpy as np
 
 
 def center_across_workers(Ghats: torch.Tensor) -> torch.Tensor:
@@ -300,3 +301,162 @@ def matrix_normal_flipflop(
     kappaMN = (kappaU * kappaV).to(dtype=dtype)
     return kappaU, kappaV, kappaMN
 
+
+def sigma_eff2_from_centered_residuals(E: torch.Tensor) -> torch.Tensor:
+    """Unbiased estimator of per-entry noise variance under matrix-normal noise.
+
+    Given centered residuals across workers E = {R_k} with shape [W, n, m],
+    returns sigma_eff^2 = (1/((W-1) n m)) * sum_k ||R_k||_F^2.
+
+    Args:
+        E: [W, n, m] centered residuals (worker mean removed)
+
+    Returns:
+        torch.scalar tensor sigma_eff^2
+    """
+    if E.ndim != 3:
+        return torch.tensor(0.0, device=E.device, dtype=torch.float32)
+    W, n, m = E.shape
+    if W <= 1:
+        return torch.tensor(0.0, device=E.device, dtype=torch.float32)
+    sse = (E.to(dtype=torch.float32).pow(2)).sum()
+    denom = float((W - 1) * n * m)
+    return (sse / denom).to(dtype=torch.float32)
+
+
+def anisotropy_dispersion_tau2(E: torch.Tensor, eps: float = 1e-30) -> torch.Tensor:
+    """Compute anisotropy–dispersion scalar tau^2 from worker-centered residuals.
+
+    Implements the formula based on minimal sufficient statistics:
+      - SSE = sum_k ||R_k||_F^2
+      - S_C = sum_{k,l} ||R_k^T R_l||_F^2 = ||sum_k R_k R_k^T||_F^2 = ||sum_k R_k^T R_k||_F^2
+
+    Then with W workers, layer shape (n, m):
+      a = b = SSE / ((W-1) n m)
+      A = (1/n) * S_C / ((W-1)^2 m^2)
+      B = (1/m) * S_C / ((W-1)^2 n^2)
+      tau^2 = (2/n) * (A / a^2) + (2/m) * (B / b^2)
+
+    Args:
+        E: [W, n, m] centered residuals across workers
+        eps: numerical guard for denominator stability
+
+    Returns:
+        torch.scalar tensor tau^2 (nonnegative)
+    """
+    if E.ndim != 3:
+        return torch.tensor(0.0, device=E.device, dtype=torch.float32)
+    W, n, m = E.shape
+    if W <= 1:
+        return torch.tensor(0.0, device=E.device, dtype=torch.float32)
+
+    Ef = E.to(dtype=torch.float32)
+    # SSE
+    sse = (Ef * Ef).sum()
+    # Accumulate either sum_k R_k R_k^T (n x n) or sum_k R_k^T R_k (m x m) based on smaller dim
+    if n <= m:
+        S = torch.zeros((n, n), device=E.device, dtype=torch.float32)
+        for k in range(W):
+            Rk = Ef[k]
+            S = S + (Rk @ Rk.transpose(0, 1))
+    else:
+        S = torch.zeros((m, m), device=E.device, dtype=torch.float32)
+        for k in range(W):
+            Rk = Ef[k]
+            S = S + (Rk.transpose(0, 1) @ Rk)
+    SC = (S * S).sum()
+
+    denomW = float(W - 1)
+    if denomW <= 0:
+        return torch.tensor(0.0, device=E.device, dtype=torch.float32)
+    n_f = float(n)
+    m_f = float(m)
+
+    a = sse / (denomW * n_f * m_f)
+    # A and B per definitions
+    A = (1.0 / n_f) * (SC / (denomW * denomW * m_f * m_f))
+    B = (1.0 / m_f) * (SC / (denomW * denomW * n_f * n_f))
+
+    a2 = torch.clamp(a * a, min=eps)
+    # b == a
+    term1 = (2.0 / n_f) * (A / a2)
+    term2 = (2.0 / m_f) * (B / a2)
+    tau2 = term1 + term2
+    return torch.clamp(tau2, min=0.0).to(dtype=torch.float32)
+
+
+def _spc_iso_from_y(y: torch.Tensor, beta: float) -> torch.Tensor:
+    """Isotropic SPC f_iso(y, beta) operating on torch tensors.
+
+    Implements the mapping described via the spiked model:
+      - Threshold y_star = 1 + sqrt(beta)
+      - t solves t^2 - (y^2 - 1 - beta)*t + beta = 0 → take positive root
+      - spc = sqrt(((1 - β/t^2)(1 - 1/t^2)) / ((1 + β/t)(1 + 1/t))) for y > y_star, else 0
+    """
+    dtype = torch.float32
+    device = y.device
+    y = y.to(dtype)
+    b = torch.tensor(float(beta), dtype=dtype, device=device)
+    ystar = 1.0 + torch.sqrt(torch.clamp(b, min=0.0))
+    y2 = y * y
+    A = y2 - (1.0 + b)
+    disc = torch.clamp(A * A - 4.0 * b, min=0.0)
+    t = 0.5 * (A + torch.sqrt(disc))  # t = x^2
+    # Guard
+    t = torch.clamp(t, min=1e-12)
+    num = (1.0 - b / (t * t)) * (1.0 - 1.0 / (t * t))
+    den = (1.0 + b / t) * (1.0 + 1.0 / t)
+    val = torch.sqrt(torch.clamp(num / torch.clamp(den, min=1e-30), min=0.0))
+    val = torch.where(y > ystar, val, torch.zeros_like(val))
+    return torch.clamp(val, 0.0, 1.0)
+
+
+def predicted_spc_soft(
+    s: torch.Tensor,
+    noise_sigma: float,
+    tau2: float,
+    beta: float,
+    gh_points: int = 9,
+) -> torch.Tensor:
+    """Compute softened SPC via log-normal anisotropy averaging.
+
+    spc(s | σ_eff^2, τ^2, β) = E_Θ[ f_iso( s / (σ_eff * sqrt(Θ)), β ) ],
+    with Θ = exp( sqrt(v) Z - v/2 ), v = log(1 + τ^2), Z ~ N(0,1).
+
+    Uses Gauss–Hermite quadrature for the standard normal by transforming
+    hermgauss nodes/weights associated with exp(-x^2) weight.
+
+    Args:
+        s: singular values tensor (1D)
+        noise_sigma: σ_eff (scalar)
+        tau2: τ^2 (scalar)
+        beta: aspect ratio ≤ 1
+        gh_points: number of Gauss–Hermite nodes (e.g., 9 or 11)
+
+    Returns:
+        torch.Tensor of same shape as s with values in [0,1].
+    """
+    s = s.to(dtype=torch.float32)
+    device = s.device
+    sigma = max(float(noise_sigma), 1e-30)
+    if sigma <= 0.0:
+        return torch.zeros_like(s, dtype=torch.float32)
+    v = float(np.log1p(max(float(tau2), 0.0)))
+    if v <= 0.0:
+        # No anisotropy → isotropic rule
+        y = s / sigma
+        return _spc_iso_from_y(y, beta)
+    # Gauss–Hermite nodes/weights for exp(-x^2)
+    x, w = np.polynomial.hermite.hermgauss(gh_points)
+    # Convert to standard normal expectation: z = sqrt(2) x, weights /= sqrt(pi)
+    z = (np.sqrt(2.0) * x).astype(np.float32)
+    w_norm = (w / np.sqrt(np.pi)).astype(np.float32)
+    z_t = torch.from_numpy(z).to(device=device)
+    w_t = torch.from_numpy(w_norm).to(device=device)
+    # y_j factor: exp(-0.5*sqrt(v) z + v/4)
+    y_factor = torch.exp(-0.5 * math.sqrt(v) * z_t + 0.25 * v)
+    y0 = (s / sigma).unsqueeze(-1)  # [K, 1] or [N, 1]
+    yj = y0 * y_factor  # broadcast over nodes → [N, M]
+    fij = _spc_iso_from_y(yj, beta)  # [N, M]
+    spc_avg = (fij * w_t).sum(dim=-1)
+    return torch.clamp(spc_avg, 0.0, 1.0)

@@ -58,6 +58,8 @@ from empirical.research.analysis.anisotropy import (
     john_sphericity,
     lanczos_condition_shrunk,
     matrix_normal_flipflop,
+    anisotropy_dispersion_tau2,
+    predicted_spc_soft,
 )
 import logging
 
@@ -106,6 +108,12 @@ ANALYSIS_SPECS = [
     PropertySpec("john_sphericity_U", ["worker_centered_residuals"], john_sphericity),
     PropertySpec("kappa_LW", ["worker_centered_residuals"], lanczos_condition_shrunk),
     PropertySpec("matrix_normal_kappas", ["worker_centered_residuals"], matrix_normal_flipflop),
+    PropertySpec("anisotropy_tau2", ["worker_centered_residuals"], anisotropy_dispersion_tau2),
+
+    # Softened SPC using (sigma_eff, tau2, beta) and mean singular values
+    PropertySpec("predicted_spc_soft", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta"],
+                predicted_spc_soft),
+
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -366,7 +374,7 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
     from empirical.research.analysis.core_visualization import newton_schulz_quintic_function
     y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
     ax.plot(xs, y_ns, color='black', lw=1.5)
-    # Predicted SPC curves per layer
+    # Predicted SPC curves per layer (softened using tau^2)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type:
             continue
@@ -378,7 +386,11 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         p, n = shape
         beta = min(p, n) / max(p, n)
         sigma = float(d.get('sigma', 0.0))
-        y_pred = predict_spc_curve_np(xs, sigma, beta)
+        tau2 = float(d.get('tau2', 0.0))
+        # Softened SPC curve via anisotropy averaging
+        xs_t = torch.from_numpy(xs.astype(np.float32))
+        y_pred_t = predicted_spc_soft(xs_t, sigma, tau2, beta)
+        y_pred = y_pred_t.detach().cpu().numpy()
         color = viridis(layer / max(1, max_layers - 1))
         ax.plot(xs, y_pred, color=color, lw=1.0)
         # Optional: faint scatter of actual SV/SPC
@@ -424,6 +436,8 @@ def main():
             ju = props.get('john_sphericity_U', None)
             klw = props.get('kappa_LW', None)
             mnk = props.get('matrix_normal_kappas', None)
+            tau2 = props.get('anisotropy_tau2', None)
+            spc_soft = props.get('predicted_spc_soft', None)
             prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
             if kd is not None:
                 logging.info(f"{prefix} metric=kappa_diag value={float(kd):.6g}")
@@ -438,6 +452,12 @@ def main():
                 logging.info(f"{prefix} metric=matrix_normal_kappa_U value={float(ku):.6g}")
                 logging.info(f"{prefix} metric=matrix_normal_kappa_V value={float(kv):.6g}")
                 logging.info(f"{prefix} metric=matrix_normal_kappa_MN value={float(kmn):.6g}")
+            if tau2 is not None:
+                logging.info(f"{prefix} metric=anisotropy_tau2 value={float(tau2):.6g}")
+            if spc_soft is not None and hasattr(spc_soft, 'detach'):
+                ss = spc_soft.detach().cpu().float().numpy().reshape(-1)
+                if ss.size:
+                    logging.info(f"{prefix} metric=predicted_spc_soft stats={{min:{ss.min():.4f}, med:{np.median(ss):.4f}, max:{ss.max():.4f}}}")
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
@@ -460,6 +480,7 @@ def main():
                         'sv': sv[:m],
                         'spc': spc[:m],
                         'sigma': float(props.get('noise_sigma', 0.0)),
+                        'tau2': float(props.get('anisotropy_tau2', 0.0)),
                         'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
                     }
             pred_actual_gptlp_ts[step] = pred_actual_gptlp
