@@ -42,6 +42,8 @@ from empirical.research.analysis.core_math import (
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
+    compute_panel_xs,
+    predict_spc_curve_np,
 )
 from empirical.research.analysis.wishart import (
     aspect_ratio_beta as wishart_aspect_ratio_beta,
@@ -221,46 +223,7 @@ def compute_analysis_for_step(
     stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
     local_records = {}
 
-    # Debug attention SPC ~1.0: inspect subspace alignment signals
-    if rank == 0:
-        try:
-            for (ptype, layer), props in list(local_results.items()):
-                if not (isinstance(ptype, str) and ptype.startswith('Attention')):
-                    continue
-                mb_svd = props.get('minibatch_gradient_svd')
-                mean_svd = props.get('mean_gradient_svd')
-                spc = props.get('spectral_projection_coefficients')
-                if not (isinstance(mb_svd, tuple) and isinstance(mean_svd, tuple)):
-                    continue
-                U_b, S_b, Vh_b = mb_svd
-                U_m, S_m, Vh_m = mean_svd
-                # Shapes
-                B, H, Kb = U_b.shape
-                Hm, Km = U_m.shape
-                W = Vh_b.shape[-1]
-                print(f"[attn-debug] {ptype} L{layer}: U_b={tuple(U_b.shape)} U_m={tuple(U_m.shape)} Vh_b={tuple(Vh_b.shape)} Vh_m={tuple(Vh_m.shape)}")
-                # Degenerate full-rank subspace check (square layers)
-                if H == W and min(Kb, Km) == H:
-                    print(f"[attn-debug] full-rank square case: H=W={H}, K={min(Kb,Km)}; canonical correlations can degenerate to 1.0")
-                # Frobenius norms of differences for first batch
-                b0 = 0
-                if B > 0:
-                    fn_u = float(torch.norm(U_b[b0] - U_m, p='fro').item())
-                    fn_v = float(torch.norm(Vh_b[b0] - Vh_m, p='fro').item())
-                    print(f"[attn-debug] ||U_b[0]-U_m||_F={fn_u:.3e} ||Vh_b[0]-Vh_m||_F={fn_v:.3e}")
-                    # Principal correlations diagnostics
-                    Cu = (U_b[b0].transpose(-2, -1) @ U_m)
-                    Cv = (Vh_b[b0].transpose(-2, -1) @ Vh_m.transpose(-2, -1))
-                    su = torch.linalg.svdvals(Cu).detach().cpu()
-                    sv = torch.linalg.svdvals(Cv).detach().cpu()
-                    print(f"[attn-debug] top-5 sigma_u: {su[:5].tolist()} top-5 sigma_v: {sv[:5].tolist()}")
-                if isinstance(spc, torch.Tensor):
-                    spc0 = spc[0] if spc.ndim == 2 else spc
-                    spc_min = float(torch.min(spc0).item())
-                    spc_max = float(torch.max(spc0).item())
-                    print(f"[attn-debug] SPC range batch0: min={spc_min:.3e} max={spc_max:.3e}")
-        except Exception:
-            pass
+    # (no debug logs)
 
     if dist.is_initialized():
         dist.barrier()
@@ -374,23 +337,39 @@ def create_pred_vs_actual_spc_log_log_subplot(ax, prop: GPTLayerProperty, param_
     ax.plot(xs, xs, ls='--', lw=1.0, color='black')
     return []
 
-def create_spc_vs_sv_semilog_subplot(ax, prop: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
     ax.set_xlabel('Singular value (log scale)')
     ax.set_ylabel('Spectral projection coefficient')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
-    ax.set_ylim(-0.05, 1.05)
-    denom = max(1, max_layers - 1)
-    for (pt, layer), arr in sorted(prop.items(), key=lambda x: x[0][1]):
+    ax.set_ylim(0.0, 1.0)
+    # X-grid across all layers in this panel
+    xs = compute_panel_xs(panel)
+    # Newton–Schulz quintic reference
+    from empirical.research.analysis.core_visualization import newton_schulz_quintic_function
+    y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
+    ax.plot(xs, y_ns, color='black', lw=1.5)
+    # Predicted SPC curves per layer
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type:
             continue
-        a = np.asarray(arr)
-        if a.ndim != 2 or (a.shape[0] != 2 and a.shape[1] != 2):
+        if not isinstance(d, dict):
             continue
-        sv, spc = (a[0], a[1]) if a.shape[0] == 2 else (a[:, 0], a[:, 1])
-        sv = sv.flatten(); spc = np.clip(spc.flatten(), 0.0, 1.0)
-        color = viridis(layer / denom)
-        ax.scatter(sv, spc, s=6, alpha=0.2, c=[color])
+        shape = tuple(int(x) for x in d.get('shape', ()))
+        if len(shape) != 2:
+            continue
+        p, n = shape
+        beta = min(p, n) / max(p, n)
+        sigma = float(d.get('sigma', 0.0))
+        y_pred = predict_spc_curve_np(xs, sigma, beta)
+        color = viridis(layer / max(1, max_layers - 1))
+        ax.plot(xs, y_pred, color=color, lw=1.0)
+        # Optional: faint scatter of actual SV/SPC
+        sv = d.get('sv'); spc = d.get('spc')
+        if sv is not None and spc is not None:
+            sv = np.asarray(sv).flatten(); spc = np.clip(np.asarray(spc).flatten(), 0.0, 1.0)
+            if sv.size and spc.size:
+                ax.scatter(sv, spc, s=6, alpha=0.05, c=[color])
     return []
 
 
@@ -425,17 +404,23 @@ def main():
             pred_actual_gptlp: GPTLayerProperty = {}
             spc_singular_gptlp: GPTLayerProperty = {}
             for key, props in aggregated_payload.items():
+                # Pred vs actual SPC: keep as 2xN
                 pred = props['predicted_spectral_projection_coefficient'].detach().cpu().numpy().flatten()
                 actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
                 n = min(len(pred), len(actual))
                 if n:
                     pred_actual_gptlp[key] = np.vstack([pred[:n], actual[:n]])
-                # SPC vs Singular Values: (ptype, layer) -> 2xN [sv; spc]
+                # SPC vs SV: store dict with sv/spc/sigma/shape
                 sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
                 spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
                 m = min(len(sv), len(spc))
                 if m:
-                    spc_singular_gptlp[key] = np.vstack([sv[:m], spc[:m]])
+                    spc_singular_gptlp[key] = {
+                        'sv': sv[:m],
+                        'spc': spc[:m],
+                        'sigma': float(props.get('noise_sigma', 0.0)),
+                        'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
+                    }
             pred_actual_gptlp_ts[step] = pred_actual_gptlp
             spc_singular_gptlp_ts[step] = spc_singular_gptlp
         if dist.is_initialized():

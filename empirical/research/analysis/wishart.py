@@ -356,3 +356,18 @@ def predict_spectral_projection_coefficient_from_squared_true_signal(
             out = np.sqrt(np.clip(num / np.clip(den, 1e-30, None), 0.0, None))
             val[mask] = out
         return val
+
+
+def invert_spike_mapping_y2_to_t_np(y2: np.ndarray, beta: float) -> np.ndarray:
+    """Invert rectangular spiked mapping for y^2 -> t (numpy path).
+
+    y2 = (s/σ)^2, beta in (0,1]. Solve y^2 = t + (1+beta) + beta/t for t ≥ 0
+    via the positive root: t = (A + sqrt(A^2 - 4 beta)) / 2, A = y2 - 1 - beta.
+    Clamp t ≥ sqrt(beta) + eps for numerical stability.
+    """
+    y2 = np.asarray(y2, dtype=np.float64)
+    A = y2 - (1.0 + float(beta))
+    D = np.maximum(A * A - 4.0 * float(beta), 0.0)
+    t = 0.5 * (A + np.sqrt(D))
+    t_min = np.sqrt(max(float(beta), 0.0)) + 1e-8
+    return np.maximum(t, t_min)

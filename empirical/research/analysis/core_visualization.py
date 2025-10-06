@@ -17,6 +17,10 @@ import pandas as pd
 import json
 from matplotlib.ticker import LogLocator, LogFormatterMathtext, NullLocator
 from empirical.research.training.zeropower import NEWTON_SCHULZ_QUINTIC_COEFFICIENTS
+from empirical.research.analysis.wishart import (
+    invert_spike_mapping_y2_to_t_np,
+    predict_spectral_projection_coefficient_from_squared_true_signal,
+)
 from empirical.research.analysis.model_utilities import GPTLayerProperty
 from empirical.research.analysis.wishart import predict_spectral_projection_coefficient_from_squared_true_signal
 
@@ -90,6 +94,38 @@ def newton_schulz_quintic_function(x):
     for a, b, c in NEWTON_SCHULZ_QUINTIC_COEFFICIENTS:
         out = a * out + b * (out **3) + c * (out ** 5)
     return out
+
+
+def compute_panel_xs(panel: GPTLayerProperty, eps: float = 1e-8) -> np.ndarray:
+    """Build a log-spaced x-grid from positive singulars across panel layers."""
+    vals = []
+    for (_pt, _layer), d in panel.items():
+        sv = d.get('sv') if isinstance(d, dict) else None
+        if sv is None:
+            continue
+        sv = np.asarray(sv, dtype=float)
+        sv = sv[np.isfinite(sv) & (sv > 0)]
+        if sv.size:
+            vals.append(sv)
+    if not vals:
+        return np.geomspace(1e-6, 1.0, 256)
+    all_sv = np.concatenate(vals)
+    lo = max(float(all_sv.min()), eps)
+    hi = float(all_sv.max())
+    if hi <= lo:
+        hi = lo * 10.0
+    return np.geomspace(lo, hi, 256)
+
+
+def predict_spc_curve_np(xs: np.ndarray, sigma: float, beta: float) -> np.ndarray:
+    """Predict SPC(xs) from sigma and beta (numpy)."""
+    xs = np.asarray(xs, dtype=np.float64)
+    sigma = float(sigma)
+    beta = float(beta)
+    y2 = (xs / max(sigma, 1e-30)) ** 2
+    t = invert_spike_mapping_y2_to_t_np(y2, beta)
+    spc = predict_spectral_projection_coefficient_from_squared_true_signal(t, beta)
+    return np.clip(spc, 0.0, 1.0)
 
 def make_gif_from_layer_property_time_series(
     layer_property_time_series: dict[int, GPTLayerProperty],
