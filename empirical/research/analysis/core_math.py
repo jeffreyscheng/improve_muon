@@ -80,7 +80,7 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
         return U.clone(), s.clone(), Vh.clone()
 
 
-def compute_spc_from_svds(
+def compute_spc_by_permutation_alignment(
     mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -94,8 +94,9 @@ def compute_spc_from_svds(
                 U_m: [H, K], S_m: [K], Vh_m: [K, W]
 
     Returns:
-        SPC tensor [B, K] where each entry is the product of principal
-        correlations (cosines) between aligned left/right singular subspaces.
+        SPC tensor [B, K] where each entry corresponds to the product of
+        cosine agreements between matched singular directions (via a
+        permutation alignment) of (U_b,V_b) to (U_m,V_m).
     """
     U_b, _, Vh_b = mb_svd
     U_m, _, Vh_m = mean_svd
@@ -109,23 +110,45 @@ def compute_spc_from_svds(
 
     B = U_b.shape[0]
 
-    # Left subspace alignment: C_u = U_b^T @ U_m  -> [B, K, K]
-    C_u = U_b.transpose(-2, -1) @ U_m      # [B, K, H] @ [H, K] -> [B, K, K]
-    # Right subspace alignment: C_v = V_b^T @ V_m -> [B, K, K]
-    V_b = Vh_b.transpose(-2, -1)           # [B, W, K]
-    V_m = Vh_m.transpose(-2, -1)           # [W, K]
-    C_v = V_b.transpose(-2, -1) @ V_m      # ([B, K, W] @ [W, K]) -> [B, K, K]
+    # Pairwise cosine agreements between singular directions
+    # Left: cosU[b, j, i] = |<u_b_j, u_m_i>|
+    cosU = torch.einsum('bhk,hq->bkq', U_b, U_m).abs()  # [B, K_b, K_m]
+    # Right: cosV[b, j, i] = |<v_b_j, v_m_i>|
+    V_b = Vh_b.transpose(-2, -1)  # [B, W, K_b]
+    V_m = Vh_m.transpose(-2, -1)  # [W, K_m]
+    cosV = torch.einsum('bwk,wq->bkq', V_b, V_m).abs()  # [B, K_b, K_m]
+    # Combined similarity matrix per batch: M[b, j, i]
+    M = cosU * cosV  # [B, K, K]
 
-    # Singular values of C_u and C_v are principal correlations (cosines)
-    sigma_u = torch.linalg.svdvals(C_u)    # [B, K]
-    sigma_v = torch.linalg.svdvals(C_v)    # [B, K]
+    B, Kb, Km = M.shape
+    Kc = min(Kb, Km)
+    spc_out = U_b.new_zeros((B, Kc))
 
-    # Sort descending and take elementwise product for SPC
-    sigma_u_sorted, _ = torch.sort(sigma_u, dim=-1, descending=True)
-    sigma_v_sorted, _ = torch.sort(sigma_v, dim=-1, descending=True)
-    Kc = min(sigma_u_sorted.shape[-1], sigma_v_sorted.shape[-1])
-    spc = sigma_u_sorted[..., :Kc] * sigma_v_sorted[..., :Kc]
-    return spc
+    # Greedy permutation alignment per batch: maximize sum of matches
+    for b in range(B):
+        Mb = M[b]
+        # Track available rows (batch directions j)
+        used = torch.zeros(Kb, dtype=torch.bool, device=Mb.device)
+        # Order columns (mean directions i) by their best available match descending
+        best_per_col, _ = Mb.max(dim=0)  # [K]
+        order = torch.argsort(best_per_col, descending=True)
+        assigned = torch.full((Km,), -1, dtype=torch.long, device=Mb.device)
+        for i in order.tolist():
+            scores = Mb[:, i].clone()
+            scores[used] = -1.0  # mask used rows
+            j = int(torch.argmax(scores).item())
+            if scores[j] < 0:
+                continue
+            assigned[i] = j
+            used[j] = True
+        # Build SPC vector for first Kc columns of mean
+        for i in range(Kc):
+            j = int(assigned[i].item())
+            if j >= 0:
+                spc_out[b, i] = Mb[j, i]
+            else:
+                spc_out[b, i] = 0.0
+    return spc_out
 
 
 def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

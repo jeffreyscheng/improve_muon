@@ -38,7 +38,7 @@ from empirical.research.analysis.model_utilities import (
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
     stable_rank_from_tensor, safe_svd,
-    compute_spc_from_svds,
+    compute_spc_by_permutation_alignment,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -78,7 +78,7 @@ ANALYSIS_SPECS = [
     # Spectral projection analysis (with Procrustes alignment)
     PropertySpec("spectral_projection_coefficients",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
-                compute_spc_from_svds),
+                compute_spc_by_permutation_alignment),
     
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
