@@ -241,12 +241,9 @@ def compute_analysis_for_step(
 
     if dist.is_initialized():
         dist.barrier()
-
     if rank == 0:
         print(f"Step {step}: Analysis complete (streamed to CSV)")
-        return {}, local_results
-    else:
-        return {}, {}
+    return {}, local_results
 
 
 ## removed legacy record/viz builders in favor of direct GPTLayerProperty usage
@@ -421,9 +418,11 @@ def main():
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
-        # Build GIFs using the simplified interface
-        make_gif_from_layer_property_time_series(pred_actual_gptlp_ts, create_pred_vs_actual_spc_log_log_subplot, f"{run_id} pred_vs_actual_spc")
-        make_gif_from_layer_property_time_series(spc_singular_gptlp_ts, create_spc_vs_sv_semilog_subplot, f"{run_id} spc_vs_singular_values")
+        # Build GIFs using the simplified interface (nested under run folder)
+        out_dir = Path(f"research_logs/visualizations/{run_id}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        make_gif_from_layer_property_time_series(pred_actual_gptlp_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
+        make_gif_from_layer_property_time_series(spc_singular_gptlp_ts, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values", output_dir=out_dir)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0

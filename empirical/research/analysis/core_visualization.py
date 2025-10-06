@@ -82,7 +82,6 @@ def create_subplot_grid(
     except Exception:
         pass
     
-    plt.close(fig)
     return fig
 
 def newton_schulz_quintic_function(x):
@@ -95,7 +94,8 @@ def newton_schulz_quintic_function(x):
 def make_gif_from_layer_property_time_series(
     layer_property_time_series: dict[int, GPTLayerProperty],
     plot_fn: Callable[[plt.Axes, GPTLayerProperty, str, mcolors.Colormap, int], List[Any]],
-    title: np.str_
+    title: np.str_,
+    output_dir: Path | None = None,
 ):
     """
     layer_property_time_series: maps from checkpoint idx to GPTLayerProperty
@@ -114,7 +114,7 @@ def make_gif_from_layer_property_time_series(
     xmins, xmaxs, ymins, ymaxs = get_global_axis_bounds(list(frames.values()))
 
     # 3) Apply global bounds to each frame and save PNGs
-    out_dir = Path("research_logs/visualizations")
+    out_dir = Path("research_logs/visualizations") if output_dir is None else Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     png_paths: List[str] = []
     for step, fig in frames.items():
