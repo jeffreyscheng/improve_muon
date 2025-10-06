@@ -51,6 +51,15 @@ from empirical.research.analysis.wishart import (
     predict_spectral_projection_coefficient_from_squared_true_signal,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, categorize_parameter
+from empirical.research.analysis.anisotropy import (
+    center_across_workers,
+    diagonal_spread,
+    sketch_condition,
+    john_sphericity,
+    lanczos_condition_shrunk,
+    matrix_normal_flipflop,
+)
+import logging
 
 
 ANALYSIS_SPECS = [
@@ -81,7 +90,7 @@ ANALYSIS_SPECS = [
     PropertySpec("spectral_projection_coefficients",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
                 compute_spc_by_permutation_alignment),
-    
+
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(wishart_aspect_ratio_beta(w))),
@@ -89,6 +98,14 @@ ANALYSIS_SPECS = [
                 squared_true_signal_from_quadratic_formula),
     PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
                 predict_spectral_projection_coefficient_from_squared_true_signal),
+
+    # Anisotropy metrics (Noise Anisotropy Test)
+    PropertySpec("worker_centered_residuals", ["per_minibatch_gradient"], center_across_workers),
+    PropertySpec("kappa_diag", ["worker_centered_residuals"], diagonal_spread),
+    PropertySpec("kappa_sketch", ["worker_centered_residuals"], lambda E: sketch_condition(E, s=128, repeats=3, seed=1234)),
+    PropertySpec("john_sphericity_U", ["worker_centered_residuals"], john_sphericity),
+    PropertySpec("kappa_LW", ["worker_centered_residuals"], lanczos_condition_shrunk),
+    PropertySpec("matrix_normal_kappas", ["worker_centered_residuals"], matrix_normal_flipflop),
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -377,6 +394,8 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python -m empirical.research.analysis.compute_gradient_distribution <run_id>")
         return 1
+    # Lightweight logging setup
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     run_id = sys.argv[1]
     _, rank, world_size, device, _ = setup_distributed_training()
     model = build_compiled_model(device)
@@ -397,6 +416,28 @@ def main():
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         _, local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
+        # Log anisotropy metrics for each local layer on each rank
+        for (ptype, layer), props in local_payload.items():
+            # Only log if properties were computed
+            kd = props.get('kappa_diag', None)
+            ks = props.get('kappa_sketch', None)
+            ju = props.get('john_sphericity_U', None)
+            klw = props.get('kappa_LW', None)
+            mnk = props.get('matrix_normal_kappas', None)
+            prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
+            if kd is not None:
+                logging.info(f"{prefix} metric=kappa_diag value={float(kd):.6g}")
+            if ks is not None:
+                logging.info(f"{prefix} metric=kappa_sketch value={float(ks):.6g}")
+            if ju is not None:
+                logging.info(f"{prefix} metric=john_sphericity_U value={float(ju):.6g}")
+            if klw is not None:
+                logging.info(f"{prefix} metric=kappa_LW value={float(klw):.6g}")
+            if isinstance(mnk, (tuple, list)) and len(mnk) == 3:
+                ku, kv, kmn = mnk
+                logging.info(f"{prefix} metric=matrix_normal_kappa_U value={float(ku):.6g}")
+                logging.info(f"{prefix} metric=matrix_normal_kappa_V value={float(kv):.6g}")
+                logging.info(f"{prefix} metric=matrix_normal_kappa_MN value={float(kmn):.6g}")
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
