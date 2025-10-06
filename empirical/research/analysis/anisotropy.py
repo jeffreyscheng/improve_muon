@@ -483,60 +483,40 @@ def predicted_spc_soft_plugin(
     gh_points: int = 100,
     gl_points: int = 7,
 ) -> torch.Tensor:
-    """Softened SPC with plug-in uncertainty over sigma_eff^2.
+    """Softened SPC with plug-in uncertainty merged into anisotropy dispersion.
 
-    Computes E_U E_Θ [ f_iso( y / sqrt(U Θ), β ) ] where
-      - U ~ Gamma(ν/2, scale=2/ν) models sampling variability of sigma_eff^2
-      - Θ models anisotropy dispersion with E[Θ]=1, Var(Θ)=tau2 (log-normal surrogate)
-
-    Implemented as an outer Gauss–Laguerre quadrature over U with weight e^{-t},
-    folding t^{k-1}/Γ(k) into the integrand via the change of variables U = θ t,
-    θ = 2/ν, k = ν/2.
+    Replaces explicit Gamma (Laguerre) integration with an equivalent variance
+    aggregation: tau2_total = tau2 + 2/nu_eff, where nu_eff = (W-1) * n * m
+    (or an effective DoF if provided). Delegates to predicted_spc_soft with the
+    same SNR normalization and Gauss–Hermite inner averaging.
 
     Args:
         s: singular values tensor
-        noise_sigma: sigma_eff (per-entry) at draw level
+        noise_sigma: per-entry sigma_eff at draw level
         tau2: anisotropy dispersion scalar
         beta: aspect ratio ≤ 1
         worker_count: W
         m_big: max(n, m)
-        nu_dof: ν = (W-1) n m
-        g_accum: accumulation factor (default 1)
-        gh_points: Gauss–Hermite nodes (inner, Θ), default 100
-        gl_points: Gauss–Laguerre nodes (outer, U), default 7
+        nu_dof: ν = (W-1) * n * m (or effective DoF)
+        g_accum: microbatch accumulation factor
+        gh_points: Gauss–Hermite nodes for Θ averaging (default 100)
+        gl_points: unused (kept for API compatibility)
 
     Returns:
         torch.Tensor of SPCs in [0,1]
     """
-    # Degenerate cases: no residual DoF or W<2 → revert to inner-only softening
-    if nu_dof is None or int(nu_dof) <= 0 or int(worker_count) < 2:
-        return predicted_spc_soft(s, noise_sigma, tau2, beta, worker_count, m_big, g_accum, gh_points)
-
-    # Standard Laguerre nodes/weights for weight e^{-x}
-    x, w = np.polynomial.laguerre.laggauss(gl_points)
-    x = x.astype(np.float64)
-    w = w.astype(np.float64)
-    # Gamma params for U: k = ν/2, θ = 2/ν
-    nu = float(nu_dof)
-    k = 0.5 * nu
-    theta = 2.0 / nu
-    # Normalization 1/Γ(k) inside integrand
-    log_gamma_k = math.lgamma(k)
-
-    # Accumulate outer expectation
-    s_dev = s.detach() if hasattr(s, 'detach') else s
-    agg = torch.zeros_like(s_dev, dtype=torch.float32)
-    for xi, wi in zip(x, w):
-        # Map t -> U = θ t ; integrand weight factor: t^{k-1} / Γ(k)
-        t = float(xi)
-        if t <= 0.0:
-            continue
-        log_factor = (k - 1.0) * math.log(t) - log_gamma_k
-        factor = math.exp(log_factor)
-        U = theta * t
-        # Effective sigma for this node: sigma' = sigma * sqrt(U)
-        sigma_prime = float(noise_sigma) * math.sqrt(max(U, 1e-30))
-        # Inner expectation over Θ using our existing routine
-        inner = predicted_spc_soft(s, sigma_prime, tau2, beta, worker_count, m_big, g_accum, gh_points)
-        agg = agg + float(wi) * factor * inner
-    return torch.clamp(agg, 0.0, 1.0)
+    # Compute total dispersion adding plug-in variance of sigma estimator
+    if nu_dof is None or int(nu_dof) <= 0:
+        tau2_total = float(tau2)
+    else:
+        tau2_total = float(tau2) + 2.0 / max(float(nu_dof), 1.0)
+    return predicted_spc_soft(
+        s,
+        noise_sigma,
+        tau2_total,
+        beta,
+        worker_count=worker_count,
+        m_big=m_big,
+        g_accum=g_accum,
+        gh_points=gh_points,
+    )
