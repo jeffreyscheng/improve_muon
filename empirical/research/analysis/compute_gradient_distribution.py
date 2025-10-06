@@ -221,21 +221,44 @@ def compute_analysis_for_step(
     stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
     local_records = {}
 
-    # Aggressive debug: on rank 0, print singular value stats per layer
+    # Debug attention SPC ~1.0: inspect subspace alignment signals
     if rank == 0:
         try:
-            for (ptype, layer), props in list(local_results.items())[:32]:  # cap to first 32 layers for readability
-                sv = props.get('minibatch_singular_values', None)
-                if isinstance(sv, torch.Tensor):
-                    sv_cpu = sv.detach().float().cpu().reshape(-1)
-                    if sv_cpu.numel() > 0:
-                        pos = sv_cpu[sv_cpu > 0]
-                        n_pos = int(pos.numel())
-                        n = int(sv_cpu.numel())
-                        sv_min = float(torch.min(sv_cpu).item())
-                        sv_max = float(torch.max(sv_cpu).item())
-                        frac_pos = (n_pos / n) if n > 0 else 0.0
-                        print(f"[rank0] SV stats {ptype} L{layer}: n={n} pos={n_pos} ({frac_pos:.2%}) min={sv_min:.3e} max={sv_max:.3e}")
+            for (ptype, layer), props in list(local_results.items()):
+                if not (isinstance(ptype, str) and ptype.startswith('Attention')):
+                    continue
+                mb_svd = props.get('minibatch_gradient_svd')
+                mean_svd = props.get('mean_gradient_svd')
+                spc = props.get('spectral_projection_coefficients')
+                if not (isinstance(mb_svd, tuple) and isinstance(mean_svd, tuple)):
+                    continue
+                U_b, S_b, Vh_b = mb_svd
+                U_m, S_m, Vh_m = mean_svd
+                # Shapes
+                B, H, Kb = U_b.shape
+                Hm, Km = U_m.shape
+                W = Vh_b.shape[-1]
+                print(f"[attn-debug] {ptype} L{layer}: U_b={tuple(U_b.shape)} U_m={tuple(U_m.shape)} Vh_b={tuple(Vh_b.shape)} Vh_m={tuple(Vh_m.shape)}")
+                # Degenerate full-rank subspace check (square layers)
+                if H == W and min(Kb, Km) == H:
+                    print(f"[attn-debug] full-rank square case: H=W={H}, K={min(Kb,Km)}; canonical correlations can degenerate to 1.0")
+                # Frobenius norms of differences for first batch
+                b0 = 0
+                if B > 0:
+                    fn_u = float(torch.norm(U_b[b0] - U_m, p='fro').item())
+                    fn_v = float(torch.norm(Vh_b[b0] - Vh_m, p='fro').item())
+                    print(f"[attn-debug] ||U_b[0]-U_m||_F={fn_u:.3e} ||Vh_b[0]-Vh_m||_F={fn_v:.3e}")
+                    # Principal correlations diagnostics
+                    Cu = (U_b[b0].transpose(-2, -1) @ U_m)
+                    Cv = (Vh_b[b0].transpose(-2, -1) @ Vh_m.transpose(-2, -1))
+                    su = torch.linalg.svdvals(Cu).detach().cpu()
+                    sv = torch.linalg.svdvals(Cv).detach().cpu()
+                    print(f"[attn-debug] top-5 sigma_u: {su[:5].tolist()} top-5 sigma_v: {sv[:5].tolist()}")
+                if isinstance(spc, torch.Tensor):
+                    spc0 = spc[0] if spc.ndim == 2 else spc
+                    spc_min = float(torch.min(spc0).item())
+                    spc_max = float(torch.max(spc0).item())
+                    print(f"[attn-debug] SPC range batch0: min={spc_min:.3e} max={spc_max:.3e}")
         except Exception:
             pass
 

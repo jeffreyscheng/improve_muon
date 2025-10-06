@@ -220,8 +220,6 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     
     # Original behavior: eval mode outside; enable grads only for forward/backward block
     model.eval()  # Set to eval mode for consistent analysis
-    rank_str = f"[rank{rank}]"
-    print(f"{rank_str} accumulate {num_minibatches} minibatches for gradient analysis")
     with torch.no_grad():
         for minibatch_idx in range(num_minibatches):
             try:
@@ -286,19 +284,6 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
         if grad_list:
             result[key] = torch.stack(grad_list, dim=0)  # Shape: [num_minibatches, ...]
 
-    # Debug summary: print a few stats to help diagnose zero/NaN gradients
-    try:
-        total_layers = len(per_minibatch_grads)
-        sample_keys = list(per_minibatch_grads.keys())[:min(5, total_layers)]
-        print(f"{rank_str} collected gradients for {total_layers} layers; sample stats:")
-        for k in sample_keys:
-            g = per_minibatch_grads[k][-1]
-            finite = torch.isfinite(g)
-            frac_finite = float(finite.float().mean().item())
-            gmin = float(torch.nan_to_num(g).min().item()) if g.numel() else 0.0
-            gmax = float(torch.nan_to_num(g).max().item()) if g.numel() else 0.0
-            print(f"{rank_str}  {k}: shape={tuple(g.shape)} finite={frac_finite:.3f} min={gmin:.3e} max={gmax:.3e}")
-    except Exception:
-        pass
+    # (debug logs removed)
 
     return result
