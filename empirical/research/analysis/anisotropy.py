@@ -416,7 +416,10 @@ def predicted_spc_soft(
     noise_sigma: float,
     tau2: float,
     beta: float,
-    gh_points: int = 9,
+    worker_count: int = 1,
+    m_big: int = 1,
+    g_accum: int = 1,
+    gh_points: int = 100,
 ) -> torch.Tensor:
     """Compute softened SPC via log-normal anisotropy averaging.
 
@@ -441,10 +444,16 @@ def predicted_spc_soft(
     sigma = max(float(noise_sigma), 1e-30)
     if sigma <= 0.0:
         return torch.zeros_like(s, dtype=torch.float32)
+    # Effective mean noise scale for averaged gradient and MP normalization
+    W = max(int(worker_count), 1)
+    G = max(int(g_accum), 1)
+    mnorm = max(int(m_big), 1)
+    # y_base = s / (sigma_eff_mean * sqrt(m_big)) = (s / sigma) * sqrt(W*G / m_big)
+    scale = math.sqrt((W * G) / float(mnorm))
     v = float(np.log1p(max(float(tau2), 0.0)))
     if v <= 0.0:
         # No anisotropy → isotropic rule
-        y = s / sigma
+        y = (s / sigma) * scale
         return _spc_iso_from_y(y, beta)
     # Gauss–Hermite nodes/weights for exp(-x^2)
     x, w = np.polynomial.hermite.hermgauss(gh_points)
@@ -455,7 +464,7 @@ def predicted_spc_soft(
     w_t = torch.from_numpy(w_norm).to(device=device)
     # y_j factor: exp(-0.5*sqrt(v) z + v/4)
     y_factor = torch.exp(-0.5 * math.sqrt(v) * z_t + 0.25 * v)
-    y0 = (s / sigma).unsqueeze(-1)  # [K, 1] or [N, 1]
+    y0 = ((s / sigma) * scale).unsqueeze(-1)  # [N, 1]
     yj = y0 * y_factor  # broadcast over nodes → [N, M]
     fij = _spc_iso_from_y(yj, beta)  # [N, M]
     spc_avg = (fij * w_t).sum(dim=-1)

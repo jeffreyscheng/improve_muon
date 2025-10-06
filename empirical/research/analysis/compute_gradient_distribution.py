@@ -96,6 +96,8 @@ ANALYSIS_SPECS = [
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(wishart_aspect_ratio_beta(w))),
+    PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
+    PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
     PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
                 squared_true_signal_from_quadratic_formula),
     PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
@@ -111,7 +113,7 @@ ANALYSIS_SPECS = [
     PropertySpec("anisotropy_tau2", ["worker_centered_residuals"], anisotropy_dispersion_tau2),
 
     # Softened SPC using (sigma_eff, tau2, beta) and mean singular values
-    PropertySpec("predicted_spc_soft", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta"],
+    PropertySpec("predicted_spc_soft", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta", "worker_count", "m_big"],
                 predicted_spc_soft),
 
 ]
@@ -387,9 +389,12 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         beta = min(p, n) / max(p, n)
         sigma = float(d.get('sigma', 0.0))
         tau2 = float(d.get('tau2', 0.0))
+        m_big = int(max(p, n))
+        # Effective averaging count approximated by number of per-minibatch grads used
+        W_eff = int(d.get('W_eff', 1))
         # Softened SPC curve via anisotropy averaging
         xs_t = torch.from_numpy(xs.astype(np.float32))
-        y_pred_t = predicted_spc_soft(xs_t, sigma, tau2, beta)
+        y_pred_t = predicted_spc_soft(xs_t, sigma, tau2, beta, worker_count=W_eff, m_big=m_big)
         y_pred = y_pred_t.detach().cpu().numpy()
         color = viridis(layer / max(1, max_layers - 1))
         ax.plot(xs, y_pred, color=color, lw=1.0)
@@ -481,6 +486,7 @@ def main():
                         'spc': spc[:m],
                         'sigma': float(props.get('noise_sigma', 0.0)),
                         'tau2': float(props.get('anisotropy_tau2', 0.0)),
+                        'W_eff': int(props.get('worker_count', int(props['minibatch_singular_values'].shape[0]) if hasattr(props.get('minibatch_singular_values', None), 'shape') else 1)),
                         'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
                     }
             pred_actual_gptlp_ts[step] = pred_actual_gptlp
