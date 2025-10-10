@@ -39,6 +39,10 @@ from empirical.research.analysis.property_pipeline import PropertySpec, Property
 from empirical.research.analysis.core_math import (
     stable_rank_from_tensor, safe_svd,
     compute_spc_by_permutation_alignment,
+    estimate_gradient_noise_sigma2,
+    fit_empirical_noise_to_phase_slope_kappa,
+    fit_empirical_phase_constant_tau2,
+    precompute_theoretical_noise_to_phase_slope_kappa  # TODO: implement
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -51,16 +55,6 @@ from empirical.research.analysis.wishart import (
     predict_spectral_projection_coefficient_from_squared_true_signal,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, categorize_parameter
-from empirical.research.analysis.anisotropy import (
-    center_across_workers,
-    diagonal_spread,
-    sketch_condition,
-    john_sphericity,
-    lanczos_condition_shrunk,
-    matrix_normal_flipflop,
-    anisotropy_dispersion_tau2,
-    predicted_spc_soft,
-)
 import logging
 
 
@@ -98,26 +92,15 @@ ANALYSIS_SPECS = [
                 lambda w: float(wishart_aspect_ratio_beta(w))),
     PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
-    PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
-                squared_true_signal_from_quadratic_formula),
-    PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
-                predict_spectral_projection_coefficient_from_squared_true_signal),
+    # PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
+    #             squared_true_signal_from_quadratic_formula),
+    # PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
+    #             predict_spectral_projection_coefficient_from_squared_true_signal),
 
-    # Anisotropy metrics (Noise Anisotropy Test)
-    PropertySpec("worker_centered_residuals", ["per_minibatch_gradient"], center_across_workers),
-    PropertySpec("kappa_diag", ["worker_centered_residuals"], diagonal_spread),
-    PropertySpec("kappa_sketch", ["worker_centered_residuals"], lambda E: sketch_condition(E, s=128, repeats=3, seed=1234)),
-    PropertySpec("john_sphericity_U", ["worker_centered_residuals"], john_sphericity),
-    PropertySpec("kappa_LW", ["worker_centered_residuals"], lanczos_condition_shrunk),
-    PropertySpec("matrix_normal_kappas", ["worker_centered_residuals"], matrix_normal_flipflop),
-    PropertySpec("anisotropy_tau2", ["worker_centered_residuals"], anisotropy_dispersion_tau2),
-
-    # Softened SPC using (sigma_eff, tau2, beta) and mean singular values
-    PropertySpec("edge_scale_X", ["matrix_normal_kappas"], lambda kv: (float(kv[0]) * float(kv[1])) ** 0.5 if not hasattr(kv[0], 'sqrt') else float((kv[0] * kv[1]).sqrt())),
-
-    PropertySpec("predicted_spc_soft", ["mean_singular_values", "noise_sigma", "anisotropy_tau2", "aspect_ratio_beta", "worker_count", "m_big", "edge_scale_X"],
-                predicted_spc_soft),
-
+    PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient"], estimate_gradient_noise_sigma2),
+    PropertySpec("empirical_phase_constant_tau2", ["minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
+    PropertySpec("empirical_noise_to_phase_slope_kappa", ["aspect_ratio_beta", "gradient_noise_sigma2", "empirical_phase_constant_tau2"], fit_empirical_noise_to_phase_slope_kappa),
+    # PropertySpec("theoretical_kappa", ["aspect_ratio_beta"], precompute_theoretical_noise_to_phase_slope_kappa),
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -368,17 +351,11 @@ def create_pred_vs_actual_spc_log_log_subplot(ax, prop: GPTLayerProperty, param_
 
 def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
-    ax.set_xlabel('Singular value (log scale)')
+    ax.set_xlabel('Whitened singular value (log scale)')
     ax.set_ylabel('Spectral projection coefficient')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
     ax.set_ylim(0.0, 1.0)
-    # X-grid across all layers in this panel
-    xs = compute_panel_xs(panel)
-    # Newton–Schulz quintic reference
-    from empirical.research.analysis.core_visualization import newton_schulz_quintic_function
-    y_ns = np.clip(newton_schulz_quintic_function(xs), 0.0, 1.0)
-    ax.plot(xs, y_ns, color='black', lw=1.5)
-    # Predicted SPC curves per layer (softened using tau^2)
+    # Predicted vs actual SPC per layer in whitened space
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type:
             continue
@@ -387,26 +364,22 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         shape = tuple(int(x) for x in d.get('shape', ()))
         if len(shape) != 2:
             continue
-        p, n = shape
-        beta = min(p, n) / max(p, n)
-        sigma = float(d.get('sigma', 0.0))
-        tau2 = float(d.get('tau2', 0.0))
-        m_big = int(max(p, n))
-        # Effective averaging count approximated by number of per-minibatch grads used
-        W_eff = int(d.get('W_eff', 1))
-        # Softened SPC curve via anisotropy averaging with edge-scale correction X
-        xs_t = torch.from_numpy(xs.astype(np.float32))
-        X = float(d.get('X', 1.0))
-        y_pred_t = predicted_spc_soft(xs_t, sigma, tau2, beta, worker_count=W_eff, m_big=m_big, edge_scale_X=X)
-        y_pred = y_pred_t.detach().cpu().numpy()
+        svw = d.get('sv_whitened')
+        spc_pred = d.get('spc_pred')
+        if svw is None or spc_pred is None:
+            continue
+        svw = np.asarray(svw).flatten(); spc_pred = np.clip(np.asarray(spc_pred).flatten(), 0.0, 1.0)
         color = viridis(layer / max(1, max_layers - 1))
-        ax.plot(xs, y_pred, color=color, lw=1.0)
-        # Optional: faint scatter of actual SV/SPC
-        sv = d.get('sv'); spc = d.get('spc')
-        if sv is not None and spc is not None:
-            sv = np.asarray(sv).flatten(); spc = np.clip(np.asarray(spc).flatten(), 0.0, 1.0)
-            if sv.size and spc.size:
-                ax.scatter(sv, spc, s=6, alpha=0.05, c=[color])
+        # Predicted SPC (ordered line)
+        order = np.argsort(svw)
+        ax.plot(svw[order], spc_pred[order], color=color, lw=1.0)
+        # Actual SPC (faint scatter) vs whitened singulars
+        spc = d.get('spc')
+        if spc is not None:
+            spc = np.clip(np.asarray(spc).flatten(), 0.0, 1.0)
+            if spc.size:
+                m = min(svw.size, spc.size)
+                ax.scatter(svw[:m], spc[:m], s=6, alpha=0.05, c=[color])
     return []
 
 
@@ -436,7 +409,7 @@ def main():
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         _, local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
-        # Log anisotropy metrics for each local layer on each rank
+        # Log anisotropy metrics and whitened SPC for each local layer on each rank
         for (ptype, layer), props in local_payload.items():
             # Only log if properties were computed
             kd = props.get('kappa_diag', None)
@@ -445,7 +418,7 @@ def main():
             klw = props.get('kappa_LW', None)
             mnk = props.get('matrix_normal_kappas', None)
             tau2 = props.get('anisotropy_tau2', None)
-            spc_soft = props.get('predicted_spc_soft', None)
+            spc_pred = props.get('predicted_spc_whitened', None)
             prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
             if kd is not None:
                 logging.info(f"{prefix} metric=kappa_diag value={float(kd):.6g}")
@@ -462,10 +435,10 @@ def main():
                 logging.info(f"{prefix} metric=matrix_normal_kappa_MN value={float(kmn):.6g}")
             if tau2 is not None:
                 logging.info(f"{prefix} metric=anisotropy_tau2 value={float(tau2):.6g}")
-            if spc_soft is not None and hasattr(spc_soft, 'detach'):
-                ss = spc_soft.detach().cpu().float().numpy().reshape(-1)
+            if spc_pred is not None and hasattr(spc_pred, 'detach'):
+                ss = spc_pred.detach().cpu().float().numpy().reshape(-1)
                 if ss.size:
-                    logging.info(f"{prefix} metric=predicted_spc_soft stats={{min:{ss.min():.4f}, med:{np.median(ss):.4f}, max:{ss.max():.4f}}}")
+                    logging.info(f"{prefix} metric=predicted_spc_whitened stats={{min:{ss.min():.4f}, med:{np.median(ss):.4f}, max:{ss.max():.4f}}}")
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
@@ -474,32 +447,21 @@ def main():
             spc_singular_gptlp: GPTLayerProperty = {}
             for key, props in aggregated_payload.items():
                 # Pred vs actual SPC: keep as 2xN
-                pred = props['predicted_spectral_projection_coefficient'].detach().cpu().numpy().flatten()
+                pred = props['predicted_spc_whitened'].detach().cpu().numpy().flatten()
                 actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
                 n = min(len(pred), len(actual))
                 if n:
                     pred_actual_gptlp[key] = np.vstack([pred[:n], actual[:n]])
-                # SPC vs SV: store dict with sv/spc/sigma/shape
-                sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
+                # SPC vs SV (whitened): store dict with sv_whitened/spc_pred/spc_actual/shape
+                svw = props['whitened_singular_values'].detach().cpu().numpy().flatten()
+                spc_pred = props['predicted_spc_whitened'].detach().cpu().numpy().flatten()
                 spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
-                m = min(len(sv), len(spc))
+                m = min(len(svw), len(spc_pred), len(spc))
                 if m:
-                    # Derive X from kappa_U, kappa_V if present
-                    kv = props.get('matrix_normal_kappas', None)
-                    X = None
-                    if isinstance(kv, (tuple, list)) and len(kv) >= 2:
-                        ku, kvv = kv[0], kv[1]
-                        try:
-                            X = float((ku * kvv).sqrt()) if hasattr(ku, 'sqrt') else float(ku) ** 0.5 * float(kvv) ** 0.5
-                        except Exception:
-                            X = None
                     spc_singular_gptlp[key] = {
-                        'sv': sv[:m],
+                        'sv_whitened': svw[:m],
+                        'spc_pred': spc_pred[:m],
                         'spc': spc[:m],
-                        'sigma': float(props.get('noise_sigma', 0.0)),
-                        'tau2': float(props.get('anisotropy_tau2', 0.0)),
-                        'W_eff': int(props.get('worker_count', int(props['minibatch_singular_values'].shape[0]) if hasattr(props.get('minibatch_singular_values', None), 'shape') else 1)),
-                        'X': float(X) if X is not None else 1.0,
                         'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
                     }
             pred_actual_gptlp_ts[step] = pred_actual_gptlp

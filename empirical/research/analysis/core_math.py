@@ -11,6 +11,8 @@ from typing import Union, Tuple, Dict
 import numpy as np
 import torch
 
+from empirical.research.analysis.model_utilities import GPTLayerProperty
+
 
 def compute_stable_rank(singular_values: Union[np.ndarray, torch.Tensor], epsilon: float = 1e-8) -> float:
     """
@@ -200,3 +202,38 @@ def compute_innovation_spectrum(per_minibatch_grad: torch.Tensor, mean_grad: tor
         beta = matrix_shape_beta((H, W))
         
         return s.clone()
+
+def estimate_gradient_noise_sigma2(
+    per_minibatch_gradient: torch.tensor,
+    mean_gradient: torch.tensor
+) -> float:
+    B, m, n = per_minibatch_gradient.shape
+    return 1.0 / ((B - 1) * m * n) * torch.linalg.norm((per_minibatch_gradient - mean_gradient), ord="fro").sum()
+ 
+def fit_empirical_phase_constant_tau2(
+    minibatch_singular_values: torch.tensor,
+    spectral_projection_coefficients: torch.tensor
+) -> float:
+    """
+    """
+    eps = 1e-10
+    A = (1.0 / minibatch_singular_values.clamp(min=eps) ** 2).unsqueeze(-1)
+    b = (1.0 / spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps) - 1.0).unsqueeze(-1)
+    return torch.linalg.lstsq(A, b).solution.squeeze()
+
+def fit_empirical_noise_to_phase_slope_kappa(
+    gradient_noise_sigma2: GPTLayerProperty,
+    empirical_phase_constant_tau2: GPTLayerProperty
+) -> float:
+    """
+    """
+    sigma2s = torch.tensor(list(gradient_noise_sigma2.values()))
+    tau2s = torch.tensor(list(empirical_phase_constant_tau2.values()))
+    return float(torch.linalg.lstsq(sigma2s, tau2s))
+
+def precompute_theoretical_noise_to_phase_slope_kappa(
+    aspect_ratio_beta: float
+) -> float:
+    """
+    """
+    pass
