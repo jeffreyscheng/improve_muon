@@ -5,26 +5,16 @@ DEFAULT_ZEROPOWER_METHOD = "newton_schulz"  # Options: "newton_schulz", "svd_pol
 DEFAULT_ZEROPOWER_HYPERPARAMS = {}
 
 import sys
-import argparse
-import json
 with open(sys.argv[0]) as f:
     code = f.read()
 
 import os
-import uuid
-import time
-import copy
-from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
-import itertools
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 if torch.cuda.is_available():
     torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
-import torch.nn.functional as F
+from torch import Tensor
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 torch._inductor.config.coordinate_descent_tuning = True

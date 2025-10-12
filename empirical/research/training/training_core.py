@@ -302,6 +302,96 @@ def create_gpt_with_muon(args, zeropower_fn):
     
     return model, optimizers, train_loader
 
+def create_gpt_with_optimizer(args,
+                              build_hidden_optimizer_fn,
+                              *,
+                              hidden_lr: float = 0.025,
+                              hidden_weight_decay: float = 0.01,
+                              hidden_momentum: float = 0.95):
+    """Generalized assembly: build model and optimizers with an injected hidden optimizer builder.
+
+    Returns: model, (adamw, hidden_opt)
+    Train loader should be created via create_train_loader(args).
+    """
+    # Setup distributed training
+    run_id, rank, world_size, device, master_process = setup_distributed_training()
+    print0, run_id_full, logfile = setup_logging(run_id, master_process)
+
+    # Read and log code
+    with open(sys.argv[0]) as f:
+        code = f.read()
+    log_system_info(print0, code)
+
+    # Create model
+    from .architecture import GPT
+    model = GPT(args.vocab_size, 16, 8, 1024, max(args.train_seq_len, args.val_seq_len)).cuda()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
+
+    # Get parameter groups
+    param_groups = get_param_groups(model)
+
+    # Coverage check
+    params_collections = [param_groups["hidden"], param_groups["embed"], param_groups["scalar"], param_groups["head"]]
+    optimized_parameters_set = {p for params in params_collections for p in params}
+    assert optimized_parameters_set == {*model.parameters()}
+    assert len(optimized_parameters_set) == sum(len(lst) for lst in params_collections)
+
+    # AdamW for non-hidden
+    adam_param_groups = [
+        dict(params=param_groups["head"], lr=1/320),
+        dict(params=param_groups["embed"], lr=0.3),
+        dict(params=param_groups["scalar"], lr=0.015)
+    ]
+    optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0, fused=True)
+
+    # Hidden optimizer via builder fn
+    param_to_name = {p: n for n, p in model.named_parameters()}
+    optimizer2 = build_hidden_optimizer_fn(
+        param_groups["hidden"],
+        model=model,
+        param_to_name=param_to_name,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+        lr=hidden_lr,
+        weight_decay=hidden_weight_decay,
+        momentum=hidden_momentum,
+    )
+    optimizers = [optimizer1, optimizer2]
+
+    # Initial learning rates
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+
+    # Compile model and warmup
+    model = torch.compile(model, dynamic=False)
+    warmup_kernels(model, optimizers, args)
+
+    # Stash globals for train_loader helper
+    global _global_print0, _global_run_id_full, _global_rank, _global_world_size, _global_master_process, _global_training_time_ms, _global_t0, _global_code
+    _global_print0 = print0
+    _global_run_id_full = run_id_full
+    _global_rank = rank
+    _global_world_size = world_size
+    _global_master_process = master_process
+    _global_training_time_ms = 0
+    _global_t0 = time.perf_counter()
+    _global_code = code
+
+    torch.cuda.reset_peak_memory_stats()
+    dist.barrier()
+    return model, optimizers
+
+def create_train_loader(args):
+    """Return a distributed train data generator using stored globals."""
+    assert _global_rank is not None and _global_world_size is not None
+    return distributed_data_generator(args.train_files, _global_world_size * args.train_seq_len, _global_rank, _global_world_size)
+
 def should_terminate(step, args):
     """Determine if training should terminate at given step."""
     if args.max_minibatches is not None and step >= args.max_minibatches:
@@ -442,17 +532,11 @@ def optimize_step(model, optimizers, step, args):
     for opt in optimizers:
         opt.step()
 
-    # 7. Record sigma in Muon optimizer state after step initialization
+    # 7. Feed noise sigma^2 to hidden optimizer if it expects it (duck-typed)
     if muon_opt is not None and len(muon_params) > 0 and sigma_vec is not None:
-        sigma_cpu = sigma_vec.detach().cpu()
-        for idx, p in enumerate(muon_params):
-            try:
-                muon_opt.state[p]["sigma"] = float(sigma_cpu[idx])
-                # Also attach as a lightweight attribute on the Parameter for logging/serialization
-                setattr(p, "_muon_sigma", float(sigma_cpu[idx]))
-            except Exception:
-                # Be robust to first-step initialization timing or unexpected states
-                pass
+        if hasattr(muon_opt, 'expects_noise_sigma2') and getattr(muon_opt, 'expects_noise_sigma2'):
+            # sigma_vec is sigma, feed sigma^2 as variance
+            muon_opt.feed_noise_sigma2(muon_params, sigma_vec * sigma_vec)
 
     # 8. Zero gradients
     # Zero gradients

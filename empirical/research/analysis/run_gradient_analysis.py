@@ -87,7 +87,6 @@ ANALYSIS_SPECS = [
                 lambda svd_tuple: svd_tuple[1]),
     PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
     
-    # Spectral projection analysis (with Procrustes alignment)
     PropertySpec("spectral_echo_and_alignment",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
                 compute_spectral_echo_and_alignment),
@@ -102,8 +101,6 @@ ANALYSIS_SPECS = [
     PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
     PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_echo"], fit_empirical_phase_constant_tau2),
 ]
-
-## removed mock and SVD precompile helpers for simplicity
 
 
 def build_compiled_model(device: torch.device):
