@@ -10,12 +10,12 @@ from torch import Tensor
 import torch.distributed as dist
 
 layer_type_to_kappa = {
-    'Attention Q': 0.0,
-    'Attention K': 0.0,
-    'Attention V': 0.0,
-    'Attention O': 0.0,
-    'MLP Input': 0.0,
-    'MLP Output': 0.0
+    'Attention Q': 2.01e5,
+    'Attention K': 1.61e5,
+    'Attention V': 4.44e4,
+    'Attention O': 1.37e5,
+    'MLP Input': 4.27e5,
+    'MLP Output': 3.83e5
 }
 
 def spectral_echo_via_svd(Ghat: Tensor, kappa: float | Tensor, sigma2: float | Tensor):
