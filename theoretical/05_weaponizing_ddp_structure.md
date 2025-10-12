@@ -6,9 +6,9 @@ We look at one layer’s gradient matrix of shape $m\times n$ and focus on a sin
 - True gradient (rank-1 for exposition): $G = s\,u v^\top$, with $\|u\|=\|v\|=1$.
 - Empirical (minibatch) gradient: $\widehat G = G + E$.
 
-We study the expected **spectral projection coefficient**
+We study the expected **spectral echo**
 $$
-\mathrm{SPC}(s) \;=\; \langle u,\widehat u\rangle\,\langle v,\widehat v\rangle,
+\mathrm{spectral echo}(s) \;=\; \langle u,\widehat u\rangle\,\langle v,\widehat v\rangle,
 $$
 where $(\widehat u,\widehat v)$ is the top singular pair of $\widehat G$.
 
@@ -22,7 +22,7 @@ and the aspect ratio is $\gamma = m/n$. Batch size only affects $\sigma^2\propto
 
 ## Sketch (the roadmap)
 
-1. **Geometry.** SPC is the product of cosines between true and empirical singular vectors. We relate those cosines to the small angles by which noise rotates the signal direction.
+1. **Geometry.** spectral echo is the product of cosines between true and empirical singular vectors. We relate those cosines to the small angles by which noise rotates the signal direction.
 
 2. **From rotations to a sum.** Noise causes small, independent “leakages” from $u$ into orthogonal directions; the total squared angle is a sum of modewise contributions weighted by spectral gaps.
 
@@ -30,19 +30,19 @@ and the aspect ratio is $\gamma = m/n$. Batch size only affects $\sigma^2\propto
 
 4. **Small-angle to cosine.** A simple trig identity turns the angle law into a smooth “Hill”/logistic-in-log-$s$ law per side.
 
-5. **Single-scalar collapse.** Away from the MP edge, the MP integral is nearly constant in $s^2$, leaving a single knee parameter $\tau^2\approx \sigma^2\,\kappa(\gamma)$. Multiplying left and right gives the SPC law.
+5. **Single-scalar collapse.** Away from the MP edge, the MP integral is nearly constant in $s^2$, leaving a single knee parameter $\tau^2\approx \sigma^2\,\kappa(\gamma)$. Multiplying left and right gives the spectral echo law.
 
 6. **Caveats and anisotropy.** We say when independence is reasonable, when the single-scalar collapse is tight, and what changes if the noise is anisotropic.
 
 ---
 
-## 1) Geometry of SPC and small angles
+## 1) Geometry of spectral echo and small angles
 
 Let $\theta_L$ be the angle between $u$ and $\widehat u$; similarly $\theta_R$ for $v$ and $\widehat v$. Then
 $$
 \langle u,\widehat u\rangle = \cos\theta_L,\qquad
 \langle v,\widehat v\rangle = \cos\theta_R,\qquad
-\mathrm{SPC}(s) = \cos\theta_L\,\cos\theta_R.
+\mathrm{spectral echo}(s) = \cos\theta_L\,\cos\theta_R.
 $$
 
 **Small-angle regime.** When the signal $s$ is not swamped by noise, the top singular vectors only rotate slightly: $\theta_L,\theta_R$ are small. For small $\theta$, $\cos\theta = (1+\tan^2\theta)^{-1/2}$ and $\tan^2\theta\approx \sin^2\theta$. Thus
@@ -137,7 +137,7 @@ $$
 $$
 with $C_R(\gamma,\cdot)=C_L(1/\gamma,\cdot)$ for rectangles.
 
-**Independence assumption.** To get $\mathbb E[\mathrm{SPC}(s)]$ from the product $\cos\theta_L\,\cos\theta_R$, we use
+**Independence assumption.** To get $\mathbb E[\mathrm{spectral echo}(s)]$ from the product $\cos\theta_L\,\cos\theta_R$, we use
 $$
 \mathbb E[\cos\theta_L\,\cos\theta_R]\;\approx\;\mathbb E[\cos\theta_L]\,\mathbb E[\cos\theta_R].
 $$
@@ -145,12 +145,12 @@ This factorization is **not exact**, but it is accurate to first order under iso
 
 ---
 
-## 4) The SPC law (exact first order, then the single-scalar collapse)
+## 4) The spectral echo law (exact first order, then the single-scalar collapse)
 
-Putting left and right together, the **first-order SPC law** is
+Putting left and right together, the **first-order spectral echo law** is
 $$
 \boxed{
-\mathbb E[\mathrm{SPC}(s)]
+\mathbb E[\mathrm{spectral echo}(s)]
 \;\approx\;
 \frac{1}{\sqrt{1+\tau_L^2/s^2}}\cdot\frac{1}{\sqrt{1+\tau_R^2/s^2}},
 \qquad
@@ -180,12 +180,12 @@ $$
 \tau_L^2\approx \sigma^2 C_L^\infty(\gamma),\qquad
 \tau_R^2\approx \sigma^2 C_R^\infty(\gamma),
 $$
-and use the two-sided SPC law as written.
+and use the two-sided spectral echo law as written.
 
 2) **Single-scalar collapse (common in practice).** Average the two scales,
 $$
 \boxed{
-\mathbb E[\mathrm{SPC}(s)]\;\approx\;\frac{1}{\big(1+\tau^2/s^2\big)^{q}},
+\mathbb E[\mathrm{spectral echo}(s)]\;\approx\;\frac{1}{\big(1+\tau^2/s^2\big)^{q}},
 \qquad
 \tau^2 := \tfrac12(\tau_L^2+\tau_R^2),\quad q=1.
 }
@@ -230,7 +230,7 @@ which places the knee correctly and matches the observed “same shape, horizont
   $$
   or the pairwise-difference equivalent (often more stable).
 - **Setting $\tau^2$**: $\widehat\tau^2=\widehat\sigma^2\,\kappa(\gamma)$ with a precomputed/tabled $\kappa(\gamma)$ or the proxy $(1+\sqrt\gamma)^2$.
-- **Fitting from SPC curves** (if you skip $\sigma^2$): regress $y_i=(1/\mathrm{SPC}_i-1)$ onto $x_i=1/s_i^2$ through the origin to get $\widehat\tau^2$ directly.
+- **Fitting from spectral echo curves** (if you skip $\sigma^2$): regress $y_i=(1/\mathrm{spectral echo}_i-1)$ onto $x_i=1/s_i^2$ through the origin to get $\widehat\tau^2$ directly.
 
 ---
 
@@ -246,7 +246,7 @@ which places the knee correctly and matches the observed “same shape, horizont
 A simple, testable law captures your curves:
 $$
 \boxed{
-\mathbb E[\mathrm{SPC}(s)]\ \approx\ \frac{1}{\big(1+\tau^2/s^2\big)^{q}},\qquad
+\mathbb E[\mathrm{spectral echo}(s)]\ \approx\ \frac{1}{\big(1+\tau^2/s^2\big)^{q}},\qquad
 \tau^2\approx \sigma^2\,\kappa(\gamma),\ \ q\approx 1,
 }
 $$

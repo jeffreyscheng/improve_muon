@@ -91,12 +91,12 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
         return U.clone(), s.clone(), Vh.clone()
 
 
-def compute_spc_by_permutation_alignment(
+def compute_spectral_echo_by_permutation_alignment(
     mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
     """
-    Compute spectral projection coefficients via Procrustes alignment.
+    Compute spectral echo via Procrustes alignment.
 
     Args:
         mb_svd: (U_b, S_b, Vh_b) from batched SVD of per-minibatch gradients
@@ -105,7 +105,7 @@ def compute_spc_by_permutation_alignment(
                 U_m: [H, K], S_m: [K], Vh_m: [K, W]
 
     Returns:
-        SPC tensor [B, K] where each entry corresponds to the product of
+        spectral_echo tensor [B, K] where each entry corresponds to the product of
         cosine agreements between matched singular directions (via a
         permutation alignment) of (U_b,V_b) to (U_m,V_m).
     """
@@ -133,7 +133,7 @@ def compute_spc_by_permutation_alignment(
 
     B, Kb, Km = M.shape
     Kc = min(Kb, Km)
-    spc_out = U_b.new_zeros((B, Kc))
+    echo_out = U_b.new_zeros((B, Kc))
 
     # Greedy permutation alignment per batch: maximize sum of matches
     for b in range(B):
@@ -152,24 +152,24 @@ def compute_spc_by_permutation_alignment(
                 continue
             assigned[i] = j
             used[j] = True
-        # Build SPC vector for first Kc columns of mean
+        # Build spectral echo vector for first Kc columns of mean
         for i in range(Kc):
             j = int(assigned[i].item())
             if j >= 0:
-                spc_out[b, i] = Mb[j, i]
+                echo_out[b, i] = Mb[j, i]
             else:
-                spc_out[b, i] = 0.0
-    return spc_out
+                echo_out[b, i] = 0.0
+    return echo_out
 
 
-def compute_spc_and_alignment(
+def compute_spectral_echo_and_alignment(
     mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute SPC and the alignment indices j*(i) per batch.
+    """Compute spectral echo and the alignment indices j*(i) per batch.
 
     Returns:
-        spc_out: [B, Kc]
+        echo_out: [B, Kc]
         assign_idx: [B, Kc] long, where assign_idx[b, i] = j index in minibatch aligning to mean i, or -1.
     """
     U_b, _, Vh_b = mb_svd
@@ -190,7 +190,7 @@ def compute_spc_and_alignment(
 
     B, Kb, Km = M.shape
     Kc = min(Kb, Km)
-    spc_out = U_b.new_zeros((B, Kc))
+    echo_out = U_b.new_zeros((B, Kc))
     assign_idx = torch.full((B, Kc), -1, dtype=torch.long, device=U_b.device)
 
     for b in range(B):
@@ -210,12 +210,12 @@ def compute_spc_and_alignment(
         for i in range(Kc):
             j = int(assigned[i].item())
             if j >= 0:
-                spc_out[b, i] = Mb[j, i]
+                echo_out[b, i] = Mb[j, i]
                 assign_idx[b, i] = j
             else:
-                spc_out[b, i] = 0.0
+                echo_out[b, i] = 0.0
                 assign_idx[b, i] = -1
-    return spc_out, assign_idx
+    return echo_out, assign_idx
 
 
 def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
@@ -312,39 +312,38 @@ def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
     return w * (len(w) / w.sum())
 
 
-def _spc_model_np(s: np.ndarray, tau2: float) -> np.ndarray:
+def _spectral_echo_model_np(s: np.ndarray, tau2: float) -> np.ndarray:
     return 1.0 / (1.0 + (tau2 / (s * s)))
 
 
 def fit_empirical_phase_constant_tau2(
     minibatch_singular_values: torch.Tensor,
-    spectral_projection_coefficients: torch.Tensor,
-    *,
+    spectral_echo: torch.Tensor,
     eps: float = 1e-12,
     nbins: int = 32,
 ) -> float:
-    """Weighted nonlinear LS for tau^2 in SPC(s)=1/(1+tau^2/s^2), with log-space reweighting.
+    """Weighted nonlinear LS for tau^2 in spectral_echo(s)=1/(1+tau^2/s^2), with log-space reweighting.
 
     Uses SciPy's curve_fit when available. Falls back to median moment if not.
     """
     with torch.no_grad():
         s = minibatch_singular_values.reshape(-1).detach().cpu().numpy().astype(np.float64)
-        spc = spectral_projection_coefficients.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        echo = spectral_echo.reshape(-1).detach().cpu().numpy().astype(np.float64)
         if s.size == 0:
             return 0.0
         s = np.clip(s, eps, None)
-        spc = np.clip(spc, eps, 1.0 - eps)
+        echo = np.clip(echo, eps, 1.0 - eps)
 
         if _scipy_curve_fit is not None:
             w = _logspace_weights_np(s, nbins=nbins)
             sigma = 1.0 / np.sqrt(w)
-            tau2_init = float(np.mean((s * s) * (1.0 / spc - 1.0)))
+            tau2_init = float(np.mean((s * s) * (1.0 / echo - 1.0)))
             tau2_init = max(tau2_init, eps)
             try:
                 (tau2_hat,), _ = _scipy_curve_fit(
-                    _spc_model_np,
+                    _spectral_echo_model_np,
                     xdata=s,
-                    ydata=spc,
+                    ydata=echo,
                     p0=(tau2_init,),
                     bounds=(eps, 1e40),
                     sigma=sigma,
@@ -356,7 +355,7 @@ def fit_empirical_phase_constant_tau2(
                 pass
 
         # Fallback: robust per-point estimator (median)
-        y = (s * s) * (1.0 / spc - 1.0)
+        y = (s * s) * (1.0 / echo - 1.0)
         tau2 = float(np.median(y))
         return float(max(tau2, 0.0))
 

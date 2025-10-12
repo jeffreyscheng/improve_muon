@@ -38,14 +38,14 @@ from empirical.research.analysis.property_pipeline import PropertySpec, Property
 from empirical.research.analysis.core_math import (
     matrix_shape_beta,
     stable_rank_from_tensor, safe_svd,
-    compute_spc_and_alignment, gather_aligned_singulars,
+    compute_spectral_echo_and_alignment, gather_aligned_singulars,
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
     compute_panel_xs,
-    predict_spc_curve_np,
+    predict_spectral_echo_curve_np,
     newton_schulz_quintic_function,
     PARAM_TYPES,
 )
@@ -88,11 +88,11 @@ ANALYSIS_SPECS = [
     PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
     
     # Spectral projection analysis (with Procrustes alignment)
-    PropertySpec("spc_and_alignment",
+    PropertySpec("spectral_echo_and_alignment",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
-                compute_spc_and_alignment),
-    PropertySpec("spectral_projection_coefficients", ["spc_and_alignment"], lambda t: t[0]),
-    PropertySpec("aligned_minibatch_singular_values", ["spc_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
+                compute_spectral_echo_and_alignment),
+    PropertySpec("spectral_echo", ["spectral_echo_and_alignment"], lambda t: t[0]),
+    PropertySpec("aligned_minibatch_singular_values", ["spectral_echo_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
     # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
 
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
@@ -100,7 +100,7 @@ ANALYSIS_SPECS = [
     PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
     PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
-    PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
+    PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_echo"], fit_empirical_phase_constant_tau2),
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -157,13 +157,10 @@ def shard_param_keys(all_keys: list[Tuple[str, int]], rank: int, world_size: int
 
 def compute_analysis_for_step(
     step: int,
-    checkpoint_file: str, 
     num_minibatches: int,
     rank: int,
     world_size: int,
-    device: torch.device,
     model: torch.nn.Module,
-    *,
     initial_props: GPTLayerProperty | None = None,
     specs: list[PropertySpec] | None = None,
     run_id: str | None = None,
@@ -211,10 +208,6 @@ def compute_analysis_for_step(
     return local_results
 
 
-## removed legacy record/viz builders in favor of direct GPTLayerProperty usage
-
-
-
 def to_np16(x):
     if isinstance(x, torch.Tensor):
         return x.detach().to(torch.float16).cpu().numpy()
@@ -257,7 +250,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'per_minibatch_gradient_singular_values',
         'gradient_singular_value_standard_deviations',
         'per_minibatch_gradient_stable_rank',
-        'spectral_projection_coefficients_from_8x_mean_gradient',
+        'spectral_echo_from_8x_mean_gradient',
         'shape',
         'gradient_noise_sigma2',
         'empirical_phase_constant_tau2',
@@ -277,7 +270,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'per_minibatch_gradient_singular_values': json.dumps(to_np16(props['minibatch_singular_values']).tolist()),
                 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
-                'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props['spectral_projection_coefficients']).tolist()),
+                'spectral_echo_from_8x_mean_gradient': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
@@ -301,12 +294,12 @@ def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
 
 
 
-def create_pred_vs_actual_spc_log_log_subplot(ax, prop: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+def create_pred_vs_actual_spectral_echo_subplot(ax, prop: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
-    ax.set_xlabel('Predicted SPC (log scale)')
-    ax.set_ylabel('Actual SPC (log scale)')
-    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, alpha=0.3)
-    ax.set_xlim(1e-8, 1.0); ax.set_ylim(1e-8, 1.0)
+    ax.set_xlabel('Predicted spectral echo')
+    ax.set_ylabel('Actual spectral echo')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
     denom = max(1, max_layers - 1)
     for (pt, layer), arr in sorted(prop.items(), key=lambda x: x[0][1]):
         if pt != param_type: continue
@@ -322,33 +315,33 @@ def create_pred_vs_actual_spc_log_log_subplot(ax, prop: GPTLayerProperty, param_
         color = viridis(layer / denom)
         ax.scatter(pred, actual, s=6, alpha=0.2, c=[color])
     # y=x reference
-    xs = np.geomspace(1e-8, 1.0, 200)
+    xs = np.linspace(0.0, 1.0, 200)
     ax.plot(xs, xs, ls='--', lw=1.0, color='black')
     return []
 
-def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
     ax.set_xlabel('Singular value s (log scale)')
     ax.set_ylabel('Spectral projection coefficient')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
     ax.set_ylim(0.0, 1.0)
-    # Actual SPC vs s per layer (scatter)
+    # Actual spectral echo vs s per layer (scatter)
     denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sv = d.get('sv'); spc = d.get('spc')
-        if sv is None or spc is None:
+        sv = d.get('sv'); echo = d.get('spectral_echo')
+        if sv is None or echo is None:
             continue
         sv = np.asarray(sv, dtype=float).flatten()
-        spc = np.clip(np.asarray(spc, dtype=float).flatten(), 0.0, 1.0)
-        if sv.size == 0 or spc.size == 0:
+        echo = np.clip(np.asarray(echo, dtype=float).flatten(), 0.0, 1.0)
+        if sv.size == 0 or echo.size == 0:
             continue
-        m = min(sv.size, spc.size)
-        sv = sv[:m]; spc = spc[:m]
+        m = min(sv.size, echo.size)
+        sv = sv[:m]; echo = echo[:m]
         color = viridis(layer / denom)
         order = np.argsort(sv)
-        ax.scatter(sv[order], spc[order], s=6, alpha=0.25, c=[color])
+        ax.scatter(sv[order], echo[order], s=6, alpha=0.25, c=[color])
     # Common x-grid across panel
     xs = compute_panel_xs(panel)
     xs_max = float(np.max(xs)) if xs.size else 1.0
@@ -357,7 +350,7 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
         y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
         ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
-    # Overlay predicted E[SPC] for each layer using tau2
+    # Overlay predicted E[spectral_echo] for each layer using tau2
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
@@ -365,9 +358,43 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
         if tau2 is None:
             continue
         color = viridis(layer / denom)
-        y_pred = predict_spc_curve_np(xs, float(tau2)) if xs.size else np.array([])
+        y_pred = predict_spectral_echo_curve_np(xs, float(tau2)) if xs.size else np.array([])
         if y_pred.size:
             ax.plot(xs, y_pred, color=color, lw=1.0, alpha=0.9)
+    return []
+
+
+def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+    ax.set_title(f"{param_type} (normalized s)")
+    ax.set_xlabel('Normalized singular value s/max(s) (log scale)')
+    ax.set_ylabel('Spectral echo')
+    ax.set_xscale('log'); ax.grid(True, alpha=0.3)
+    ax.set_ylim(0.0, 1.0)
+    denom = max(1, max_layers - 1)
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        sv = d.get('sv'); echo = d.get('spectral_echo')
+        if sv is None or echo is None:
+            continue
+        sv = np.asarray(sv, dtype=float).flatten()
+        echo = np.clip(np.asarray(echo, dtype=float).flatten(), 0.0, 1.0)
+        if sv.size == 0 or echo.size == 0:
+            continue
+        m = min(sv.size, echo.size)
+        sv = sv[:m]; echo = echo[:m]
+        smax = np.max(sv)
+        if smax <= 0:
+            continue
+        svn = sv / smax
+        order = np.argsort(svn)
+        color = viridis(layer / denom)
+        ax.scatter(svn[order], echo[order], s=6, alpha=0.25, c=[color])
+        tau2 = d.get('tau2', None)
+        if tau2 is None:
+            continue
+        y_pred = predict_spectral_echo_curve_np(sv[order], float(tau2))
+        ax.plot(svn[order], y_pred, color=color, lw=1.0, alpha=0.9)
     return []
 
 
@@ -431,29 +458,41 @@ def main():
         checkpoints = checkpoints[:2]
         if rank == 0:
             print(f"Testing mode enabled: processing {len(checkpoints)} checkpoints")
-    # Collect time series for two GIFs (rank 0 only)
+    # Collect time series (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
-    spc_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
-    spc_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
+    echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
+    echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
     kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
+    noise_panel_ts: Dict[int, GPTLayerProperty] = {}
+    aggregated_payload_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
-        local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
+        local_payload = compute_analysis_for_step(step, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, model=model, run_id=run_id)
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
             pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
-            noise_panel = build_noise_to_phase_gptlp(aggregated_payload)
-            kappa_map = fit_per_type_kappa_loglog(noise_panel)
-            spc_singular_direct_ts[step] = build_spc_singular_gptlp(aggregated_payload)
-            spc_singular_from_kappa_ts[step] = build_spc_singular_gptlp_from_kappa(aggregated_payload, kappa_map)
-            kappa_calibration_ts[step] = build_kappa_calibration_panel(noise_panel, kappa_map)
+            noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
+            echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
+            aggregated_payload_ts[step] = aggregated_payload
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
+        # Fit global kappa across all checkpoints (per param type)
+        # Aggregate all noise panels
+        combined_noise: GPTLayerProperty = {}
+        for panel in noise_panel_ts.values():
+            combined_noise.update(panel)
+        kappa_map = fit_per_type_kappa_loglog(combined_noise)
+
+        # Build per-step kappa-derived panels using the same kappa_map
+        for step, panel in noise_panel_ts.items():
+            kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
+            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(aggregated_payload_ts[step], kappa_map)
+
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_direct_ts, spc_singular_from_kappa_ts, kappa_calibration_ts)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, echo_singular_direct_ts, echo_singular_from_kappa_ts, kappa_calibration_ts)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
@@ -463,26 +502,26 @@ def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerPro
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
         sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
-        actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        actual = props['spectral_echo'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
         n = min(len(sv), len(actual))
         if n:
-            pred = predict_spc_curve_np(sv[:n], tau2)
+            pred = predict_spectral_echo_curve_np(sv[:n], tau2)
             out[key] = np.vstack([np.clip(pred, 1e-8, 1.0), np.clip(actual[:n], 1e-8, 1.0)])
     return out
 
 
-def build_spc_singular_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
         sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
-        spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        echo = props['spectral_echo'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
-        n = min(len(sv), len(spc))
+        n = min(len(sv), len(echo))
         if n:
             out[key] = {
                 'sv': sv[:n],
-                'spc': spc[:n],
+                'spectral_echo': echo[:n],
                 'tau2': tau2,
                 'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
             }
@@ -518,21 +557,21 @@ def fit_per_type_kappa_loglog(noise_panel: GPTLayerProperty) -> Dict[str, float]
     return kappa_map
 
 
-def build_spc_singular_gptlp_from_kappa(aggregated_payload: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
-    """SPC vs s panel with overlays using tau2 = kappa(param_type) * sigma2(layer)."""
+def build_spectral_echo_vs_sv_panel_from_kappa(aggregated_payload: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
+    """Spectral-echo vs s panel with overlays using tau2 = kappa(param_type) * sigma2(layer)."""
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
         param_type, _ = key
         sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
-        spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        echo = props['spectral_echo'].detach().cpu().numpy().flatten()
         sigma2 = float(props.get('gradient_noise_sigma2', np.nan))
         kappa = float(kappa_map.get(param_type, np.nan))
         tau2 = sigma2 * kappa if np.isfinite(sigma2) and np.isfinite(kappa) else np.nan
-        n = min(len(sv), len(spc))
+        n = min(len(sv), len(echo))
         if n:
             out[key] = {
                 'sv': sv[:n],
-                'spc': spc[:n],
+                'spectral_echo': echo[:n],
                 'tau2': tau2,
                 'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
             }
@@ -553,13 +592,15 @@ def build_kappa_calibration_panel(noise_panel: GPTLayerProperty, kappa_map: Dict
 
 def generate_gifs_for_run(out_dir: Path,
                           pred_ts: Dict[int, GPTLayerProperty],
-                          spc_ts_direct: Dict[int, GPTLayerProperty],
-                          spc_ts_kappa: Dict[int, GPTLayerProperty],
+                          echo_ts_direct: Dict[int, GPTLayerProperty],
+                          echo_ts_kappa: Dict[int, GPTLayerProperty],
                           kappa_ts: Dict[int, GPTLayerProperty]):
-    make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(spc_ts_direct, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values_direct", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(spc_ts_kappa, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values_from_kappa", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spectral_echo_subplot, title="pred_vs_actual_spectral_echo", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_direct", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(echo_ts_kappa, create_spectral_echo_vs_sv_semilog_subplot, title="spectral_echo_vs_singular_values_from_kappa", output_dir=out_dir)
     make_gif_from_layer_property_time_series(kappa_ts, create_kappa_calibration_subplot, title="kappa_calibration", output_dir=out_dir)
+    # Normalized-x spectral-echo plot (using direct tau2 overlays)
+    make_gif_from_layer_property_time_series(echo_ts_direct, create_spectral_echo_vs_sv_semilog_normalized_subplot, title="spectral_echo_vs_singular_values_normalized_direct", output_dir=out_dir)
 
 
 if __name__ == "__main__":

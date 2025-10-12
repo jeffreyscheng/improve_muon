@@ -91,8 +91,8 @@ def newton_schulz_quintic_function(x):
     return out
 
 
-def predict_spc_curve_np(s: np.ndarray, tau2: float) -> np.ndarray:
-    """Predict E[SPC(s)] = 1 / (1 + tau^2 / s^2).
+def predict_spectral_echo_curve_np(s: np.ndarray, tau2: float) -> np.ndarray:
+    """Predict E[spectral_echo(s)] = 1 / (1 + tau^2 / s^2).
 
     Args:
         s: singular values (>=0)
