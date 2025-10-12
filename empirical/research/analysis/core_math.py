@@ -303,63 +303,19 @@ def fit_empirical_phase_constant_tau2(
     minibatch_singular_values: torch.Tensor,
     spectral_projection_coefficients: torch.Tensor
 ) -> float:
-    """Nonlinear least squares fit of tau^2 using per-minibatch singular values.
+    """Robust per-point estimator for tau^2 using per-minibatch s.
 
-    Minimize J(tau2) = sum_i (spc_i - x_i / (x_i + tau2))^2, where x_i = s_i^2.
-    Uses a 1D gradient descent in log-parameter space for stability.
+    Computes y_i = s_i^2 * (1/SPC_i - 1) and returns median(y_i).
     """
     with torch.no_grad():
-        eps = 1e-16
-        s = minibatch_singular_values.clamp(min=eps).reshape(-1).double()
-        spc = spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps).reshape(-1).double()
+        eps = 1e-12
+        s = minibatch_singular_values.reshape(-1).to(dtype=torch.float64).clamp(min=eps)
+        spc = spectral_projection_coefficients.reshape(-1).to(dtype=torch.float64).clamp(min=eps, max=1.0 - eps)
         if s.numel() == 0:
             return 0.0
-        x = s * s  # s^2
-
-        # Robust initial guess via median of z_i = (1/spc - 1) * x
-        z0 = torch.median(((1.0 / spc) - 1.0) * x).item()
-        z0 = float(max(z0, eps))
-        logging.info(f"tau2_fit: N={int(s.numel())} x_min={float(x.min()):.3e} x_med={float(x.median()):.3e} x_max={float(x.max()):.3e} spc_min={float(spc.min()):.3e} spc_med={float(spc.median()):.3e} spc_max={float(spc.max()):.3e} z0={z0:.3e}")
-
-        def objective(z):
-            y_pred = x / (x + z)
-            r = spc - y_pred
-            return torch.sum(r * r)
-
-        def grad(z):
-            # d/dz y_pred = -x/(x+z)^2
-            dy = -x / ((x + z) * (x + z))
-            r = spc - (x / (x + z))
-            # dJ/dz = -2 sum r * dy = 2 sum r * x/(x+z)^2
-            return 2.0 * torch.sum(r * (-dy))
-
-        # Optimize over u = log(z) for positivity
-        u = math.log(z0)
-        z = torch.tensor(z0, dtype=torch.float64)
-        J_prev = objective(z)
-        step = 0.5
-        for it in range(200):
-            z = torch.tensor(math.exp(u), dtype=torch.float64)
-            g = grad(z) * z  # chain rule dJ/du = dJ/dz * dz/du = dJ/dz * z
-            # Take a tentative step
-            u_new = u - step * float(g)
-            z_new = torch.tensor(math.exp(u_new), dtype=torch.float64)
-            J_new = objective(z_new)
-            if torch.isfinite(J_new) and (J_new <= J_prev or step < 1e-6):
-                # Accept step; maybe increase step a bit
-                u, J_prev = u_new, J_new
-                step = min(step * 1.1, 1.0)
-                # Converged?
-                if J_prev.item() < 1e-24:
-                    break
-            else:
-                # Backtrack
-                step *= 0.5
-            if it % 20 == 0:
-                logging.info(f"tau2_fit: it={it} step={step:.2e} J={float(J_prev):.3e} tau2={math.exp(u):.3e}")
-        tau2 = float(math.exp(u))
-        logging.info(f"tau2_fit: done J={float(J_prev):.3e} tau2={tau2:.3e}")
-        return max(tau2, 0.0)
+        y = (s * s) * (1.0 / spc - 1.0)
+        tau2 = torch.median(y).item()
+        return float(max(tau2, 0.0))
 
 def fit_empirical_noise_to_phase_slope_kappa(
     gradient_noise_sigma2: GPTLayerProperty,
