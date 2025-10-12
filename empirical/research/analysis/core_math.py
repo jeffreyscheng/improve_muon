@@ -10,6 +10,10 @@ import math
 import logging
 from typing import Union, Tuple, Dict
 import numpy as np
+try:
+    from scipy.optimize import curve_fit as _scipy_curve_fit
+except Exception:
+    _scipy_curve_fit = None
 import torch
 
 from empirical.research.analysis.model_utilities import GPTLayerProperty
@@ -299,22 +303,61 @@ def estimate_gradient_noise_sigma2(
         total_frob2 = torch.sum(frob2_per_mb)
         return float(total_frob2 / max(1, (B - 1) * m * n))
  
+def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
+    log_s = np.log(s)
+    edges = np.linspace(log_s.min(), log_s.max(), nbins + 1)
+    idx = np.clip(np.digitize(log_s, edges) - 1, 0, nbins - 1)
+    counts = np.bincount(idx, minlength=nbins).astype(np.float64)
+    w = 1.0 / np.maximum(counts[idx], 1.0)
+    return w * (len(w) / w.sum())
+
+
+def _spc_model_np(s: np.ndarray, tau2: float) -> np.ndarray:
+    return 1.0 / (1.0 + (tau2 / (s * s)))
+
+
 def fit_empirical_phase_constant_tau2(
     minibatch_singular_values: torch.Tensor,
-    spectral_projection_coefficients: torch.Tensor
+    spectral_projection_coefficients: torch.Tensor,
+    *,
+    eps: float = 1e-12,
+    nbins: int = 32,
 ) -> float:
-    """Robust per-point estimator for tau^2 using per-minibatch s.
+    """Weighted nonlinear LS for tau^2 in SPC(s)=1/(1+tau^2/s^2), with log-space reweighting.
 
-    Computes y_i = s_i^2 * (1/SPC_i - 1) and returns median(y_i).
+    Uses SciPy's curve_fit when available. Falls back to median moment if not.
     """
     with torch.no_grad():
-        eps = 1e-12
-        s = minibatch_singular_values.reshape(-1).to(dtype=torch.float64).clamp(min=eps)
-        spc = spectral_projection_coefficients.reshape(-1).to(dtype=torch.float64).clamp(min=eps, max=1.0 - eps)
-        if s.numel() == 0:
+        s = minibatch_singular_values.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        spc = spectral_projection_coefficients.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        if s.size == 0:
             return 0.0
+        s = np.clip(s, eps, None)
+        spc = np.clip(spc, eps, 1.0 - eps)
+
+        if _scipy_curve_fit is not None:
+            w = _logspace_weights_np(s, nbins=nbins)
+            sigma = 1.0 / np.sqrt(w)
+            tau2_init = float(np.mean((s * s) * (1.0 / spc - 1.0)))
+            tau2_init = max(tau2_init, eps)
+            try:
+                (tau2_hat,), _ = _scipy_curve_fit(
+                    _spc_model_np,
+                    xdata=s,
+                    ydata=spc,
+                    p0=(tau2_init,),
+                    bounds=(eps, 1e40),
+                    sigma=sigma,
+                    absolute_sigma=False,
+                    maxfev=20000,
+                )
+                return float(max(tau2_hat, 0.0))
+            except Exception:
+                pass
+
+        # Fallback: robust per-point estimator (median)
         y = (s * s) * (1.0 / spc - 1.0)
-        tau2 = torch.median(y).item()
+        tau2 = float(np.median(y))
         return float(max(tau2, 0.0))
 
 def fit_empirical_noise_to_phase_slope_kappa(
