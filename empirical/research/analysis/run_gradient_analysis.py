@@ -370,36 +370,36 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
     return []
 
 
-def create_noise_to_phase_slope_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+def create_kappa_calibration_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
-    ax.set_xlabel('Gradient noise variance σ^2 (log)')
-    ax.set_ylabel('Phase constant τ^2 (log)')
-    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, which='both', alpha=0.3)
-    # Collect points
+    ax.set_xlabel('σ^2 · κ (fitted)')
+    ax.set_ylabel('Fitted τ^2')
+    ax.grid(True, alpha=0.3)
+    # Collect per-layer points
     xs, ys, layers = [], [], []
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        sigma2 = d.get('sigma2'); tau2 = d.get('tau2')
-        if sigma2 is None or tau2 is None:
+        if 'sigma2' not in d or 'tau2' not in d:
             continue
-        xs.append(float(sigma2)); ys.append(float(tau2)); layers.append(layer)
+        sigma2 = float(d['sigma2']); tau2 = float(d['tau2'])
+        if sigma2 <= 0 or not np.isfinite(tau2) or tau2 <= 0:
+            continue
+        xs.append(sigma2); ys.append(tau2); layers.append(layer)
     if not xs:
         return []
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
+    # OLS through origin to get a single κ per param_type
+    kappa_hat = float(np.dot(xs, ys) / max(1e-30, np.dot(xs, xs)))
+    x_cal = xs * kappa_hat
     denom = max(1, max_layers - 1)
-    for x, y, layer in zip(xs, ys, layers):
-        ax.scatter([x], [y], c=[viridis(layer / denom)], s=24, alpha=0.9)
-    # Fit kappa using middle 50% kappas (IQR) and draw single line y = kappa x
-    kappas = ys / xs
-    q25, q75 = np.quantile(kappas, 0.25), np.quantile(kappas, 0.75)
-    mask = (kappas >= q25) & (kappas <= q75)
-    x_f, y_f = xs[mask], ys[mask]
-    if x_f.size and np.any(x_f > 0):
-        slope = float(np.dot(x_f, y_f) / max(1e-30, np.dot(x_f, x_f)))
-        xline = np.geomspace(xs.min(), xs.max(), 200)
-        ax.plot(xline, slope * xline, color='black', lw=1.6)
+    for x, y, layer in zip(x_cal, ys, layers):
+        ax.scatter([x], [y], c=[viridis(layer / denom)], s=26, alpha=0.9)
+    # y=x reference
+    x_max = float(max(np.max(x_cal), np.max(ys)))
+    xline = np.linspace(0.0, x_max * 1.05, 200)
+    ax.plot(xline, xline, ls='--', lw=1.2, color='black')
     return []
 
 
@@ -426,7 +426,7 @@ def main():
     # Collect time series for two GIFs (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}
-    noise_to_phase_ts: Dict[int, GPTLayerProperty] = {}
+    kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
@@ -435,13 +435,13 @@ def main():
         if rank == 0 and aggregated_payload is not None:
             pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
             spc_singular_gptlp_ts[step] = build_spc_singular_gptlp(aggregated_payload)
-            noise_to_phase_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
+            kappa_calibration_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_gptlp_ts, noise_to_phase_ts)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_gptlp_ts, kappa_calibration_ts)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
@@ -489,10 +489,10 @@ def build_noise_to_phase_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayer
 def generate_gifs_for_run(out_dir: Path,
                           pred_ts: Dict[int, GPTLayerProperty],
                           spc_ts: Dict[int, GPTLayerProperty],
-                          noise_ts: Dict[int, GPTLayerProperty]):
+                          kappa_ts: Dict[int, GPTLayerProperty]):
     make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
     make_gif_from_layer_property_time_series(spc_ts, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(noise_ts, create_noise_to_phase_slope_subplot, title="noise_to_phase_slope", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(kappa_ts, create_kappa_calibration_subplot, title="kappa_calibration", output_dir=out_dir)
 
 
 if __name__ == "__main__":
