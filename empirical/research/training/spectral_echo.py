@@ -92,7 +92,7 @@ class SpectralEcho(torch.optim.Optimizer):
         # Advertise noise sigma2 consumption (duck typing for training_core)
         self.expects_noise_sigma2 = True
         def _feed_sigma2(ps, s2):
-            # s2 is a tensor or list of floats; length must match ps
+            # s2 is a sequence aligned to ps; each element can be a float or 4‑length list for packed attention
             if hasattr(s2, 'detach'):
                 vals = s2.detach().cpu().tolist()
             else:
@@ -100,7 +100,12 @@ class SpectralEcho(torch.optim.Optimizer):
             if len(vals) != len(ps):
                 raise RuntimeError("feed_noise_sigma2: length mismatch")
             for p, v in zip(ps, vals):
-                self.state[p]['noise_sigma2'] = float(v)
+                if isinstance(v, (list, tuple)):
+                    if len(v) != 4:
+                        raise RuntimeError("noise_sigma2_slices must have length 4 for packed attention")
+                    self.state[p]['noise_sigma2_slices'] = [float(x) for x in v]
+                else:
+                    self.state[p]['noise_sigma2'] = float(v)
         self.feed_noise_sigma2 = _feed_sigma2
         for group in self.param_groups:
             for p in group["params"]:
@@ -130,21 +135,38 @@ class SpectralEcho(torch.optim.Optimizer):
                     kind = self.param_kind[p]
                     if kind == 'MLP Input' or kind == 'MLP Output':
                         kappa_val = float(layer_type_to_kappa[kind])
+                        sigma2_val = float(state.get("noise_sigma2", 0.0))
+                        kappa_t = torch._as_tensor_fullprec(kappa_val)
+                        sigma2_t = torch._as_tensor_fullprec(sigma2_val)
+                        self.update_func(
+                            p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
+                            p.grad, momentum,
+                            eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
+                            eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
+                            kappa=kappa_t,
+                            sigma2=sigma2_t,
+                        )
+                        continue
                     elif kind == 'packed_attention':
-                        # Per-slice kappas handled inside spectral_echo_via_svd
-                        kappa_val = 0.0
+                        # Per-slice kappas handled inside spectral_echo_via_svd; sigma2 is a 4‑vector if available
+                        s2_slices = state.get('noise_sigma2_slices', None)
+                        if s2_slices is not None:
+                            sigma2_t = torch.tensor(s2_slices, dtype=torch.float32, device=p.device)
+                        else:
+                            sigma2_t = torch.zeros(4, dtype=torch.float32, device=p.device)
+                        kappa_t = torch.tensor(0.0, dtype=torch.float32, device=p.device)
+                        self.update_func(
+                            p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
+                            p.grad, momentum,
+                            eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
+                            eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
+                            kappa=kappa_t,
+                            sigma2=sigma2_t,
+                        )
+                        continue
                     else:
                         raise RuntimeError(f"Unexpected param kind: {kind}")
-                    # Default to 0.0 during warmup if noise_sigma2 not yet provided
-                    sigma2_val = float(state.get("noise_sigma2", 0.0))
-                    self.update_func(
-                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
-                        p.grad, momentum,
-                        eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
-                        eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
-                        kappa=torch._as_tensor_fullprec(kappa_val),
-                        sigma2=torch._as_tensor_fullprec(sigma2_val),
-                    )
+                    # (handled in branches above)
                 futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
         torch.futures.collect_all(futures).wait()
 

@@ -461,7 +461,6 @@ def main():
     echo_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
     kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
     noise_panel_ts: Dict[int, GPTLayerProperty] = {}
-    aggregated_payload_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         local_payload = compute_analysis_for_step(step, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, model=model, run_id=run_id)
@@ -471,7 +470,14 @@ def main():
             pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
             noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
             echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
-            aggregated_payload_ts[step] = aggregated_payload
+            # Drop GPU-heavy payload immediately after extracting CPU arrays
+            aggregated_payload = None
+            local_payload = None
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
@@ -485,7 +491,7 @@ def main():
         # Build per-step kappa-derived panels using the same kappa_map
         for step, panel in noise_panel_ts.items():
             kappa_calibration_ts[step] = build_kappa_calibration_panel(panel, kappa_map)
-            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(aggregated_payload_ts[step], kappa_map)
+            echo_singular_from_kappa_ts[step] = build_spectral_echo_vs_sv_panel_from_kappa(echo_singular_direct_ts[step], panel, kappa_map)
 
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -554,14 +560,18 @@ def fit_per_type_kappa_loglog(noise_panel: GPTLayerProperty) -> Dict[str, float]
     return kappa_map
 
 
-def build_spectral_echo_vs_sv_panel_from_kappa(aggregated_payload: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
-    """Spectral-echo vs s panel with overlays using tau2 = kappa(param_type) * sigma2(layer)."""
+def build_spectral_echo_vs_sv_panel_from_kappa(direct_panel: GPTLayerProperty,
+                                               noise_panel: GPTLayerProperty,
+                                               kappa_map: Dict[str, float]) -> GPTLayerProperty:
+    """Use existing CPU direct panel (sv, spectral_echo, shape) and noise panel (sigma2) to set tau2 = kappa*sigma2."""
     out: GPTLayerProperty = {}
-    for key, props in aggregated_payload.items():
+    for key, d in direct_panel.items():
         param_type, _ = key
-        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
-        echo = props['spectral_echo'].detach().cpu().numpy().flatten()
-        sigma2 = float(props.get('gradient_noise_sigma2', np.nan))
+        sv = np.asarray(d.get('sv', []))
+        echo = np.asarray(d.get('spectral_echo', []))
+        shape = tuple(d.get('shape', ()))
+        np_noise = noise_panel.get(key, {}) if isinstance(noise_panel.get(key, None), dict) else {}
+        sigma2 = float(np_noise.get('sigma2', np.nan))
         kappa = float(kappa_map.get(param_type, np.nan))
         tau2 = sigma2 * kappa if np.isfinite(sigma2) and np.isfinite(kappa) else np.nan
         n = min(len(sv), len(echo))
@@ -570,7 +580,7 @@ def build_spectral_echo_vs_sv_panel_from_kappa(aggregated_payload: GPTLayerPrope
                 'sv': sv[:n],
                 'spectral_echo': echo[:n],
                 'tau2': tau2,
-                'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
+                'shape': shape,
             }
     return out
 
