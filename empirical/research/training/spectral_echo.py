@@ -67,7 +67,7 @@ def update(acc_bf16_view_u16: Tensor, mantissa: Tensor, momentum_buffer: Tensor,
     assert acc_bf16_view_u16.dtype == mantissa.dtype == torch.uint16
     grad = grad.float()
     momentum_buffer.copy_(momentum * momentum_buffer + (1 - momentum) * grad)
-    v = zeropower_function(momentum * momentum_buffer + (1 - momentum) * grad, float(kappa.item()), float(sigma2.item()))
+    v = zeropower_function(momentum * momentum_buffer + (1 - momentum) * grad, kappa, sigma2)
 
     acc_m_u32 = (acc_bf16_view_u16.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
     acc_m_u32.view(torch.float32).mul_(1 - eff_weight_decay)
