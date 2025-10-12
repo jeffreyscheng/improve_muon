@@ -83,3 +83,71 @@ $$
 $$
 
 Foundation models train with extremely large batch sizes, so the only thing that matters is the asymptotic order of the bias and variance of MsignThenAcc and AccThenMsign as estimators of the true preconditioned update.
+## Setup (2D intuition; then momentum)
+Let $y_t = g + \epsilon_t$ with $\mathbb{E}[\epsilon_t]=0$, $\operatorname{Cov}[\epsilon_t]=\Sigma$, and $u:=g/\|g\|$, $\rho:=\|g\|$. Define the EWMA weights $w_t=(1-\gamma)\gamma^t$ with $\sum_t w_t=1$ and $\sum_t w_t^2=\frac{1-\gamma}{1+\gamma}$. Let $n_{\mathrm{eff}}:=1/\sum_t w_t^2=\frac{1+\gamma}{1-\gamma}$.
+
+Two estimators of the *unit* preconditioned direction $u$:
+- **MsignThenAcc** (normalize after averaging): $\hat u_{\mathrm{post}} := \frac{\sum_t w_t y_t}{\left\|\sum_t w_t y_t\right\|}$.
+- **AccThenMsign** (normalize before averaging): $\hat u_{\mathrm{pre}} := \sum_t w_t \frac{y_t}{\|y_t\|}$ (optionally renormalized at the very end; bias/variance below are directional—scale factors are irrelevant to the direction).
+
+We use a second-order delta method for $h(x)=x/\|x\|$ at $x=g$. Write $P_\perp := I - uu^\top$ (orthogonal projector).
+
+## MsignThenAcc (normalize **after** averaging)
+Let $\bar y:=\sum_t w_t y_t = g + \bar\epsilon$, with $\mathbb{E}[\bar\epsilon]=0$ and $\operatorname{Cov}[\bar\epsilon]=\Sigma_\gamma:=\left(\sum_t w_t^2\right)\Sigma=\frac{1-\gamma}{1+\gamma}\Sigma$.
+
+**Bias (directional):**
+First-order bias vanishes; the leading bias is second order:
+$$
+\mathbb{E}[\hat u_{\mathrm{post}}]
+= u \;-\; \frac{1}{2\rho^2}\,u\,\operatorname{tr}\!\big(P_\perp \Sigma_\gamma\big) \;+\; O\!\left(\frac{\|\Sigma\|^2}{\rho^4}\right).
+$$
+Equivalently,
+$$
+\mathrm{Bias}_{\mathrm{post}}
+:= \mathbb{E}[\hat u_{\mathrm{post}}]-u
+= - \frac{1}{2\rho^2}\,u\,\operatorname{tr}\!\big(P_\perp \Sigma\big)\frac{1-\gamma}{1+\gamma}
++ O\!\left(\frac{\|\Sigma\|^2}{\rho^4}\right).
+$$
+So the bias shrinks as $1/n_{\mathrm{eff}}$.
+
+**Variance (directional):**
+To first order (Jacobian $Dh_g = P_\perp/\rho$),
+$$
+\operatorname{Var}(\hat u_{\mathrm{post}})
+\;\approx\; \frac{1}{\rho^2}\, P_\perp \Sigma_\gamma P_\perp
+\;=\; \frac{1}{\rho^2}\, P_\perp \Sigma P_\perp \cdot \frac{1-\gamma}{1+\gamma}.
+$$
+
+## AccThenMsign (normalize **before** averaging)
+Expand each term $\frac{y_t}{\|y_t\|}$ around $g$ (same calculus, but now applied per-sample). For a single sample,
+$$
+\mathbb{E}\!\left[\frac{y}{\|y\|}\right]
+= u \;-\; \frac{1}{2\rho^2}\,u\,\operatorname{tr}\!\big(P_\perp \Sigma\big)
+\;+\; O\!\left(\frac{\|\Sigma\|^2}{\rho^4}\right).
+$$
+Averaging *does not* reduce this bias because it is per-sample and identical:
+$$
+\mathrm{Bias}_{\mathrm{pre}}
+:= \mathbb{E}[\hat u_{\mathrm{pre}}]-u
+= - \frac{1}{2\rho^2}\,u\,\operatorname{tr}\!\big(P_\perp \Sigma\big)
++ O\!\left(\frac{\|\Sigma\|^2}{\rho^4}\right).
+$$
+Compare to $\mathrm{Bias}_{\mathrm{post}}$: this one lacks the $\frac{1-\gamma}{1+\gamma}=\frac{1}{n_{\mathrm{eff}}}$ reduction—i.e., it does **not** shrink with longer averaging.
+
+**Variance (directional):**
+Each normalized sample has variance $\approx \frac{1}{\rho^2} P_\perp \Sigma P_\perp$ (plus curvature inflation). Averaging with weights $w_t$ yields
+$$
+\operatorname{Var}(\hat u_{\mathrm{pre}})
+\;\approx\; \frac{1}{\rho^2}\, P_\perp \Sigma P_\perp \cdot \frac{1-\gamma}{1+\gamma}
+\;+\; \text{(additional curvature terms)}.
+$$
+The leading $1/n_{\mathrm{eff}}$ rate matches **MsignThenAcc**, but constants are typically **larger** here due to per-sample nonlinear normalization (noise is “amplified” when $\rho$ is small).
+
+## Conclusion (2D and matrix case)
+- **MsignThenAcc**: bias $= O\!\big(\operatorname{tr}(P_\perp\Sigma)/(\rho^2 n_{\mathrm{eff}})\big)$, variance $= O\!\big((1/n_{\mathrm{eff}})\,P_\perp\Sigma P_\perp/\rho^2\big)$.
+- **AccThenMsign**: bias $= O\!\big(\operatorname{tr}(P_\perp\Sigma)/\rho^2\big)$ (does **not** decay with $n_{\mathrm{eff}}$), variance has the same $1/n_{\mathrm{eff}}$ rate but a larger constant.
+
+Therefore, **normalize after averaging** is the better estimator of the true preconditioned update—both theoretically (lower asymptotic bias; efficient to first order) and practically (uses magnitude information to stabilize direction). Translating back to matrices, the same calculus applies with vector normalization $\frac{x}{\|x\|}$ replaced by matrix sign/polar factor: $\mathrm{msign}\!\left(\sum_t w_t \tilde G_t\right)$ has bias that shrinks with $n_{\mathrm{eff}}$, while $\sum_t w_t \mathrm{msign}(\tilde G_t)$ retains an $O(\|\Sigma\|/\|G\|^2)$ bias independent of $n_{\mathrm{eff}}$ and shows larger variance constants.
+
+**Side note:** your spectral-norm steepest-descent derivation should use the SVD of $G$ (the gradient), not of $W$; the maximizer is the polar factor $U_G V_G^\top$, and the bound is $\|G\|_*$.
+

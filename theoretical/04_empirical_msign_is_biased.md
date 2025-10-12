@@ -1,4 +1,4 @@
-# Muon is Doubly Biased
+# Empirical Msign is Biased
 
 For true gradient $G=\nabla_W L$ and minibatch gradient $\hat{G}=G+E$ under Gaussian noise model $E\sim N(0, \Sigma)$, we can straightforwardly show that $\hat{G}$ is an unbiased estimator of $G$ by linearity of expectation.  
 
@@ -63,10 +63,6 @@ $$
 This equals the claimed formula. $\square$
 
 ---
-
-## How to empirically find $h$ without $G$
-
-TODO
 
 ## Notes
 

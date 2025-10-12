@@ -60,6 +60,10 @@ def matrix_shape_beta(shape: Union[Tuple[int, int], torch.Size]) -> float:
     return float(a) / float(b)
 
 
+# Backward-compatible alias used elsewhere in the codebase
+## No alias needed; use matrix_shape_beta directly
+
+
 ## Removed MP-specific density helpers (mp_pdf_singular_*). Finite-size Wishart overlays
 ## now come from tabulated CDFs (see wishart_tables.py).
 
@@ -204,32 +208,57 @@ def compute_innovation_spectrum(per_minibatch_grad: torch.Tensor, mean_grad: tor
         return s.clone()
 
 def estimate_gradient_noise_sigma2(
-    per_minibatch_gradient: torch.tensor,
-    mean_gradient: torch.tensor
+    per_minibatch_gradient: torch.Tensor,
+    mean_gradient: torch.Tensor
 ) -> float:
-    B, m, n = per_minibatch_gradient.shape
-    return 1.0 / ((B - 1) * m * n) * torch.linalg.norm((per_minibatch_gradient - mean_gradient), ord="fro").sum()
+    """Unbiased per-entry variance estimate from per-minibatch gradients.
+
+    sigma^2_hat = (1/((B-1) m n)) * sum_i ||G_i - G_bar||_F^2
+    """
+    with torch.no_grad():
+        B, m, n = per_minibatch_gradient.shape
+        diffs = per_minibatch_gradient - mean_gradient.unsqueeze(0)
+        # Frobenius norm squared per minibatch, then sum over batches
+        frob2_per_mb = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
+        total_frob2 = torch.sum(frob2_per_mb)
+        return float(total_frob2 / max(1, (B - 1) * m * n))
  
 def fit_empirical_phase_constant_tau2(
-    minibatch_singular_values: torch.tensor,
-    spectral_projection_coefficients: torch.tensor
+    minibatch_singular_values: torch.Tensor,
+    spectral_projection_coefficients: torch.Tensor
 ) -> float:
+    """Fit tau^2 from SPC vs singulars via y = tau^2 * x through origin.
+
+    x = 1/s^2,  y = 1/SPC - 1.  Use all (B,K) samples jointly.
     """
-    """
-    eps = 1e-10
-    A = (1.0 / minibatch_singular_values.clamp(min=eps) ** 2).unsqueeze(-1)
-    b = (1.0 / spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps) - 1.0).unsqueeze(-1)
-    return torch.linalg.lstsq(A, b).solution.squeeze()
+    with torch.no_grad():
+        eps = 1e-10
+        s = minibatch_singular_values.clamp(min=eps)
+        spc = spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps)
+        x = (1.0 / (s * s)).reshape(-1, 1)        # [BK, 1]
+        y = (1.0 / spc - 1.0).reshape(-1, 1)      # [BK, 1]
+        # Least squares through origin
+        sol = torch.linalg.lstsq(x, y).solution  # [1,1]
+        return float(sol.squeeze())
 
 def fit_empirical_noise_to_phase_slope_kappa(
     gradient_noise_sigma2: GPTLayerProperty,
     empirical_phase_constant_tau2: GPTLayerProperty
 ) -> float:
+    """Fit kappa in tau^2 ≈ kappa * sigma^2 using per-layer points.
+
+    Input dicts map (param_type, layer) -> scalar. We perform a
+    through-origin least squares fit across available layers.
     """
-    """
-    sigma2s = torch.tensor(list(gradient_noise_sigma2.values()))
-    tau2s = torch.tensor(list(empirical_phase_constant_tau2.values()))
-    return float(torch.linalg.lstsq(sigma2s, tau2s))
+    with torch.no_grad():
+        # Intersect keys to align x,y
+        keys = [k for k in empirical_phase_constant_tau2.keys() if k in gradient_noise_sigma2]
+        if not keys:
+            return float('nan')
+        sigma2s = torch.tensor([float(gradient_noise_sigma2[k]) for k in keys], dtype=torch.float64).reshape(-1, 1)
+        tau2s = torch.tensor([float(empirical_phase_constant_tau2[k]) for k in keys], dtype=torch.float64).reshape(-1, 1)
+        sol = torch.linalg.lstsq(sigma2s, tau2s).solution  # [1,1]
+        return float(sol.squeeze())
 
 def precompute_theoretical_noise_to_phase_slope_kappa(
     aspect_ratio_beta: float
@@ -237,3 +266,6 @@ def precompute_theoretical_noise_to_phase_slope_kappa(
     """
     """
     pass
+
+def aspect_ratio_beta(matrix: torch.Tensor) -> float:
+    return float(matrix_shape_beta(matrix.shape))

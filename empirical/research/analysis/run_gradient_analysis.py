@@ -13,7 +13,6 @@ Usage:
 
 import os
 import sys
-import glob
 import re
 from pathlib import Path
 import csv
@@ -37,33 +36,40 @@ from empirical.research.analysis.model_utilities import (
 )
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
+    matrix_shape_beta,
     stable_rank_from_tensor, safe_svd,
     compute_spc_by_permutation_alignment,
     estimate_gradient_noise_sigma2,
-    fit_empirical_noise_to_phase_slope_kappa,
     fit_empirical_phase_constant_tau2,
-    precompute_theoretical_noise_to_phase_slope_kappa  # TODO: implement
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
     compute_panel_xs,
     predict_spc_curve_np,
+    newton_schulz_quintic_function,
 )
-from empirical.research.analysis.wishart import (
-    aspect_ratio_beta as wishart_aspect_ratio_beta,
-    squared_true_signal_from_quadratic_formula,
-    predict_spectral_projection_coefficient_from_squared_true_signal,
-)
-from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, categorize_parameter
+from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint
 import logging
+
+
+# Small configuration knobs
+NUM_MINIBATCHES = 8
+LOG_EVERY = 5
+
+
+def gradients_stable_rank(grads: torch.Tensor) -> float:
+    return stable_rank_from_tensor(grads.view(-1, grads.shape[-1]))
+
+
+def singular_value_std(mb_sv: torch.Tensor, mean_sv: torch.Tensor) -> torch.Tensor:
+    return torch.std(mb_sv, dim=0)
 
 
 ANALYSIS_SPECS = [
     # Stable rank computations
     PropertySpec("weights_stable_rank", ["checkpoint_weights"], 
                 stable_rank_from_tensor),
-    PropertySpec("gradients_stable_rank", ["per_minibatch_gradient"], 
-                lambda grads: stable_rank_from_tensor(grads.view(-1, grads.shape[-1]))),
+    PropertySpec("gradients_stable_rank", ["per_minibatch_gradient"], gradients_stable_rank),
     
     # Core gradient analysis
     PropertySpec("mean_gradient", ["per_minibatch_gradient"], 
@@ -78,9 +84,7 @@ ANALYSIS_SPECS = [
                 lambda svd_tuple: svd_tuple[1]),
     PropertySpec("mean_singular_values", ["mean_gradient_svd"], 
                 lambda svd_tuple: svd_tuple[1]),
-    PropertySpec("singular_value_std", 
-                ["minibatch_singular_values", "mean_singular_values"],
-                lambda mb_sv, mean_sv: torch.std(mb_sv, dim=0)),
+    PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
     
     # Spectral projection analysis (with Procrustes alignment)
     PropertySpec("spectral_projection_coefficients",
@@ -89,7 +93,7 @@ ANALYSIS_SPECS = [
 
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
-                lambda w: float(wishart_aspect_ratio_beta(w))),
+                lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
     PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
     # PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
@@ -99,8 +103,6 @@ ANALYSIS_SPECS = [
 
     PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient"], estimate_gradient_noise_sigma2),
     PropertySpec("empirical_phase_constant_tau2", ["minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
-    PropertySpec("empirical_noise_to_phase_slope_kappa", ["aspect_ratio_beta", "gradient_noise_sigma2", "empirical_phase_constant_tau2"], fit_empirical_noise_to_phase_slope_kappa),
-    # PropertySpec("theoretical_kappa", ["aspect_ratio_beta"], precompute_theoretical_noise_to_phase_slope_kappa),
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -144,6 +146,17 @@ def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device
     return int(checkpoint_data['step'])
 
 
+def shard_param_keys(all_keys: list[Tuple[str, int]], rank: int, world_size: int) -> set:
+    """Shard parameter keys across ranks uniformly."""
+    n = len(all_keys)
+    if world_size <= 1:
+        return set(all_keys)
+    per = n // world_size
+    start = rank * per
+    end = start + per if rank < world_size - 1 else n
+    return set(all_keys[start:end])
+
+
 def compute_analysis_for_step(
     step: int,
     checkpoint_file: str, 
@@ -167,10 +180,7 @@ def compute_analysis_for_step(
         all_weights = get_weight_matrices(model, only_hidden=True)
         all_param_keys = list(all_weights.keys())
         # Shard parameters across ranks
-        params_per_rank = len(all_param_keys) // world_size
-        start_idx = rank * params_per_rank
-        end_idx = start_idx + params_per_rank if rank < world_size - 1 else len(all_param_keys)
-        my_param_keys = set(all_param_keys[start_idx:end_idx])
+        my_param_keys = shard_param_keys(all_param_keys, rank, world_size)
         if rank == 0:
             print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
         # Get sharded gradients
@@ -182,70 +192,57 @@ def compute_analysis_for_step(
             lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
             my_weights, gradients
         )
-
-        # Inject noise_sigma from serialized checkpoint
-        try:
-            ckpt = deserialize_model_checkpoint(Path(checkpoint_file))
-            muon_sigma_map: Dict[str, float] = ckpt['muon_sigma']
-        except Exception as e:
-            muon_sigma_map = {}
-
-        # Build per-layer sigma mappings from parameter names
-        sigma_attention: Dict[int, float] = {}
-        sigma_mlp_in: Dict[int, float] = {}
-        sigma_mlp_out: Dict[int, float] = {}
-        for name, _param in model.named_parameters():
-            try:
-                ptype, layer = categorize_parameter(name)
-            except Exception:
-                continue
-            if layer < 0:
-                continue
-            if name in muon_sigma_map:
-                s = float(muon_sigma_map[name])
-                if ptype == 'attention':
-                    sigma_attention[layer] = s
-                elif ptype == 'mlp_input':
-                    sigma_mlp_in[layer] = s
-                elif ptype == 'mlp_output':
-                    sigma_mlp_out[layer] = s
-
-        # Attach noise_sigma to initial_props per (param_type, layer)
-        for (ptype, layer), props in initial_props.items():
-            if ptype.startswith('Attention '):
-                sigma = sigma_attention.get(layer, 0.0)
-            elif ptype == 'MLP Input':
-                sigma = sigma_mlp_in.get(layer, 0.0)
-            elif ptype == 'MLP Output':
-                sigma = sigma_mlp_out.get(layer, 0.0)
-            else:
-                sigma = 0.0
-            props['noise_sigma'] = float(sigma)
+        # Removed noise_sigma injection from checkpoint; sigma^2 is computed per layer in-pipeline
     
     # 3. Execute analysis pipeline (5 LOC)
     pipeline = PropertyPipeline(specs or ANALYSIS_SPECS)
     
     def progress_callback(completed: int, total: int):
-        if rank == 0 and completed % 5 == 0:
+        if rank == 0 and completed % LOG_EVERY == 0:
             print(f"  Analyzed {completed}/{total} layers")
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
 
     # Stream results to per-rank CSV to avoid large in-memory payloads
     stream_write_analysis_results(local_results, step, rank, run_id or "unknown_run")
-    local_records = {}
-
-    # (no debug logs)
 
     if dist.is_initialized():
         dist.barrier()
     if rank == 0:
         print(f"Step {step}: Analysis complete (streamed to CSV)")
-    return {}, local_results
+    return local_results
 
 
 ## removed legacy record/viz builders in favor of direct GPTLayerProperty usage
 
+
+
+def to_np16(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().to(torch.float16).cpu().numpy()
+    return np.asarray(x)
+
+
+def open_layer_stats_writer(csv_path: Path, fieldnames: list[str]) -> tuple[Any, csv.DictWriter]:
+    """Ensure CSV exists with matching header; return (file_handle, writer)."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = True
+    if csv_path.exists():
+        try:
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                existing_header = next(reader, [])
+            if existing_header == fieldnames:
+                write_header = False
+            else:
+                csv_path.unlink()
+        except Exception:
+            csv_path.unlink(missing_ok=True)
+    f = open(csv_path, 'a', newline='')
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    if write_header:
+        writer.writeheader()
+    return f, writer
 
 
 def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank: int, run_id: str):
@@ -265,31 +262,18 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'spectral_projection_coefficients_from_8x_mean_gradient',
         'shape',
         'noise_sigma',
+        'gradient_noise_sigma2',
+        'empirical_phase_constant_tau2',
+        'empirical_noise_to_phase_slope_kappa',
     ]
 
-    # If file exists with an older/different schema, replace it to keep CSV consistent
-    write_header = True
-    if csv_path.exists():
-        try:
-            with open(csv_path, 'r', newline='') as f:
-                reader = csv.reader(f)
-                existing_header = next(reader, [])
-            if existing_header == fieldnames:
-                write_header = False
-            else:
-                csv_path.unlink()  # remove stale file with incompatible header
-        except Exception:
-            csv_path.unlink(missing_ok=True)
-    with open(csv_path, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-
+    f, writer = open_layer_stats_writer(csv_path, fieldnames)
+    try:
         for (param_type, layer_num), props in layer_props.items():
-            def to_np16(x):
-                if isinstance(x, torch.Tensor):
-                    return x.detach().to(torch.float16).cpu().numpy()
-                return np.asarray(x)
+            # Pre-compute scalar extras
+            grad_sigma2_val = float(props.get('gradient_noise_sigma2', 0.0))
+            tau2_val = float(props.get('empirical_phase_constant_tau2', 0.0))
+            empirical_kappa_val = (tau2_val / grad_sigma2_val) if grad_sigma2_val > 0 else 0.0
 
             row = {
                 'param_type': param_type,
@@ -301,24 +285,24 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props.get('spectral_projection_coefficients', [])).tolist()),
                 'shape': json.dumps(list(props.get('checkpoint_weights', torch.empty(0)).shape[-2:])),
                 'noise_sigma': float(props.get('noise_sigma', 0.0)) if isinstance(props.get('noise_sigma', None), (int, float)) else float(props.get('noise_sigma', torch.tensor(0.0)).item() if isinstance(props.get('noise_sigma', None), torch.Tensor) else 0.0),
+                'gradient_noise_sigma2': grad_sigma2_val,
+                'empirical_phase_constant_tau2': tau2_val,
+                'empirical_noise_to_phase_slope_kappa': empirical_kappa_val,
             }
             writer.writerow(row)
+    finally:
+        f.close()
 
 
 def find_all_checkpoints(run_id: str) -> list[tuple[int, str]]:
     """Find all checkpoint files for the given run."""
-    checkpoints_dir = Path("research_logs/checkpoints")
-    checkpoint_pattern = str(checkpoints_dir / run_id / "model_step_*.pt")
-    checkpoint_files = glob.glob(checkpoint_pattern)
-    
-    unique_steps = {}
-    for file in checkpoint_files:
-        step_match = re.search(r'step_(\d+)', str(file))
-        if step_match:
-            step = int(step_match.group(1))
-            unique_steps[step] = file
-    
-    return [(step, unique_steps[step]) for step in sorted(unique_steps.keys())]
+    ckpt_dir = Path("research_logs/checkpoints") / run_id
+    unique: Dict[int, str] = {}
+    for p in ckpt_dir.glob("model_step_*.pt"):
+        m = re.search(r'step_(\d+)', p.stem)
+        if m:
+            unique[int(m.group(1))] = str(p)
+    return [(s, unique[s]) for s in sorted(unique)]
 
 ## removed legacy main; simplified main is defined below
 
@@ -351,35 +335,82 @@ def create_pred_vs_actual_spc_log_log_subplot(ax, prop: GPTLayerProperty, param_
 
 def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
-    ax.set_xlabel('Whitened singular value (log scale)')
+    ax.set_xlabel('Singular value s (log scale)')
     ax.set_ylabel('Spectral projection coefficient')
     ax.set_xscale('log'); ax.grid(True, alpha=0.3)
     ax.set_ylim(0.0, 1.0)
-    # Predicted vs actual SPC per layer in whitened space
+    # Actual SPC vs s per layer (scatter)
+    denom = max(1, max_layers - 1)
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
-        if pt != param_type:
+        if pt != param_type or not isinstance(d, dict):
             continue
-        if not isinstance(d, dict):
+        sv = d.get('sv'); spc = d.get('spc')
+        if sv is None or spc is None:
             continue
-        shape = tuple(int(x) for x in d.get('shape', ()))
-        if len(shape) != 2:
+        sv = np.asarray(sv, dtype=float).flatten()
+        spc = np.clip(np.asarray(spc, dtype=float).flatten(), 0.0, 1.0)
+        if sv.size == 0 or spc.size == 0:
             continue
-        svw = d.get('sv_whitened')
-        spc_pred = d.get('spc_pred')
-        if svw is None or spc_pred is None:
+        m = min(sv.size, spc.size)
+        sv = sv[:m]; spc = spc[:m]
+        color = viridis(layer / denom)
+        order = np.argsort(sv)
+        ax.scatter(sv[order], spc[order], s=6, alpha=0.25, c=[color])
+    # Common x-grid across panel
+    xs = compute_panel_xs(panel)
+    xs_max = float(np.max(xs)) if xs.size else 1.0
+    # Overlay NS quintic in black (normalized xs)
+    if xs.size:
+        xnorm = np.clip(xs / max(xs_max, 1e-12), 0.0, 1.0)
+        y_ns = np.clip(newton_schulz_quintic_function(xnorm), 0.0, 1.0)
+        ax.plot(xs, y_ns, color='black', lw=1.2, alpha=0.9)
+    # Overlay predicted E[SPC] for each layer using tau2
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
             continue
-        svw = np.asarray(svw).flatten(); spc_pred = np.clip(np.asarray(spc_pred).flatten(), 0.0, 1.0)
-        color = viridis(layer / max(1, max_layers - 1))
-        # Predicted SPC (ordered line)
-        order = np.argsort(svw)
-        ax.plot(svw[order], spc_pred[order], color=color, lw=1.0)
-        # Actual SPC (faint scatter) vs whitened singulars
-        spc = d.get('spc')
-        if spc is not None:
-            spc = np.clip(np.asarray(spc).flatten(), 0.0, 1.0)
-            if spc.size:
-                m = min(svw.size, spc.size)
-                ax.scatter(svw[:m], spc[:m], s=6, alpha=0.05, c=[color])
+        tau2 = d.get('tau2', None)
+        if tau2 is None:
+            continue
+        color = viridis(layer / denom)
+        y_pred = predict_spc_curve_np(xs, float(tau2)) if xs.size else np.array([])
+        if y_pred.size:
+            ax.plot(xs, y_pred, color=color, lw=1.0, alpha=0.9)
+    return []
+
+
+def create_noise_to_phase_slope_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
+    ax.set_title(param_type)
+    ax.set_xlabel('Gradient noise variance σ^2')
+    ax.set_ylabel('Phase constant τ^2')
+    ax.grid(True, alpha=0.3)
+    # Collect points
+    xs, ys, layers = [], [], []
+    for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
+        if pt != param_type or not isinstance(d, dict):
+            continue
+        sigma2 = d.get('sigma2'); tau2 = d.get('tau2')
+        if sigma2 is None or tau2 is None:
+            continue
+        xs.append(float(sigma2)); ys.append(float(tau2)); layers.append(layer)
+    if not xs:
+        return []
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    denom = max(1, max_layers - 1)
+    for x, y, layer in zip(xs, ys, layers):
+        ax.scatter([x], [y], c=[viridis(layer / denom)], s=22, alpha=0.9)
+    valid = xs > 0
+    kappas = ys[valid] / xs[valid]
+    if kappas.size:
+        mean_kappa = float(np.mean(kappas))
+        std_kappa = float(np.std(kappas, ddof=1)) if kappas.size > 1 else 0.0
+        ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, kappas.size)))
+        xline = np.linspace(0.0, float(np.max(xs)) * 1.05, 200)
+        y_center = mean_kappa * xline
+        y_lo = max(0.0, mean_kappa - ci_kappa) * xline
+        y_hi = (mean_kappa + ci_kappa) * xline
+        ax.plot(xline, y_center, color='black', lw=1.5)
+        ax.fill_between(xline, y_lo, y_hi, color='black', alpha=0.15)
     return []
 
 
@@ -406,77 +437,84 @@ def main():
     # Collect time series for two GIFs (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}
+    noise_to_phase_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
-        _, local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=8, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
-        # Log anisotropy metrics and whitened SPC for each local layer on each rank
-        for (ptype, layer), props in local_payload.items():
-            # Only log if properties were computed
-            kd = props.get('kappa_diag', None)
-            ks = props.get('kappa_sketch', None)
-            ju = props.get('john_sphericity_U', None)
-            klw = props.get('kappa_LW', None)
-            mnk = props.get('matrix_normal_kappas', None)
-            tau2 = props.get('anisotropy_tau2', None)
-            spc_pred = props.get('predicted_spc_whitened', None)
-            prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
-            if kd is not None:
-                logging.info(f"{prefix} metric=kappa_diag value={float(kd):.6g}")
-            if ks is not None:
-                logging.info(f"{prefix} metric=kappa_sketch value={float(ks):.6g}")
-            if ju is not None:
-                logging.info(f"{prefix} metric=john_sphericity_U value={float(ju):.6g}")
-            if klw is not None:
-                logging.info(f"{prefix} metric=kappa_LW value={float(klw):.6g}")
-            if isinstance(mnk, (tuple, list)) and len(mnk) == 3:
-                ku, kv, kmn = mnk
-                logging.info(f"{prefix} metric=matrix_normal_kappa_U value={float(ku):.6g}")
-                logging.info(f"{prefix} metric=matrix_normal_kappa_V value={float(kv):.6g}")
-                logging.info(f"{prefix} metric=matrix_normal_kappa_MN value={float(kmn):.6g}")
-            if tau2 is not None:
-                logging.info(f"{prefix} metric=anisotropy_tau2 value={float(tau2):.6g}")
-            if spc_pred is not None and hasattr(spc_pred, 'detach'):
-                ss = spc_pred.detach().cpu().float().numpy().reshape(-1)
-                if ss.size:
-                    logging.info(f"{prefix} metric=predicted_spc_whitened stats={{min:{ss.min():.4f}, med:{np.median(ss):.4f}, max:{ss.max():.4f}}}")
+        local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
+        # Optional verbose per-layer diagnostic logging (enable with LOG_LAYER_METRICS=1)
+        if os.getenv("LOG_LAYER_METRICS") == "1":
+            for (ptype, layer), props in local_payload.items():
+                prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
+                for key in (
+                    'kappa_diag', 'kappa_sketch', 'john_sphericity_U', 'kappa_LW',
+                    'anisotropy_tau2'
+                ):
+                    val = props.get(key, None)
+                    if val is not None:
+                        logging.info(f"{prefix} metric={key} value={float(val):.6g}")
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
-            # Pred vs actual SPC: GPTLayerProperty mapping (ptype, layer) -> 2xN [pred; actual]
-            pred_actual_gptlp: GPTLayerProperty = {}
-            spc_singular_gptlp: GPTLayerProperty = {}
-            for key, props in aggregated_payload.items():
-                # Pred vs actual SPC: keep as 2xN
-                pred = props['predicted_spc_whitened'].detach().cpu().numpy().flatten()
-                actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
-                n = min(len(pred), len(actual))
-                if n:
-                    pred_actual_gptlp[key] = np.vstack([pred[:n], actual[:n]])
-                # SPC vs SV (whitened): store dict with sv_whitened/spc_pred/spc_actual/shape
-                svw = props['whitened_singular_values'].detach().cpu().numpy().flatten()
-                spc_pred = props['predicted_spc_whitened'].detach().cpu().numpy().flatten()
-                spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
-                m = min(len(svw), len(spc_pred), len(spc))
-                if m:
-                    spc_singular_gptlp[key] = {
-                        'sv_whitened': svw[:m],
-                        'spc_pred': spc_pred[:m],
-                        'spc': spc[:m],
-                        'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
-                    }
-            pred_actual_gptlp_ts[step] = pred_actual_gptlp
-            spc_singular_gptlp_ts[step] = spc_singular_gptlp
+            pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
+            spc_singular_gptlp_ts[step] = build_spc_singular_gptlp(aggregated_payload)
+            noise_to_phase_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
-        # Build GIFs using the simplified interface (nested under run folder)
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        make_gif_from_layer_property_time_series(pred_actual_gptlp_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
-        make_gif_from_layer_property_time_series(spc_singular_gptlp_ts, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values", output_dir=out_dir)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_gptlp_ts, noise_to_phase_ts)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
+
+
+def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
+        actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
+        n = min(len(sv), len(actual))
+        if n:
+            pred = predict_spc_curve_np(sv[:n], tau2)
+            out[key] = np.vstack([np.clip(pred, 1e-8, 1.0), np.clip(actual[:n], 1e-8, 1.0)])
+    return out
+
+
+def build_spc_singular_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
+        spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
+        n = min(len(sv), len(spc))
+        if n:
+            out[key] = {
+                'sv': sv[:n],
+                'spc': spc[:n],
+                'tau2': tau2,
+                'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
+            }
+    return out
+
+
+def build_noise_to_phase_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        sigma2 = float(props.get('gradient_noise_sigma2', np.nan))
+        tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
+        out[key] = {'sigma2': sigma2, 'tau2': tau2}
+    return out
+
+
+def generate_gifs_for_run(out_dir: Path,
+                          pred_ts: Dict[int, GPTLayerProperty],
+                          spc_ts: Dict[int, GPTLayerProperty],
+                          noise_ts: Dict[int, GPTLayerProperty]):
+    make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(spc_ts, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(noise_ts, create_noise_to_phase_slope_subplot, title="noise_to_phase_slope", output_dir=out_dir)
 
 
 if __name__ == "__main__":
