@@ -303,41 +303,59 @@ def fit_empirical_phase_constant_tau2(
     minibatch_singular_values: torch.Tensor,
     spectral_projection_coefficients: torch.Tensor
 ) -> float:
-    """Fit tau^2 to match the sigmoid in semilog plot via logit-linear regression.
+    """Nonlinear least squares fit of tau^2 using per-minibatch singular values.
 
-    Model: E[SPC(s)] = 1 / (1 + tau^2 / s^2) => logit(SPC) = log(s^2) - log(tau^2).
-    Fit y = a*x + b in (x=log(s^2), y=logit(SPC)) and return tau^2 = exp(-b).
-    Uses central SPC band to avoid saturation; falls back to robust median intercept.
+    Minimize J(tau2) = sum_i (spc_i - x_i / (x_i + tau2))^2, where x_i = s_i^2.
+    Uses a 1D gradient descent in log-parameter space for stability.
     """
     with torch.no_grad():
-        eps = 1e-12
-        s = minibatch_singular_values.clamp(min=eps).reshape(-1)
-        spc = spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps).reshape(-1)
+        eps = 1e-16
+        s = minibatch_singular_values.clamp(min=eps).reshape(-1).double()
+        spc = spectral_projection_coefficients.clamp(min=eps, max=1.0 - eps).reshape(-1).double()
+        if s.numel() == 0:
+            return 0.0
+        x = s * s  # s^2
 
-        # Focus on central sigmoid region to avoid saturation dominating the fit
-        central = (spc > 0.01) & (spc < 0.99)
-        if central.any():
-            s = s[central]
-            spc = spc[central]
+        # Robust initial guess via median of z_i = (1/spc - 1) * x
+        z0 = torch.median(((1.0 / spc) - 1.0) * x).item()
+        z0 = float(max(z0, eps))
 
-        x = torch.log(s * s)                       # log(s^2)
-        odds = spc / (1.0 - spc)
-        y = torch.log(odds)                        # logit(spc)
+        def objective(z):
+            y_pred = x / (x + z)
+            r = spc - y_pred
+            return torch.sum(r * r)
 
-        # OLS: y = a*x + b. Ideally a≈1; b=-log(tau^2)
-        X = torch.stack([x, torch.ones_like(x)], dim=1)  # [N,2]
-        try:
-            sol = torch.linalg.lstsq(X, y.unsqueeze(1)).solution.flatten()  # [2]
-            a, b = float(sol[0]), float(sol[1])
-            tau2 = math.exp(-b)
-            if not math.isfinite(tau2) or tau2 <= 0:
-                raise RuntimeError("non-finite tau2")
-            return float(tau2)
-        except Exception:
-            # Robust fallback: constrain slope=1 => b = median(x - y)
-            b_hat = torch.median(x - y).item()
-            tau2 = math.exp(b_hat)
-            return float(tau2)
+        def grad(z):
+            # d/dz y_pred = -x/(x+z)^2
+            dy = -x / ((x + z) * (x + z))
+            r = spc - (x / (x + z))
+            # dJ/dz = -2 sum r * dy = 2 sum r * x/(x+z)^2
+            return 2.0 * torch.sum(r * (-dy))
+
+        # Optimize over u = log(z) for positivity
+        u = math.log(z0)
+        z = torch.tensor(z0, dtype=torch.float64)
+        J_prev = objective(z)
+        step = 0.5
+        for _ in range(200):
+            z = torch.tensor(math.exp(u), dtype=torch.float64)
+            g = grad(z) * z  # chain rule dJ/du = dJ/dz * dz/du = dJ/dz * z
+            # Take a tentative step
+            u_new = u - step * float(g)
+            z_new = torch.tensor(math.exp(u_new), dtype=torch.float64)
+            J_new = objective(z_new)
+            if torch.isfinite(J_new) and (J_new <= J_prev or step < 1e-6):
+                # Accept step; maybe increase step a bit
+                u, J_prev = u_new, J_new
+                step = min(step * 1.1, 1.0)
+                # Converged?
+                if J_prev.item() < 1e-24:
+                    break
+            else:
+                # Backtrack
+                step *= 0.5
+        tau2 = float(math.exp(u))
+        return max(tau2, 0.0)
 
 def fit_empirical_noise_to_phase_slope_kappa(
     gradient_noise_sigma2: GPTLayerProperty,

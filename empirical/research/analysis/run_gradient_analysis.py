@@ -92,6 +92,7 @@ ANALYSIS_SPECS = [
                 compute_spc_and_alignment),
     PropertySpec("spectral_projection_coefficients", ["spc_and_alignment"], lambda t: t[0]),
     PropertySpec("aligned_minibatch_singular_values", ["spc_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
+    # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
 
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
@@ -404,9 +405,23 @@ def create_noise_to_phase_slope_subplot(ax, panel: GPTLayerProperty, param_type:
     valid = xs > 0
     kappas = ys[valid] / xs[valid]
     if kappas.size:
-        mean_kappa = float(np.mean(kappas))
-        std_kappa = float(np.std(kappas, ddof=1)) if kappas.size > 1 else 0.0
-        ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, kappas.size)))
+        # Use only middle 50% (IQR) of per-layer kappas to fit the line and CI
+        q25, q75 = np.quantile(kappas, 0.25), np.quantile(kappas, 0.75)
+        mask_iqr = (kappas >= q25) & (kappas <= q75)
+        k_filtered = kappas[mask_iqr]
+        x_filtered = xs[valid][mask_iqr]
+        y_filtered = ys[valid][mask_iqr]
+        # Through-origin slope using filtered points (equivalent to average kappa if weighting uniform)
+        if k_filtered.size and np.any(x_filtered > 0):
+            # LS through origin slope = (x^T y)/(x^T x)
+            slope = float(np.dot(x_filtered, y_filtered) / max(1e-20, np.dot(x_filtered, x_filtered)))
+            mean_kappa = slope
+            std_kappa = float(np.std(k_filtered, ddof=1)) if k_filtered.size > 1 else 0.0
+            ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, k_filtered.size)))
+        else:
+            mean_kappa = float(np.mean(kappas))
+            std_kappa = float(np.std(kappas, ddof=1)) if kappas.size > 1 else 0.0
+            ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, kappas.size)))
         xline = np.linspace(0.0, float(np.max(xs)) * 1.05, 200)
         y_center = mean_kappa * xline
         y_lo = max(0.0, mean_kappa - ci_kappa) * xline
