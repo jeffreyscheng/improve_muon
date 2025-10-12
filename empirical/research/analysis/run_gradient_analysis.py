@@ -38,7 +38,7 @@ from empirical.research.analysis.property_pipeline import PropertySpec, Property
 from empirical.research.analysis.core_math import (
     matrix_shape_beta,
     stable_rank_from_tensor, safe_svd,
-    compute_spc_by_permutation_alignment,
+    compute_spc_and_alignment, gather_aligned_singulars,
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
 )
@@ -87,9 +87,11 @@ ANALYSIS_SPECS = [
     PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
     
     # Spectral projection analysis (with Procrustes alignment)
-    PropertySpec("spectral_projection_coefficients",
+    PropertySpec("spc_and_alignment",
                 ["minibatch_gradient_svd", "mean_gradient_svd"],
-                compute_spc_by_permutation_alignment),
+                compute_spc_and_alignment),
+    PropertySpec("spectral_projection_coefficients", ["spc_and_alignment"], lambda t: t[0]),
+    PropertySpec("aligned_minibatch_singular_values", ["spc_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
 
     # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
@@ -102,7 +104,7 @@ ANALYSIS_SPECS = [
     #             predict_spectral_projection_coefficient_from_squared_true_signal),
 
     PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
-    PropertySpec("empirical_phase_constant_tau2", ["minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
+    PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
 ]
 
 ## removed mock and SVD precompile helpers for simplicity
@@ -472,7 +474,7 @@ def main():
 def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
+        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
         actual = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
         n = min(len(sv), len(actual))
@@ -485,7 +487,7 @@ def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerPro
 def build_spc_singular_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['minibatch_singular_values'].detach().cpu().numpy().flatten()
+        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
         spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
         n = min(len(sv), len(spc))

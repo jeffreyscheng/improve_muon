@@ -157,6 +157,82 @@ def compute_spc_by_permutation_alignment(
     return spc_out
 
 
+def compute_spc_and_alignment(
+    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute SPC and the alignment indices j*(i) per batch.
+
+    Returns:
+        spc_out: [B, Kc]
+        assign_idx: [B, Kc] long, where assign_idx[b, i] = j index in minibatch aligning to mean i, or -1.
+    """
+    U_b, _, Vh_b = mb_svd
+    U_m, _, Vh_m = mean_svd
+
+    K = min(U_b.shape[-1], U_m.shape[-1], Vh_b.shape[-2], Vh_m.shape[-2])
+    U_b = U_b[..., :K]
+    U_m = U_m[..., :K]
+    Vh_b = Vh_b[..., :K, :]
+    Vh_m = Vh_m[..., :K, :]
+
+    B = U_b.shape[0]
+    cosU = torch.einsum('bhk,hq->bkq', U_b, U_m).abs()
+    V_b = Vh_b.transpose(-2, -1)
+    V_m = Vh_m.transpose(-2, -1)
+    cosV = torch.einsum('bwk,wq->bkq', V_b, V_m).abs()
+    M = cosU * cosV  # [B, K, K]
+
+    B, Kb, Km = M.shape
+    Kc = min(Kb, Km)
+    spc_out = U_b.new_zeros((B, Kc))
+    assign_idx = torch.full((B, Kc), -1, dtype=torch.long, device=U_b.device)
+
+    for b in range(B):
+        Mb = M[b]
+        used = torch.zeros(Kb, dtype=torch.bool, device=Mb.device)
+        best_per_col, _ = Mb.max(dim=0)
+        order = torch.argsort(best_per_col, descending=True)
+        assigned = torch.full((Km,), -1, dtype=torch.long, device=Mb.device)
+        for i in order.tolist():
+            scores = Mb[:, i].clone()
+            scores[used] = -1.0
+            j = int(torch.argmax(scores).item())
+            if scores[j] < 0:
+                continue
+            assigned[i] = j
+            used[j] = True
+        for i in range(Kc):
+            j = int(assigned[i].item())
+            if j >= 0:
+                spc_out[b, i] = Mb[j, i]
+                assign_idx[b, i] = j
+            else:
+                spc_out[b, i] = 0.0
+                assign_idx[b, i] = -1
+    return spc_out, assign_idx
+
+
+def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
+                             alignment_indices: torch.Tensor) -> torch.Tensor:
+    """Gather per-batch singular values aligned to mean indices via alignment indices.
+
+    Args:
+        minibatch_singular_values: [B, K] singulars per batch
+        alignment_indices: [B, Kc] long indices j*(i)
+    Returns:
+        aligned_sv: [B, Kc] with s[b, j*(i)] (zeros where assignment is -1)
+    """
+    with torch.no_grad():
+        B, K = minibatch_singular_values.shape
+        _, Kc = alignment_indices.shape
+        # Clamp invalid indices to 0 and mask them to 0 afterwards
+        idx = alignment_indices.clamp(min=0)
+        gather = torch.gather(minibatch_singular_values, dim=1, index=idx)
+        mask = (alignment_indices >= 0).to(gather.dtype)
+        return gather * mask
+
+
 def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     Compute CDF from PDF using trapezoid rule.
