@@ -47,6 +47,7 @@ from empirical.research.analysis.core_visualization import (
     compute_panel_xs,
     predict_spc_curve_np,
     newton_schulz_quintic_function,
+    PARAM_TYPES,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint
 import logging
@@ -371,33 +372,40 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
 
 
 def create_kappa_calibration_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
-    ax.set_title(param_type)
-    ax.set_xlabel('σ^2 · κ (fitted)')
-    ax.set_ylabel('Fitted τ^2')
-    ax.grid(True, alpha=0.3)
+    # Try to extract the fitted kappa for this param_type from the panel entries
+    kappa_val = None
+    for (pt, _layer), d in panel.items():
+        if pt == param_type and isinstance(d, dict) and 'kappa' in d:
+            try:
+                kappa_val = float(d['kappa'])
+            except Exception:
+                kappa_val = None
+            break
+    title = f"{param_type}" if kappa_val is None else f"{param_type} (κ={kappa_val:.3g})"
+    ax.set_title(title)
+    ax.set_xlabel('σ^2 · κ (log)')
+    ax.set_ylabel('Fitted τ^2 (log)')
+    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, which='both', alpha=0.3)
     # Collect per-layer points
     xs, ys, layers = [], [], []
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
         if pt != param_type or not isinstance(d, dict):
             continue
-        if 'sigma2' not in d or 'tau2' not in d:
+        if 'x_cal' not in d or 'y' not in d:
             continue
-        sigma2 = float(d['sigma2']); tau2 = float(d['tau2'])
-        if sigma2 <= 0 or not np.isfinite(tau2) or tau2 <= 0:
+        x_cal = float(d['x_cal']); tau2 = float(d['y'])
+        if x_cal <= 0 or not np.isfinite(tau2) or tau2 <= 0:
             continue
-        xs.append(sigma2); ys.append(tau2); layers.append(layer)
+        xs.append(x_cal); ys.append(tau2); layers.append(layer)
     if not xs:
         return []
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
-    # OLS through origin to get a single κ per param_type
-    kappa_hat = float(np.dot(xs, ys) / max(1e-30, np.dot(xs, xs)))
-    x_cal = xs * kappa_hat
     denom = max(1, max_layers - 1)
-    for x, y, layer in zip(x_cal, ys, layers):
+    for x, y, layer in zip(xs, ys, layers):
         ax.scatter([x], [y], c=[viridis(layer / denom)], s=26, alpha=0.9)
     # y=x reference
-    x_max = float(max(np.max(x_cal), np.max(ys)))
+    x_max = float(max(np.max(xs), np.max(ys)))
     xline = np.linspace(0.0, x_max * 1.05, 200)
     ax.plot(xline, xline, ls='--', lw=1.2, color='black')
     return []
@@ -425,7 +433,8 @@ def main():
             print(f"Testing mode enabled: processing {len(checkpoints)} checkpoints")
     # Collect time series for two GIFs (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
-    spc_singular_gptlp_ts: Dict[int, GPTLayerProperty] = {}
+    spc_singular_direct_ts: Dict[int, GPTLayerProperty] = {}
+    spc_singular_from_kappa_ts: Dict[int, GPTLayerProperty] = {}
     kappa_calibration_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
@@ -434,14 +443,17 @@ def main():
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
             pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
-            spc_singular_gptlp_ts[step] = build_spc_singular_gptlp(aggregated_payload)
-            kappa_calibration_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
+            noise_panel = build_noise_to_phase_gptlp(aggregated_payload)
+            kappa_map = fit_per_type_kappa_loglog(noise_panel)
+            spc_singular_direct_ts[step] = build_spc_singular_gptlp(aggregated_payload)
+            spc_singular_from_kappa_ts[step] = build_spc_singular_gptlp_from_kappa(aggregated_payload, kappa_map)
+            kappa_calibration_ts[step] = build_kappa_calibration_panel(noise_panel, kappa_map)
         if dist.is_initialized():
             dist.barrier()
     if rank == 0:
         out_dir = Path(f"research_logs/visualizations/{run_id}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_gptlp_ts, kappa_calibration_ts)
+        generate_gifs_for_run(out_dir, pred_actual_gptlp_ts, spc_singular_direct_ts, spc_singular_from_kappa_ts, kappa_calibration_ts)
     if dist.is_initialized():
         dist.destroy_process_group()
     return 0
@@ -486,12 +498,67 @@ def build_noise_to_phase_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayer
     return out
 
 
+def fit_per_type_kappa_loglog(noise_panel: GPTLayerProperty) -> Dict[str, float]:
+    """Fit per-parameter-type kappa via log-log OLS with slope fixed to 1.
+
+    For each param_type, solve log(tau2) = log(kappa) + log(sigma2) and estimate
+    log(kappa) = mean(log(tau2) - log(sigma2)) across the 16 layers.
+    """
+    kappa_map: Dict[str, float] = {}
+    for param_type in PARAM_TYPES:
+        diffs = []
+        for (pt, _layer), d in noise_panel.items():
+            if pt != param_type or not isinstance(d, dict):
+                continue
+            sigma2 = float(d.get('sigma2', float('nan')))
+            tau2 = float(d.get('tau2', float('nan')))
+            if np.isfinite(sigma2) and np.isfinite(tau2) and sigma2 > 0 and tau2 > 0:
+                diffs.append(np.log(tau2) - np.log(sigma2))
+        kappa_map[param_type] = float(np.exp(np.mean(diffs))) if diffs else float('nan')
+    return kappa_map
+
+
+def build_spc_singular_gptlp_from_kappa(aggregated_payload: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
+    """SPC vs s panel with overlays using tau2 = kappa(param_type) * sigma2(layer)."""
+    out: GPTLayerProperty = {}
+    for key, props in aggregated_payload.items():
+        param_type, _ = key
+        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
+        spc = props['spectral_projection_coefficients'].detach().cpu().numpy().flatten()
+        sigma2 = float(props.get('gradient_noise_sigma2', np.nan))
+        kappa = float(kappa_map.get(param_type, np.nan))
+        tau2 = sigma2 * kappa if np.isfinite(sigma2) and np.isfinite(kappa) else np.nan
+        n = min(len(sv), len(spc))
+        if n:
+            out[key] = {
+                'sv': sv[:n],
+                'spc': spc[:n],
+                'tau2': tau2,
+                'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
+            }
+    return out
+
+
+def build_kappa_calibration_panel(noise_panel: GPTLayerProperty, kappa_map: Dict[str, float]) -> GPTLayerProperty:
+    """Transform (sigma2, tau2) into (x_cal = sigma2*kappa, y = tau2) per layer; include kappa for titles."""
+    out: GPTLayerProperty = {}
+    for (pt, layer), d in noise_panel.items():
+        sigma2 = float(d.get('sigma2', np.nan))
+        tau2 = float(d.get('tau2', np.nan))
+        kappa = float(kappa_map.get(pt, np.nan))
+        if np.isfinite(sigma2) and np.isfinite(tau2) and np.isfinite(kappa) and sigma2 > 0 and tau2 > 0 and kappa > 0:
+            out[(pt, layer)] = {'x_cal': sigma2 * kappa, 'y': tau2, 'kappa': kappa}
+    return out
+
+
 def generate_gifs_for_run(out_dir: Path,
                           pred_ts: Dict[int, GPTLayerProperty],
-                          spc_ts: Dict[int, GPTLayerProperty],
+                          spc_ts_direct: Dict[int, GPTLayerProperty],
+                          spc_ts_kappa: Dict[int, GPTLayerProperty],
                           kappa_ts: Dict[int, GPTLayerProperty]):
     make_gif_from_layer_property_time_series(pred_ts, create_pred_vs_actual_spc_log_log_subplot, title="pred_vs_actual_spc", output_dir=out_dir)
-    make_gif_from_layer_property_time_series(spc_ts, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(spc_ts_direct, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values_direct", output_dir=out_dir)
+    make_gif_from_layer_property_time_series(spc_ts_kappa, create_spc_vs_sv_semilog_subplot, title="spc_vs_singular_values_from_kappa", output_dir=out_dir)
     make_gif_from_layer_property_time_series(kappa_ts, create_kappa_calibration_subplot, title="kappa_calibration", output_dir=out_dir)
 
 
