@@ -7,6 +7,7 @@ needed, with consistent interfaces.
 """
 
 import math
+import logging
 from typing import Union, Tuple, Dict
 import numpy as np
 import torch
@@ -224,13 +225,12 @@ def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
         aligned_sv: [B, Kc] with s[b, j*(i)] (zeros where assignment is -1)
     """
     with torch.no_grad():
+        if (alignment_indices < 0).any():
+            raise RuntimeError("Negative alignment index encountered; alignment must fully assign columns.")
         B, K = minibatch_singular_values.shape
         _, Kc = alignment_indices.shape
-        # Clamp invalid indices to 0 and mask them to 0 afterwards
-        idx = alignment_indices.clamp(min=0)
-        gather = torch.gather(minibatch_singular_values, dim=1, index=idx)
-        mask = (alignment_indices >= 0).to(gather.dtype)
-        return gather * mask
+        gather = torch.gather(minibatch_singular_values, dim=1, index=alignment_indices)
+        return gather
 
 
 def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -319,6 +319,7 @@ def fit_empirical_phase_constant_tau2(
         # Robust initial guess via median of z_i = (1/spc - 1) * x
         z0 = torch.median(((1.0 / spc) - 1.0) * x).item()
         z0 = float(max(z0, eps))
+        logging.info(f"tau2_fit: N={int(s.numel())} x_min={float(x.min()):.3e} x_med={float(x.median()):.3e} x_max={float(x.max()):.3e} spc_min={float(spc.min()):.3e} spc_med={float(spc.median()):.3e} spc_max={float(spc.max()):.3e} z0={z0:.3e}")
 
         def objective(z):
             y_pred = x / (x + z)
@@ -337,7 +338,7 @@ def fit_empirical_phase_constant_tau2(
         z = torch.tensor(z0, dtype=torch.float64)
         J_prev = objective(z)
         step = 0.5
-        for _ in range(200):
+        for it in range(200):
             z = torch.tensor(math.exp(u), dtype=torch.float64)
             g = grad(z) * z  # chain rule dJ/du = dJ/dz * dz/du = dJ/dz * z
             # Take a tentative step
@@ -354,7 +355,10 @@ def fit_empirical_phase_constant_tau2(
             else:
                 # Backtrack
                 step *= 0.5
+            if it % 20 == 0:
+                logging.info(f"tau2_fit: it={it} step={step:.2e} J={float(J_prev):.3e} tau2={math.exp(u):.3e}")
         tau2 = float(math.exp(u))
+        logging.info(f"tau2_fit: done J={float(J_prev):.3e} tau2={tau2:.3e}")
         return max(tau2, 0.0)
 
 def fit_empirical_noise_to_phase_slope_kappa(

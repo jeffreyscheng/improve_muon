@@ -94,16 +94,10 @@ ANALYSIS_SPECS = [
     PropertySpec("aligned_minibatch_singular_values", ["spc_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
     # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
 
-    # Noise sigma is provided externally from serialized checkpoints; no Wishart fitting
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
     PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
-    # PropertySpec("squared_true_signal_t", ["minibatch_singular_values", "noise_sigma", "aspect_ratio_beta"],
-    #             squared_true_signal_from_quadratic_formula),
-    # PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
-    #             predict_spectral_projection_coefficient_from_squared_true_signal),
-
     PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
     PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
 ]
@@ -264,33 +258,28 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'per_minibatch_gradient_stable_rank',
         'spectral_projection_coefficients_from_8x_mean_gradient',
         'shape',
-        'noise_sigma',
         'gradient_noise_sigma2',
         'empirical_phase_constant_tau2',
-        'empirical_noise_to_phase_slope_kappa',
     ]
 
     f, writer = open_layer_stats_writer(csv_path, fieldnames)
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
-            grad_sigma2_val = float(props.get('gradient_noise_sigma2', 0.0))
-            tau2_val = float(props.get('empirical_phase_constant_tau2', 0.0))
-            empirical_kappa_val = (tau2_val / grad_sigma2_val) if grad_sigma2_val > 0 else 0.0
+            grad_sigma2_val = float(props['gradient_noise_sigma2'])
+            tau2_val = float(props['empirical_phase_constant_tau2'])
 
             row = {
                 'param_type': param_type,
                 'layer_num': layer_num,
-                'weight_stable_rank': float(props.get('weights_stable_rank', 0.0)),
-                'per_minibatch_gradient_singular_values': json.dumps(to_np16(props.get('minibatch_singular_values', [])).tolist()),
-                'gradient_singular_value_standard_deviations': json.dumps(to_np16(props.get('singular_value_std', [])).tolist()),
-                'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props.get('gradients_stable_rank', [])).tolist()),
-                'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props.get('spectral_projection_coefficients', [])).tolist()),
-                'shape': json.dumps(list(props.get('checkpoint_weights', torch.empty(0)).shape[-2:])),
-                'noise_sigma': float(props.get('noise_sigma', 0.0)) if isinstance(props.get('noise_sigma', None), (int, float)) else float(props.get('noise_sigma', torch.tensor(0.0)).item() if isinstance(props.get('noise_sigma', None), torch.Tensor) else 0.0),
+                'weight_stable_rank': float(props['weights_stable_rank']),
+                'per_minibatch_gradient_singular_values': json.dumps(to_np16(props['minibatch_singular_values']).tolist()),
+                'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
+                'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
+                'spectral_projection_coefficients_from_8x_mean_gradient': json.dumps(to_np16(props['spectral_projection_coefficients']).tolist()),
+                'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,
-                'empirical_noise_to_phase_slope_kappa': empirical_kappa_val,
             }
             writer.writerow(row)
     finally:
@@ -383,9 +372,9 @@ def create_spc_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, param_type: st
 
 def create_noise_to_phase_slope_subplot(ax, panel: GPTLayerProperty, param_type: str, viridis, max_layers: int):
     ax.set_title(param_type)
-    ax.set_xlabel('Gradient noise variance σ^2')
-    ax.set_ylabel('Phase constant τ^2')
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('Gradient noise variance σ^2 (log)')
+    ax.set_ylabel('Phase constant τ^2 (log)')
+    ax.set_xscale('log'); ax.set_yscale('log'); ax.grid(True, which='both', alpha=0.3)
     # Collect points
     xs, ys, layers = [], [], []
     for (pt, layer), d in sorted(panel.items(), key=lambda x: x[0][1]):
@@ -401,33 +390,16 @@ def create_noise_to_phase_slope_subplot(ax, panel: GPTLayerProperty, param_type:
     ys = np.asarray(ys, dtype=float)
     denom = max(1, max_layers - 1)
     for x, y, layer in zip(xs, ys, layers):
-        ax.scatter([x], [y], c=[viridis(layer / denom)], s=22, alpha=0.9)
-    valid = xs > 0
-    kappas = ys[valid] / xs[valid]
-    if kappas.size:
-        # Use only middle 50% (IQR) of per-layer kappas to fit the line and CI
-        q25, q75 = np.quantile(kappas, 0.25), np.quantile(kappas, 0.75)
-        mask_iqr = (kappas >= q25) & (kappas <= q75)
-        k_filtered = kappas[mask_iqr]
-        x_filtered = xs[valid][mask_iqr]
-        y_filtered = ys[valid][mask_iqr]
-        # Through-origin slope using filtered points (equivalent to average kappa if weighting uniform)
-        if k_filtered.size and np.any(x_filtered > 0):
-            # LS through origin slope = (x^T y)/(x^T x)
-            slope = float(np.dot(x_filtered, y_filtered) / max(1e-20, np.dot(x_filtered, x_filtered)))
-            mean_kappa = slope
-            std_kappa = float(np.std(k_filtered, ddof=1)) if k_filtered.size > 1 else 0.0
-            ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, k_filtered.size)))
-        else:
-            mean_kappa = float(np.mean(kappas))
-            std_kappa = float(np.std(kappas, ddof=1)) if kappas.size > 1 else 0.0
-            ci_kappa = 1.96 * (std_kappa / np.sqrt(max(1, kappas.size)))
-        xline = np.linspace(0.0, float(np.max(xs)) * 1.05, 200)
-        y_center = mean_kappa * xline
-        y_lo = max(0.0, mean_kappa - ci_kappa) * xline
-        y_hi = (mean_kappa + ci_kappa) * xline
-        ax.plot(xline, y_center, color='black', lw=1.5)
-        ax.fill_between(xline, y_lo, y_hi, color='black', alpha=0.15)
+        ax.scatter([x], [y], c=[viridis(layer / denom)], s=24, alpha=0.9)
+    # Fit kappa using middle 50% kappas (IQR) and draw single line y = kappa x
+    kappas = ys / xs
+    q25, q75 = np.quantile(kappas, 0.25), np.quantile(kappas, 0.75)
+    mask = (kappas >= q25) & (kappas <= q75)
+    x_f, y_f = xs[mask], ys[mask]
+    if x_f.size and np.any(x_f > 0):
+        slope = float(np.dot(x_f, y_f) / max(1e-30, np.dot(x_f, x_f)))
+        xline = np.geomspace(xs.min(), xs.max(), 200)
+        ax.plot(xline, slope * xline, color='black', lw=1.6)
     return []
 
 
@@ -458,17 +430,6 @@ def main():
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
         local_payload = compute_analysis_for_step(step, ckpt, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, device=device, model=model, run_id=run_id)
-        # Optional verbose per-layer diagnostic logging (enable with LOG_LAYER_METRICS=1)
-        if os.getenv("LOG_LAYER_METRICS") == "1":
-            for (ptype, layer), props in local_payload.items():
-                prefix = f"[step={step} rank={rank}] layer=({ptype}, {layer})"
-                for key in (
-                    'kappa_diag', 'kappa_sketch', 'john_sphericity_U', 'kappa_LW',
-                    'anisotropy_tau2'
-                ):
-                    val = props.get(key, None)
-                    if val is not None:
-                        logging.info(f"{prefix} metric={key} value={float(val):.6g}")
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0 and aggregated_payload is not None:
