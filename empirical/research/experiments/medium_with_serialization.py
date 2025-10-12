@@ -10,6 +10,7 @@ from empirical.research.analysis.logging_utilities import is_logging_step_piecew
 from pathlib import Path
 from functools import partial
 from datetime import date
+import torch
 
 args = Hyperparameters(); args.max_minibatches = 1000
 

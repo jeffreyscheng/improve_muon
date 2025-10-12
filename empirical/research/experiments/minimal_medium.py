@@ -6,6 +6,7 @@ from empirical.research.training.training_core import (
 from empirical.research.training.zeropower import get_zeropower_function, make_update_function
 from empirical.research.training.muon import Muon
 from empirical.research.analysis.logging_utilities import serialize_model_checkpoint
+import torch
 
 args = Hyperparameters()
 loggers = []
