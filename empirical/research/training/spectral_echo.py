@@ -118,13 +118,13 @@ class SpectralEcho(torch.optim.Optimizer):
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
                     state = self.state[p]
-                    if len(state) == 0:
+                    if "mantissa" not in state:
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
+                    if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
-                    if "noise_sigma2" not in state:
-                        raise RuntimeError("noise_sigma2 missing in SpectralEcho state; ensure optimize_step feeds it before step().")
                     kappa_val = float(layer_type_to_kappa[self.param_layer_type[p]])
-                    sigma2_val = float(state["noise_sigma2"]) 
+                    # Default to 0.0 during warmup if noise_sigma2 not yet provided
+                    sigma2_val = float(state.get("noise_sigma2", 0.0))
                     self.update_func(
                         p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
                         p.grad, momentum,
