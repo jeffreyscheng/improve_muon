@@ -84,6 +84,19 @@ class SpectralEcho(torch.optim.Optimizer):
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
         # Build param -> layer_type mapping
         self.param_layer_type: dict[Tensor, str] = {}
+        # Advertise noise sigma2 consumption (duck typing for training_core)
+        self.expects_noise_sigma2 = True
+        def _feed_sigma2(ps, s2):
+            # s2 is a tensor or list of floats; length must match ps
+            if hasattr(s2, 'detach'):
+                vals = s2.detach().cpu().tolist()
+            else:
+                vals = list(s2)
+            if len(vals) != len(ps):
+                raise RuntimeError("feed_noise_sigma2: length mismatch")
+            for p, v in zip(ps, vals):
+                self.state[p]['noise_sigma2'] = float(v)
+        self.feed_noise_sigma2 = _feed_sigma2
         for group in self.param_groups:
             for p in group["params"]:
                 name = param_to_name.get(p)

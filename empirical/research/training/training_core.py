@@ -207,6 +207,12 @@ def warmup_kernels(model, optimizers, args):
         model(inputs.to(torch.int32), targets, get_window_size_blocks(0, args.num_iterations)).backward()
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # Feed zero sigma2 to hidden optimizers that expect it (prevents crashes during warmup)
+        for opt in optimizers:
+            if hasattr(opt, 'expects_noise_sigma2') and getattr(opt, 'expects_noise_sigma2'):
+                params = [p for g in opt.param_groups for p in g["params"]]
+                zeros = torch.zeros(len(params), device=params[0].device if params else torch.device('cuda'))
+                opt.feed_noise_sigma2(params, zeros)
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
