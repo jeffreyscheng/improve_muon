@@ -18,10 +18,10 @@ layer_type_to_kappa = {
     'MLP Output': 0.0
 }
 
-def spectral_echo_via_svd(Ghat: Tensor, kappa: float, sigma2: float):
+def spectral_echo_via_svd(Ghat: Tensor, kappa: float | Tensor, sigma2: float | Tensor):
     """
     1. computes Ghat = Uhat Shat Vhat^T via SVD.
-    2. creates spectral_echo by applying f(s) = 1 / (1 + \kappa * sigma^2 / s^2) elementwise to Shat.
+    2. creates spectral_echo by applying f(s) = 1 / (1 + kappa * sigma^2 / s^2) elementwise to Shat.
     3. returns Uhat Shat Vhat^T
 
     TODO: implement
@@ -38,11 +38,15 @@ def spectral_echo_via_svd(Ghat: Tensor, kappa: float, sigma2: float):
         slices = []
         # Map slice index to layer type kappa
         slice_types = ['Attention Q', 'Attention K', 'Attention V', 'Attention O']
+        sigma_slices = None
+        if isinstance(sigma2, torch.Tensor) and sigma2.numel() == 4:
+            sigma_slices = sigma2.flatten().tolist()
         for i, sl in enumerate(X):
             U, S, Vh = torch.linalg.svd(sl, full_matrices=False)
             S2 = torch.clamp(S * S, min=1e-12)
-            k = float(layer_type_to_kappa.get(slice_types[i], kappa))
-            w = 1.0 / (1.0 + (k * sigma2) / S2)
+            k = float(layer_type_to_kappa.get(slice_types[i], float(kappa) if not isinstance(kappa, torch.Tensor) else float(kappa.item())))
+            s2 = float(sigma_slices[i]) if sigma_slices is not None else (float(sigma2) if not isinstance(sigma2, torch.Tensor) else float(sigma2.item()))
+            w = 1.0 / (1.0 + (k * s2) / S2)
             Y = U @ torch.diag_embed(w) @ Vh
             slices.append(Y)
         Y = torch.stack(slices, dim=0)
@@ -82,8 +86,9 @@ class SpectralEcho(torch.optim.Optimizer):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         super().__init__(params, defaults)
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
-        # Build param -> layer_type mapping
-        self.param_layer_type: dict[Tensor, str] = {}
+        # Build param -> kind mapping (strict)
+        # kind in { 'packed_attention', 'MLP Input', 'MLP Output' }
+        self.param_kind: dict[Tensor, str] = {}
         # Advertise noise sigma2 consumption (duck typing for training_core)
         self.expects_noise_sigma2 = True
         def _feed_sigma2(ps, s2):
@@ -102,10 +107,10 @@ class SpectralEcho(torch.optim.Optimizer):
                 name = param_to_name.get(p)
                 if name is None:
                     raise RuntimeError("Missing parameter name mapping for SpectralEcho")
-                lt = _layer_type_from_name(name)
-                if lt is None:
+                kind = _classify_param_kind(name, p)
+                if kind is None:
                     raise RuntimeError(f"Unrecognized parameter for SpectralEcho: {name}")
-                self.param_layer_type[p] = lt
+                self.param_kind[p] = kind
 
     @torch.no_grad()
     def step(self):
@@ -122,7 +127,14 @@ class SpectralEcho(torch.optim.Optimizer):
                         state["mantissa"] = torch.zeros_like(p, dtype=torch.uint16)
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
-                    kappa_val = float(layer_type_to_kappa[self.param_layer_type[p]])
+                    kind = self.param_kind[p]
+                    if kind == 'MLP Input' or kind == 'MLP Output':
+                        kappa_val = float(layer_type_to_kappa[kind])
+                    elif kind == 'packed_attention':
+                        # Per-slice kappas handled inside spectral_echo_via_svd
+                        kappa_val = 0.0
+                    else:
+                        raise RuntimeError(f"Unexpected param kind: {kind}")
                     # Default to 0.0 during warmup if noise_sigma2 not yet provided
                     sigma2_val = float(state.get("noise_sigma2", 0.0))
                     self.update_func(
@@ -136,14 +148,18 @@ class SpectralEcho(torch.optim.Optimizer):
                 futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
         torch.futures.collect_all(futures).wait()
 
-def _layer_type_from_name(name: str) -> str | None:
-    # Mirror analysis/model_utilities logic
+def _classify_param_kind(name: str, tensor: Tensor) -> str | None:
+    # Strict classification based on naming and tensor shape
     if name.startswith("_orig_mod."):
         name = name[10:]
     if not name.startswith("blocks."):
         return None
     if "attn.qkvo_w" in name:
-        return "Attention"  # packed; slices handled in SVD fn
+        # Expect packed attention [4, H, W]
+        if tensor.ndim == 3 and tensor.size(0) == 4:
+            return "packed_attention"
+        # Future: if model splits Q/K/V/O into separate params, we would map by index; not supported yet
+        return None
     if "mlp.fc_w" in name:
         return "MLP Input"
     if "mlp.proj_w" in name:
