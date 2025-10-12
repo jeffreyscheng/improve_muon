@@ -101,7 +101,7 @@ ANALYSIS_SPECS = [
     # PropertySpec("predicted_spectral_projection_coefficient", ["squared_true_signal_t", "aspect_ratio_beta"],
     #             predict_spectral_projection_coefficient_from_squared_true_signal),
 
-    PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient"], estimate_gradient_noise_sigma2),
+    PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
     PropertySpec("empirical_phase_constant_tau2", ["minibatch_singular_values", "spectral_projection_coefficients"], fit_empirical_phase_constant_tau2),
 ]
 
