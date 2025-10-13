@@ -470,32 +470,28 @@ def optimize_step(model, optimizers, step, args):
     muon_opt = optimizers[1] if len(optimizers) > 1 else None
     muon_params = opt2params.get(muon_opt, [])
 
-    # 0) Compute local normalized squared norms for hidden grads (A numerator) before any grad averaging
-    #    A = E_i[(1/N)||G_i||_F^2] is obtained via AVG all_reduce over ranks of these local values
-    if muon_opt is not None and len(muon_params) > 0:
+    # 0) If hidden optimizer is SpectralEcho, compute A pre-averaging for sigma^2
+    from empirical.research.training.spectral_echo import SpectralEcho
+    is_spectral = (muon_opt is not None and isinstance(muon_opt, SpectralEcho) and len(muon_params) > 0)
+    if is_spectral:
         a_local = torch.zeros(len(muon_params), device=torch.device("cuda"), dtype=torch.float32)
-        # For packed attention params, also track per-slice A
         a_slices_map: dict[Tensor, torch.Tensor] = {}
         for idx, p in enumerate(muon_params):
             if p.grad is not None:
                 g = p.grad.float()
                 if g.ndim == 3 and g.size(0) == 4:
-                    # Per-slice mean square
                     H, W = g.size(-2), g.size(-1)
                     a_slices = torch.zeros(4, device=g.device, dtype=torch.float32)
                     for i in range(4):
                         gi = g[i]
                         a_slices[i] = (gi.mul(gi).sum() / (H * W))
                     a_slices_map[p] = a_slices
-                    # Also aggregate full tensor value for legacy scalar path
                     a_local[idx] = (g.mul(g).sum() / p.numel())
                 else:
                     a_local[idx] = (g.mul(g).sum() / p.numel())
             else:
                 a_local[idx] = 0.0
-        # Average across ranks to get A
         dist.all_reduce(a_local, op=dist.ReduceOp.AVG)
-        # Average per-slice across ranks
         for p, vec in a_slices_map.items():
             dist.all_reduce(vec, op=dist.ReduceOp.AVG)
     else:
@@ -523,66 +519,44 @@ def optimize_step(model, optimizers, step, args):
     for opt in optimizers:
         torch.futures.collect_all(opt2futures[opt]).wait()
 
-    # 5. With averaged grads, compute B for Muon and derive sigma
-    #    B = (1/N)||Ḡ||_F^2, and under the simple i.i.d. noise model
-    #    A - B ≈ (1 - 1/W) * sigma^2  ⇒  sigma^2 ≈ (A - B) / (1 - 1/W)
-    if muon_opt is not None and len(muon_params) > 0 and a_local is not None:
+    # 5. If SpectralEcho, compute B and assign sigma^2 directly to optimizer state BEFORE stepping
+    if is_spectral and a_local is not None:
         W = dist.get_world_size() if dist.is_initialized() else 1
         b_vec = torch.zeros_like(a_local)
-        # For packed attention, track per-slice B
         b_slices_map: dict[Tensor, torch.Tensor] = {}
         for idx, p in enumerate(muon_params):
             if p.grad is not None:
                 gbar = p.grad.float()
                 if gbar.ndim == 3 and gbar.size(0) == 4:
-                    H, W = gbar.size(-2), gbar.size(-1)
+                    H, W_ = gbar.size(-2), gbar.size(-1)
                     b_slices = torch.zeros(4, device=gbar.device, dtype=torch.float32)
                     for i in range(4):
                         gi = gbar[i]
-                        b_slices[i] = (gi.mul(gi).sum() / (H * W))
+                        b_slices[i] = (gi.mul(gi).sum() / (H * W_))
                     b_slices_map[p] = b_slices
                     b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
                 else:
                     b_vec[idx] = (gbar.mul(gbar).sum() / p.numel())
             else:
                 b_vec[idx] = 0.0
-        # Denominator (1 - 1/W); guard W=1 edge case
         denom = 1.0 - (1.0 / float(max(W, 1)))
-        if denom <= 0.0:
-            sigma2 = torch.zeros_like(a_local)
-        else:
-            sigma2 = torch.clamp_min(a_local - b_vec, 0.0) / denom
-        sigma_vec = torch.sqrt(sigma2)
-        # Compute per-slice sigma2 for packed attention params
+        sigma2_vec = torch.zeros_like(a_local) if denom <= 0.0 else torch.clamp_min(a_local - b_vec, 0.0) / denom
         sigma2_slices_map: dict[Tensor, torch.Tensor] = {}
         for p in a_slices_map.keys():
             a_s = a_slices_map[p]
             b_s = b_slices_map.get(p, torch.zeros_like(a_s))
-            if denom <= 0.0:
-                sigma2_slices = torch.zeros_like(a_s)
-            else:
-                sigma2_slices = torch.clamp_min(a_s - b_s, 0.0) / denom
+            sigma2_slices = torch.zeros_like(a_s) if denom <= 0.0 else torch.clamp_min(a_s - b_s, 0.0) / denom
             sigma2_slices_map[p] = sigma2_slices
-    else:
-        sigma_vec = None
-        sigma2_slices_map = {}
+        # Assign into optimizer state
+        for idx, p in enumerate(muon_params):
+            if p in sigma2_slices_map:
+                muon_opt.state[p]['noise_sigma2'] = [float(x) for x in sigma2_slices_map[p].detach().cpu().tolist()]
+            else:
+                muon_opt.state[p]['noise_sigma2'] = float(sigma2_vec[idx].item())
 
     # 6. Step optimizers
     for opt in optimizers:
         opt.step()
-
-    # 7. Feed noise sigma^2 to hidden optimizer if it expects it (duck-typed)
-    if muon_opt is not None and len(muon_params) > 0 and sigma_vec is not None:
-        if hasattr(muon_opt, 'expects_noise_sigma2') and getattr(muon_opt, 'expects_noise_sigma2'):
-            # Build a mixed list: scalar variances for normal params; 4-element lists for packed attention
-            values = []
-            for idx, p in enumerate(muon_params):
-                if p in sigma2_slices_map:
-                    vals = sigma2_slices_map[p].detach().cpu().tolist()
-                    values.append([float(x) for x in vals])
-                else:
-                    values.append(float((sigma_vec[idx] * sigma_vec[idx]).item()))
-            muon_opt.feed_noise_sigma2(muon_params, values)
 
     # 8. Zero gradients
     # Zero gradients

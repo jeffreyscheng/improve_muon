@@ -98,48 +98,11 @@ class SpectralEcho(torch.optim.Optimizer):
         # Build param -> kind mapping (strict)
         # kind in { 'packed_attention', 'MLP Input', 'MLP Output' }
         self.param_kind: dict[Tensor, str] = {}
-        # Advertise noise sigma2 consumption (duck typing for training_core)
-        self.expects_noise_sigma2 = True
-        def _feed_sigma2(ps, s2):
-            # s2 is a sequence aligned to ps; each element can be a float or 4‑length list for packed attention
-            if hasattr(s2, 'detach'):
-                vals = s2.detach().cpu().tolist()
-            else:
-                vals = list(s2)
-            if len(vals) != len(ps):
-                raise RuntimeError("feed_noise_sigma2: length mismatch")
-            for p, v in zip(ps, vals):
-                if isinstance(v, (list, tuple)):
-                    if len(v) != 4:
-                        raise RuntimeError("noise_sigma2_slices must have length 4 for packed attention")
-                    self.state[p]['noise_sigma2_slices'] = [float(x) for x in v]
-                    # Log if any slice is zero; only once per slice
-                    if self.rank == 0:
-                        zero_idx = [i for i, x in enumerate(v) if float(x) == 0.0]
-                        if zero_idx:
-                            warned = self.state[p].get('zero_sigma2_slices_warned', [False, False, False, False])
-                            to_report = [i for i in zero_idx if not warned[i]]
-                            if to_report:
-                                name = self.param_to_name.get(p, "<unknown>")
-                                kind = self.param_kind.get(p, "unknown")
-                                print(f"SpectralEcho: received zero noise sigma^2 for {name} ({kind}) slices {to_report}")
-                                for i in to_report:
-                                    warned[i] = True
-                                self.state[p]['zero_sigma2_slices_warned'] = warned
-                else:
-                    self.state[p]['noise_sigma2'] = float(v)
-                    # Log if scalar sigma^2 is zero; only once per param
-                    if self.rank == 0 and float(v) == 0.0 and not self.state[p].get('zero_sigma2_warned', False):
-                        name = self.param_to_name.get(p, "<unknown>")
-                        kind = self.param_kind.get(p, "unknown")
-                        print(f"SpectralEcho: received zero noise sigma^2 for {name} ({kind})")
-                        self.state[p]['zero_sigma2_warned'] = True
-        self.feed_noise_sigma2 = _feed_sigma2
         for group in self.param_groups:
             for p in group["params"]:
-                name = param_to_name.get(p)
-                if name is None:
+                if p not in param_to_name:
                     raise RuntimeError("Missing parameter name mapping for SpectralEcho")
+                name = param_to_name[p]
                 kind = _classify_param_kind(name, p)
                 if kind is None:
                     raise RuntimeError(f"Unrecognized parameter for SpectralEcho: {name}")
@@ -164,14 +127,29 @@ class SpectralEcho(torch.optim.Optimizer):
                     # Build per-kind kappa and sigma2 tensors, then update once
                     if kind == 'MLP Input' or kind == 'MLP Output':
                         kappa_t = torch.tensor([layer_type_to_kappa[kind]], dtype=torch.float32, device=p.device)
-                        sigma2_val = float(state.get("noise_sigma2", 0.0))
+                        sigma2_val = float(state["noise_sigma2"])  # must be provided
+                        # Log received sigma2 value and zero cases (rank 0 only)
+                        if self.rank == 0:
+                            name = self.param_to_name[p]
+                            print(f"SpectralEcho: sigma2 for {name} ({kind}) = {sigma2_val:.6e}")
+                            if sigma2_val == 0.0:
+                                print(f"SpectralEcho: received zero noise sigma^2 for {name} ({kind})")
                         sigma2_t = torch.tensor([sigma2_val], dtype=torch.float32, device=p.device)
                     elif kind == 'packed_attention':
                         kappas = [layer_type_to_kappa['Attention Q'], layer_type_to_kappa['Attention K'], layer_type_to_kappa['Attention V'], layer_type_to_kappa['Attention O']]
                         kappa_t = torch.tensor(kappas, dtype=torch.float32, device=p.device)
-                        s2_slices = state.get('noise_sigma2_slices', [0.0, 0.0, 0.0, 0.0])
+                        s2 = state['noise_sigma2']  # must be provided (sequence of 4)
+                        if not isinstance(s2, (list, tuple)):
+                            raise RuntimeError("packed_attention expects noise_sigma2 as a 4-element list/tuple")
+                        s2_slices = [float(x) for x in s2]
                         if len(s2_slices) != 4:
                             raise RuntimeError("noise_sigma2_slices must have length 4 for packed attention")
+                        if self.rank == 0:
+                            name = self.param_to_name[p]
+                            print(f"SpectralEcho: sigma2 for {name} (packed_attention) = {[float(x) for x in s2_slices]}")
+                            zero_idx = [i for i, x in enumerate(s2_slices) if float(x) == 0.0]
+                            if zero_idx:
+                                print(f"SpectralEcho: received zero noise sigma^2 for {name} (packed_attention) slices {zero_idx}")
                         sigma2_t = torch.tensor(s2_slices, dtype=torch.float32, device=p.device)
                     else:
                         raise RuntimeError(f"Unexpected param kind: {kind}")
