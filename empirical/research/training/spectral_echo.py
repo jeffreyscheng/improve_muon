@@ -18,7 +18,7 @@ layer_type_to_kappa = {
     'MLP Output': 3.83e5
 }
 
-def spectral_echo_via_svd(Ghat: Tensor, kappa: float | Tensor, sigma2: float | Tensor):
+def spectral_echo_via_svd(Ghat: Tensor, kappa: Tensor, sigma2: Tensor):
     """
     1. computes Ghat = Uhat Shat Vhat^T via SVD.
     2. creates spectral_echo by applying f(s) = 1 / (1 + kappa * sigma^2 / s^2) elementwise to Shat.
@@ -36,23 +36,30 @@ def spectral_echo_via_svd(Ghat: Tensor, kappa: float | Tensor, sigma2: float | T
     # Handle packed QKVO: shape [4, H, W]
     if X.ndim == 3 and X.size(0) == 4:
         slices = []
-        # Map slice index to layer type kappa
-        slice_types = ['Attention Q', 'Attention K', 'Attention V', 'Attention O']
-        sigma_slices = None
-        if isinstance(sigma2, torch.Tensor) and sigma2.numel() == 4:
-            sigma_slices = sigma2.flatten().tolist()
+        # Expect kappa as scalar (broadcast) or vector[4]; sigma2 as scalar or vector[4]
+        if kappa.numel() == 1:
+            kappa_vec = kappa.expand(4)
+        else:
+            kappa_vec = kappa.flatten()[:4]
+        if sigma2.numel() == 1:
+            sigma2_vec = sigma2.expand(4)
+        else:
+            sigma2_vec = sigma2.flatten()[:4]
         for i, sl in enumerate(X):
             U, S, Vh = torch.linalg.svd(sl, full_matrices=False)
             S2 = torch.clamp(S * S, min=1e-12)
-            k = float(layer_type_to_kappa.get(slice_types[i], float(kappa) if not isinstance(kappa, torch.Tensor) else float(kappa.item())))
-            s2 = float(sigma_slices[i]) if sigma_slices is not None else (float(sigma2) if not isinstance(sigma2, torch.Tensor) else float(sigma2.item()))
-            w = 1.0 / (1.0 + (k * s2) / S2)
+            w = 1.0 / (1.0 + (kappa_vec[i] * sigma2_vec[i]) / S2)
             Y = U @ torch.diag_embed(w) @ Vh
             slices.append(Y)
         Y = torch.stack(slices, dim=0)
     else:
         U, S, Vh = torch.linalg.svd(X, full_matrices=False)
         S2 = torch.clamp(S * S, min=1e-12)
+        # Ensure scalar tensors for broadcasting
+        if kappa.numel() != 1:
+            kappa = kappa.flatten()[0:1]
+        if sigma2.numel() != 1:
+            sigma2 = sigma2.flatten()[0:1]
         w = 1.0 / (1.0 + (kappa * sigma2) / S2)
         Y = U @ torch.diag_embed(w) @ Vh
 
@@ -133,40 +140,28 @@ class SpectralEcho(torch.optim.Optimizer):
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
                     kind = self.param_kind[p]
+                    # Build per-kind kappa and sigma2 tensors, then update once
                     if kind == 'MLP Input' or kind == 'MLP Output':
-                        kappa_val = float(layer_type_to_kappa[kind])
+                        kappa_t = torch.tensor([layer_type_to_kappa[kind]], dtype=torch.float32, device=p.device)
                         sigma2_val = float(state.get("noise_sigma2", 0.0))
-                        kappa_t = torch._as_tensor_fullprec(kappa_val)
-                        sigma2_t = torch._as_tensor_fullprec(sigma2_val)
-                        self.update_func(
-                            p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
-                            p.grad, momentum,
-                            eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
-                            eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
-                            kappa=kappa_t,
-                            sigma2=sigma2_t,
-                        )
-                        continue
+                        sigma2_t = torch.tensor([sigma2_val], dtype=torch.float32, device=p.device)
                     elif kind == 'packed_attention':
-                        # Per-slice kappas handled inside spectral_echo_via_svd; sigma2 is a 4‑vector if available
-                        s2_slices = state.get('noise_sigma2_slices', None)
-                        if s2_slices is not None:
-                            sigma2_t = torch.tensor(s2_slices, dtype=torch.float32, device=p.device)
-                        else:
-                            sigma2_t = torch.zeros(4, dtype=torch.float32, device=p.device)
-                        kappa_t = torch.tensor(0.0, dtype=torch.float32, device=p.device)
-                        self.update_func(
-                            p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
-                            p.grad, momentum,
-                            eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
-                            eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
-                            kappa=kappa_t,
-                            sigma2=sigma2_t,
-                        )
-                        continue
+                        kappas = [layer_type_to_kappa['Attention Q'], layer_type_to_kappa['Attention K'], layer_type_to_kappa['Attention V'], layer_type_to_kappa['Attention O']]
+                        kappa_t = torch.tensor(kappas, dtype=torch.float32, device=p.device)
+                        s2_slices = state.get('noise_sigma2_slices', [0.0, 0.0, 0.0, 0.0])
+                        if len(s2_slices) != 4:
+                            raise RuntimeError("noise_sigma2_slices must have length 4 for packed attention")
+                        sigma2_t = torch.tensor(s2_slices, dtype=torch.float32, device=p.device)
                     else:
                         raise RuntimeError(f"Unexpected param kind: {kind}")
-                    # (handled in branches above)
+                    self.update_func(
+                        p.view(torch.uint16), state["mantissa"], state["momentum_buffer"],
+                        p.grad, momentum,
+                        eff_lr=torch._as_tensor_fullprec(group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5),
+                        eff_weight_decay=torch._as_tensor_fullprec(group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)),
+                        kappa=kappa_t,
+                        sigma2=sigma2_t,
+                    )
                 futures.append(dist.all_gather(params_pad[base_i:base_i + self.world_size], params_pad[base_i + self.rank], async_op=True).get_future())
         torch.futures.collect_all(futures).wait()
 
