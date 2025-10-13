@@ -93,6 +93,8 @@ class SpectralEcho(torch.optim.Optimizer):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
         super().__init__(params, defaults)
         assert all(p.dtype == torch.bfloat16 for group in self.param_groups for p in group["params"])
+        # Keep a reference to names for logging
+        self.param_to_name: dict[Tensor, str] = dict(param_to_name)
         # Build param -> kind mapping (strict)
         # kind in { 'packed_attention', 'MLP Input', 'MLP Output' }
         self.param_kind: dict[Tensor, str] = {}
@@ -111,8 +113,27 @@ class SpectralEcho(torch.optim.Optimizer):
                     if len(v) != 4:
                         raise RuntimeError("noise_sigma2_slices must have length 4 for packed attention")
                     self.state[p]['noise_sigma2_slices'] = [float(x) for x in v]
+                    # Log if any slice is zero; only once per slice
+                    if self.rank == 0:
+                        zero_idx = [i for i, x in enumerate(v) if float(x) == 0.0]
+                        if zero_idx:
+                            warned = self.state[p].get('zero_sigma2_slices_warned', [False, False, False, False])
+                            to_report = [i for i in zero_idx if not warned[i]]
+                            if to_report:
+                                name = self.param_to_name.get(p, "<unknown>")
+                                kind = self.param_kind.get(p, "unknown")
+                                print(f"SpectralEcho: received zero noise sigma^2 for {name} ({kind}) slices {to_report}")
+                                for i in to_report:
+                                    warned[i] = True
+                                self.state[p]['zero_sigma2_slices_warned'] = warned
                 else:
                     self.state[p]['noise_sigma2'] = float(v)
+                    # Log if scalar sigma^2 is zero; only once per param
+                    if self.rank == 0 and float(v) == 0.0 and not self.state[p].get('zero_sigma2_warned', False):
+                        name = self.param_to_name.get(p, "<unknown>")
+                        kind = self.param_kind.get(p, "unknown")
+                        print(f"SpectralEcho: received zero noise sigma^2 for {name} ({kind})")
+                        self.state[p]['zero_sigma2_warned'] = True
         self.feed_noise_sigma2 = _feed_sigma2
         for group in self.param_groups:
             for p in group["params"]:
