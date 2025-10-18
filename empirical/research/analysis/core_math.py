@@ -8,7 +8,7 @@ needed, with consistent interfaces.
 
 import math
 import logging
-from typing import Union, Tuple, Dict
+from typing import Union, Tuple, Dict, List
 import numpy as np
 try:
     from scipy.optimize import curve_fit as _scipy_curve_fit
@@ -218,6 +218,186 @@ def compute_spectral_echo_and_alignment(
     return echo_out, assign_idx
 
 
+def _hungarian_linear_sum_assignment(cost: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Classic Hungarian algorithm for square cost matrices (min-sum). No fallbacks.
+
+    Args:
+        cost: 2D numpy array (N,N)
+    Returns:
+        row_ind, col_ind arrays indicating the assignment.
+    """
+    cost = np.array(cost, dtype=np.float64, copy=True)
+    n = cost.shape[0]
+    assert cost.shape[0] == cost.shape[1], "Hungarian requires square matrix"
+
+    # Step 1: Subtract row minima
+    cost -= cost.min(axis=1, keepdims=True)
+    # Step 2: Subtract column minima
+    cost -= cost.min(axis=0, keepdims=True)
+
+    # Masks and covers
+    starred = np.zeros_like(cost, dtype=bool)
+    primed = np.zeros_like(cost, dtype=bool)
+    row_covered = np.zeros(n, dtype=bool)
+    col_covered = np.zeros(n, dtype=bool)
+
+    # Step 3: Star independent zeros
+    for i in range(n):
+        for j in range(n):
+            if cost[i, j] == 0 and not row_covered[i] and not col_covered[j]:
+                starred[i, j] = True
+                row_covered[i] = True
+                col_covered[j] = True
+                break
+    row_covered[:] = False
+    col_covered[:] = False
+
+    def cover_columns_with_starred():
+        col_covered[:] = np.any(starred, axis=0)
+
+    cover_columns_with_starred()
+
+    def find_a_zero():
+        for i in range(n):
+            if row_covered[i]:
+                continue
+            for j in range(n):
+                if (not col_covered[j]) and (cost[i, j] == 0):
+                    return i, j
+        return None
+
+    def find_star_in_row(r):
+        c = np.where(starred[r])[0]
+        return (c[0] if c.size else None)
+
+    def find_star_in_col(c):
+        r = np.where(starred[:, c])[0]
+        return (r[0] if r.size else None)
+
+    def find_prime_in_row(r):
+        c = np.where(primed[r])[0]
+        return (c[0] if c.size else None)
+
+    def augment_path(path: List[Tuple[int, int]]):
+        for r, c in path:
+            starred[r, c] = not starred[r, c]
+            primed[r, c] = False
+
+    while True:
+        # Step 4: Check if all columns are covered
+        if col_covered.sum() == n:
+            break
+        # Step 5: Prime uncovered zero; if no starred in row, augment path
+        z = find_a_zero()
+        while z is None:
+            # Step 6: Adjust matrix by smallest uncovered value
+            min_uncovered = np.min(cost[~row_covered][:, ~col_covered])
+            cost[ row_covered, : ] += min_uncovered
+            cost[ :, ~col_covered ] -= min_uncovered
+            z = find_a_zero()
+        r, c = z
+        primed[r, c] = True
+        star_c = find_star_in_row(r)
+        if star_c is None:
+            # Augmenting path
+            path = [(r, c)]
+            # find starred zero in column c
+            r2 = find_star_in_col(c)
+            while r2 is not None:
+                c2 = find_prime_in_row(r2)
+                path.append((r2, c))
+                path.append((r2, c2))
+                c = c2
+                r2 = find_star_in_col(c)
+            augment_path(path)
+            primed[:, :] = False
+            row_covered[:] = False
+            col_covered[:] = False
+            cover_columns_with_starred()
+        else:
+            row_covered[r] = True
+            col_covered[star_c] = False
+
+    row_ind = np.arange(n, dtype=int)
+    col_ind = np.where(starred)[1]
+    return row_ind, col_ind
+
+
+def compute_reverb_echo_and_alignment(
+    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute spectral echo using spectral reverb, with cross-replica alignment via Hungarian.
+
+    Args:
+        mb_svd: (U_b, S_b, Vh_b) from batched SVD of per-minibatch gradients
+                U_b: [B, H, K], S_b: [B, K], Vh_b: [B, K, W]
+    Returns:
+        spectral_echo: [Kc]
+        alignment_indices: [B, Kc] long indices mapping reference index i to minibatch index j*(i)
+    """
+    U_b, _, Vh_b = mb_svd
+    with torch.no_grad():
+        if U_b.dtype == torch.bfloat16:
+            U_b = U_b.float()
+        if Vh_b.dtype == torch.bfloat16:
+            Vh_b = Vh_b.float()
+        V_b = Vh_b.transpose(-2, -1)  # [B, W, K]
+
+        B, H, K = U_b.shape
+        _, W, Kv = V_b.shape
+        Kc = int(min(K, Kv))
+        U_b = U_b[:, :, :Kc]
+        V_b = V_b[:, :, :Kc]
+
+        # Reference replica (0)
+        U_ref = U_b[0]  # [H, Kc]
+        V_ref = V_b[0]  # [W, Kc]
+
+        # Precompute reference Gram columns
+        # Build alignment per replica via Hungarian on similarity matrix M = |U_b^T U_ref| * |V_b^T V_ref|
+        assign_idx = torch.empty((B, Kc), dtype=torch.long, device=U_b.device)
+        for b in range(B):
+            Ux = U_b[b]  # [H, Kc]
+            Vx = V_b[b]  # [W, Kc]
+            MU = (Ux.transpose(0, 1) @ U_ref).abs().cpu().numpy()  # [Kc, Kc]
+            MV = (Vx.transpose(0, 1) @ V_ref).abs().cpu().numpy()  # [Kc, Kc]
+            M = MU * MV
+            # Maximize similarity -> minimize negative
+            # Ensure square
+            assert M.shape[0] == M.shape[1], "Alignment similarity matrix must be square"
+            max_val = M.max() if M.size else 0.0
+            cost = (max_val - M)
+            row_ind, col_ind = _hungarian_linear_sum_assignment(cost)
+            # row_ind are local j, col_ind are reference i; we want j*(i) for each i
+            inv = np.empty(Kc, dtype=np.int64)
+            inv[col_ind] = row_ind
+            assign_idx[b] = torch.from_numpy(inv).to(assign_idx.device)
+
+        # Optional sign correction to keep overlaps positive
+        for b in range(B):
+            idx = assign_idx[b]
+            # Compute sign from product of left and right overlaps
+            u_overlap = torch.sum(U_b[b].gather(1, idx.view(1, -1).expand(H, -1)) * U_ref, dim=0)
+            v_overlap = torch.sum(V_b[b].gather(1, idx.view(1, -1).expand(W, -1)) * V_ref, dim=0)
+            sgn = torch.sign(u_overlap * v_overlap)
+            sgn[sgn == 0] = 1.0
+            # Apply sign to aligned columns in-place
+            U_b[b].index_copy_(1, idx, U_b[b][:, idx] * sgn)
+            V_b[b].index_copy_(1, idx, V_b[b][:, idx] * sgn)
+
+        # Build aligned bases (replica, i, d)
+        # Reorder columns of each replica to match reference ordering
+        aligned_U = torch.stack([U_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, H, Kc]
+        aligned_V = torch.stack([V_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, W, Kc]
+
+    # Compute echoes via spectral reverb triple-OLS
+    echoes = solve_for_spectral_echo_using_reverb(aligned_U, aligned_V)  # [B, Kc]
+    with torch.no_grad():
+        # Robust aggregation across replicas
+        spectral_echo = torch.median(echoes, dim=0).values.clamp(0.0, 1.0)  # [Kc]
+    return spectral_echo, assign_idx
+
+
 def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
                              alignment_indices: torch.Tensor) -> torch.Tensor:
     """Gather per-batch singular values aligned to mean indices via alignment indices.
@@ -387,3 +567,51 @@ def precompute_theoretical_noise_to_phase_slope_kappa(
 
 def aspect_ratio_beta(matrix: torch.Tensor) -> float:
     return float(matrix_shape_beta(matrix.shape))
+
+def solve_for_spectral_echo_using_reverb(
+    left_bases_U: torch.Tensor,   # (r, d, d) aligned left singular bases per replica
+    right_bases_V: torch.Tensor,  # (r, d, d) aligned right singular bases per replica
+    noise_quantile: float = 0.10, # lower-tail quantile to set per-direction noise floor
+    tau_mult: float = 4.0,        # multiplier on the noise floor for denominator guarding
+    weight_power: float = 2.0,    # use |Z_ab|**weight_power as weights
+) -> torch.Tensor:                # returns echoes with shape (r, d)
+    """
+    Triple–OLS with robust weights and denominator guarding (no NaNs).
+    Uses per-direction spectral reverb Z_ab = <U_a,U_b>*<V_a,V_b>, weights w_ab = |Z_ab|^p,
+    and divides by Z_ab + sign(Z_ab)*tau_dir to avoid small-denominator blowups.
+    """
+    r, d, _ = left_bases_U.shape
+
+    # Spectral reverb across replicas and directions: Z[a,b,:] = <U_a,U_b> * <V_a,V_b>  ->  (r,r,d)
+    spectral_reverb_Z = torch.einsum('aik,bik->abd', left_bases_U, left_bases_U) \
+                      * torch.einsum('aik,bik->abd', right_bases_V, right_bases_V)
+
+    # Per-direction noise floor from lower tail of |Z| (exclude nothing; diag ≈ 1 keeps floor sane)
+    absZ = spectral_reverb_Z.abs()                                     # (r,r,d)
+    tau_dir = tau_mult * torch.quantile(absZ, noise_quantile, dim=(0,1))  # (d,)
+
+    # Build all r_{a,b->p} numerators and guarded denominators (broadcast to (p,a,b,d))
+    idx = torch.arange(r, device=left_bases_U.device)
+    Z_ap = spectral_reverb_Z[:, idx, :].permute(1, 0, 2).unsqueeze(2)  # (p,a,1,d) = Z[a,p,:]
+    Z_pb = spectral_reverb_Z[idx, :, :].unsqueeze(2)                    # (p,1,b,d) = Z[p,b,:]
+    numer = Z_ap * Z_pb                                                 # (p,a,b,d)
+    denom = spectral_reverb_Z.unsqueeze(0)                              # (1,a,b,d)
+    sgn = torch.where(denom >= 0, 1.0, -1.0)                            # (1,a,b,d)
+    denom_safe = denom + sgn * tau_dir.view(1,1,1,d)                    # (1,a,b,d)
+
+    # Valid triple mask: a!=b, a!=p, b!=p
+    a_ne_b = idx.view(1,-1,1) != idx.view(1,1,-1)                      # (1,a,b)
+    a_ne_p = idx.view(-1,1,1) != idx.view(1,-1,1)                      # (p,a,1)
+    b_ne_p = idx.view(-1,1,1) != idx.view(1,1,-1)                      # (p,1,b)
+    valid = (a_ne_b & a_ne_p & b_ne_p).unsqueeze(-1)                    # (p,a,b,1)
+
+    # Robust weights w_ab = |Z_ab|**weight_power (broadcast to (p,a,b,d))
+    weights = absZ.pow(weight_power).unsqueeze(0)                       # (1,a,b,d)
+
+    # Weighted Triple–OLS: mean over valid (a,b)
+    triple_vals = torch.where(valid, numer / denom_safe, 0.0)           # (p,a,b,d)
+    weighted_sum = (weights * triple_vals).sum(dim=(1,2))               # (p,d)
+    weight_sum   = (weights * valid).sum(dim=(1,2)).clamp_min(1e-12)    # (p,d)
+    s_hat = weighted_sum / weight_sum                                   # (p,d) ~ ζ_p^2
+
+    return torch.sqrt(s_hat.clamp_min(0.0))                             # echoes ζ_p ∈ [0,1], (r,d)

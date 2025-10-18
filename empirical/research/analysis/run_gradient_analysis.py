@@ -38,7 +38,7 @@ from empirical.research.analysis.property_pipeline import PropertySpec, Property
 from empirical.research.analysis.core_math import (
     matrix_shape_beta,
     stable_rank_from_tensor, safe_svd,
-    compute_spectral_echo_and_alignment, gather_aligned_singulars,
+    compute_reverb_echo_and_alignment, gather_aligned_singulars,
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
 )
@@ -88,8 +88,8 @@ ANALYSIS_SPECS = [
     PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
     
     PropertySpec("spectral_echo_and_alignment",
-                ["minibatch_gradient_svd", "mean_gradient_svd"],
-                compute_spectral_echo_and_alignment),
+                ["minibatch_gradient_svd"],
+                compute_reverb_echo_and_alignment),
     PropertySpec("spectral_echo", ["spectral_echo_and_alignment"], lambda t: t[0]),
     PropertySpec("aligned_minibatch_singular_values", ["spectral_echo_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
     # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
@@ -168,18 +168,19 @@ def compute_analysis_for_step(
     args = Hyperparameters()
     
     if initial_props is None:
-        # Get all parameters for sharding
+        # Get all parameters (no sharding during accumulation; we want 8xA replicates)
         all_weights = get_weight_matrices(model, only_hidden=True)
         all_param_keys = list(all_weights.keys())
-        # Shard parameters across ranks
-        my_param_keys = shard_param_keys(all_param_keys, rank, world_size)
         if rank == 0:
-            print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total")
-        # Get sharded gradients
-        gradients = get_accumulated_gradient_matrices(
-            model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys
+            print(f"    Rank {rank}: Accumulating gradients for all {len(all_param_keys)} parameters on every rank")
+        # Accumulate local microgradients for all keys
+        local_gradients = get_accumulated_gradient_matrices(
+            model, args, step, num_minibatches=num_minibatches, assigned_params=None
         )
-        my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
+        # Gather and concatenate microgradients across ranks to form 8xA replicates
+        from empirical.research.analysis.model_utilities import gather_microgradients_across_ranks
+        gradients = gather_microgradients_across_ranks(local_gradients)
+        my_weights = all_weights  # All ranks share the same weights
         initial_props = combine_layer_properties(
             lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
             my_weights, gradients
@@ -247,7 +248,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         'per_minibatch_gradient_singular_values',
         'gradient_singular_value_standard_deviations',
         'per_minibatch_gradient_stable_rank',
-        'spectral_echo_from_8x_mean_gradient',
+        'spectral_echo_from_reverb',
         'shape',
         'gradient_noise_sigma2',
         'empirical_phase_constant_tau2',
@@ -267,7 +268,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'per_minibatch_gradient_singular_values': json.dumps(to_np16(props['minibatch_singular_values']).tolist()),
                 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
-                'spectral_echo_from_8x_mean_gradient': json.dumps(to_np16(props['spectral_echo']).tolist()),
+                'spectral_echo_from_reverb': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,

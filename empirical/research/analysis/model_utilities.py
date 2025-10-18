@@ -194,6 +194,43 @@ def gather_layer_properties_to_rank_zero(local_props: Dict[Tuple[str, int], Dict
         return None
 
 
+def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int], torch.Tensor]) -> Dict[Tuple[str, int], torch.Tensor]:
+    """Gather per-layer microgradients across ranks and concatenate along batch dim.
+
+    - On single process, returns input unchanged.
+    - With distributed, gathers dicts to rank 0, concatenates along dim 0 for each key,
+      and broadcasts the merged dict back to all ranks.
+    """
+    if not dist.is_initialized():
+        return per_minibatch_grads
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Gather objects to rank 0
+    obj_list = [None] * world_size if rank == 0 else None
+    dist.gather_object(per_minibatch_grads, obj_list, dst=0)
+
+    if rank == 0:
+        # Merge and concatenate along batch dim
+        merged: Dict[Tuple[str, int], List[torch.Tensor]] = {}
+        for d in obj_list:
+            for k, t in d.items():
+                merged.setdefault(k, []).append(t)
+        concat: Dict[Tuple[str, int], torch.Tensor] = {}
+        for k, tensors in merged.items():
+            # Ensure tensors are on same device (move to CPU for broadcast)
+            tensors_cpu = [ti.detach().cpu() for ti in tensors]
+            concat[k] = torch.cat(tensors_cpu, dim=0)
+        payload = [concat]
+    else:
+        payload = [None]
+
+    # Broadcast merged dict to all ranks
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
 def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int, assigned_params: set = None) -> GPTLayerProperty:
     """
     Compute accumulated gradient matrices for analysis.
@@ -255,18 +292,14 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                     if param_type == "Attention" and param.grad.ndim >= 3:
                         for i, component in enumerate(["Q", "K", "V", "O"]):
                             key = (f"Attention {component}", layer_num)
-                            # Skip if not assigned to this rank
-                            if assigned_params is not None and key not in assigned_params:
-                                continue
+                            # Accumulate for all keys (no sharding during accumulation)
                             grad_tensor = param.grad[i].clone().detach()
                             if key not in minibatch_grads:
                                 minibatch_grads[key] = []
                             minibatch_grads[key].append(grad_tensor)
                     else:
                         key = (param_type, layer_num)
-                        # Skip if not assigned to this rank
-                        if assigned_params is not None and key not in assigned_params:
-                            continue
+                        # Accumulate for all keys (no sharding during accumulation)
                         grad_tensor = param.grad.clone().detach()
                         if key not in minibatch_grads:
                             minibatch_grads[key] = []
