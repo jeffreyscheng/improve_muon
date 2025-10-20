@@ -581,64 +581,109 @@ def aspect_ratio_beta(matrix: torch.Tensor) -> float:
 def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
     right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
-    noise_quantile: float = 0.02, # lower-tail quantile to set per-direction noise floor
-    tau_mult: float = 1.5,        # gentler guard multiplier to reduce high-s flattening
-    weight_power: float = 2.0,    # use |Z_ab|**weight_power as weights
+    noise_quantile: float = 0.02, # UNUSED in this debiased, tuning-free variant
+    tau_mult: float = 1.5,        # UNUSED in this debiased, tuning-free variant
+    weight_power: float = 2.0,    # UNUSED in this debiased, tuning-free variant
 ) -> torch.Tensor:                # returns echoes with shape (r, Kc)
     """
-    Triple–OLS with robust weights and denominator guarding (no NaNs).
-    Uses per-direction spectral reverb Z_ab = <U_a,U_b>*<V_a,V_b>, weights w_ab = |Z_ab|^p,
-    and divides by Z_ab + sign(Z_ab)*tau_dir to avoid small-denominator blowups.
+    Debiased spectral-echo estimator (no tunable floors, no weights).
+
+    Model: independent replicas of \hat{G} = G + E (isotropic), alignment already applied.
+    We estimate the per-direction overlap statistics of Z_{abk} directly from data and
+    apply a Fieller/delta-method bias correction to the triple ratio before the sqrt.
+
+    Notation:
+        Z_{abk} = <U_a[:,k], U_b[:,k]> * <V_a[:,k], V_b[:,k]>
+        r_{a,b->p,k} = (Z_{apk} * Z_{pbk}) / Z_{abk}
+
+    Steps per direction k:
+        1) Compute all off-diagonal Z_{abk} across replicas (a != b).
+        2) Estimate μ_Z(k) = mean(Z_{abk}) and v_Z(k) = var(Z_{abk}) from those pairs.
+        3) For each pivot p, average r_{a,b->p,k} over valid (a,b) without any floor/weights:
+               rbar_{p,k} = mean_{a!=b, a!=p, b!=p} r_{a,b->p,k}
+        4) Bias-correct the mean ratio using Fieller (second order):
+               rtilde_{p,k} = rbar_{p,k} / (1 + v_Z(k) / μ_Z(k)^2)
+        5) Echo per-pivot: ζ̂_{p,k} = sqrt(max(rtilde_{p,k}, 0))
+
+    Returns:
+        echoes: (r, Kc) tensor with per-pivot echoes; upstream can take median over pivots.
     """
-    # Shapes
-    r, _, Kc = left_bases_U.shape
+    with torch.no_grad():
+        U = left_bases_U
+        V = right_bases_V
+        if U.dtype == torch.bfloat16: U = U.float()
+        if V.dtype == torch.bfloat16: V = V.float()
 
-    # --- small-B guard: need r>=3 for triples; else pairwise fallback
-    if r < 3:
-        ZU = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U)  # (r,r,Kc)
-        ZV = torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)  # (r,r,Kc)
-        Z  = ZU * ZV                                                    # (r,r,Kc)
-        mask = ~torch.eye(r, dtype=torch.bool, device=Z.device)
-        Z_off = Z[mask].reshape(r*(r-1), Kc).abs().clamp_min(0.0)
-        echoes = torch.sqrt(Z_off.median(dim=0).values.clamp_min(0.0))  # (Kc,)
-        return echoes.unsqueeze(0).expand(r, -1)
+        r, H, Kc = U.shape
+        _, W, Kc2 = V.shape
+        assert Kc == Kc2, "Left/Right Kc mismatch"
 
-    # Spectral reverb across replicas and directions: Z[a,b,k] = <U_a,U_b> * <V_a,V_b>
-    ZU = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U)       # (r,r,Kc)
-    ZV = torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)     # (r,r,Kc)
-    spectral_reverb_Z = ZU * ZV                                         # (r,r,Kc)
+        # --- small-r guard: need r >= 3 for triples; else pairwise fallback
+        if r < 3:
+            ZU = torch.einsum('aik,bik->abk', U, U)     # (r,r,Kc)
+            ZV = torch.einsum('aik,bik->abk', V, V)     # (r,r,Kc)
+            Z  = ZU * ZV                                # (r,r,Kc)
+            mask = ~torch.eye(r, dtype=torch.bool, device=Z.device)
+            Z_off = Z[mask].reshape(r*(r-1), Kc).abs().clamp_min(0.0)
+            echoes = torch.sqrt(Z_off.median(dim=0).values.clamp_min(0.0))  # (Kc,)
+            return echoes.unsqueeze(0).expand(r, -1)
 
-    absZ = spectral_reverb_Z.abs()                                      # (r,r,Kc)
+        # --- Build Z_{abk} across replicas and directions
+        # Z[a,b,k] = <U_a[:,k],U_b[:,k]> * <V_a[:,k],V_b[:,k}>
+        ZU = torch.einsum('aik,bik->abk', U, U)         # (r,r,Kc)
+        ZV = torch.einsum('aik,bik->abk', V, V)         # (r,r,Kc)
+        Z  = ZU * ZV                                    # (r,r,Kc)
 
-    # Quantile over (a,b) entries for each k; flatten (a,b) first (no contiguity assumptions)
-    absZ_flat = absZ.reshape(-1, Kc)                                    # (r*r, Kc)
-    tau_dir = tau_mult * torch.quantile(absZ_flat, noise_quantile, dim=0)  # (Kc,)
+        # --- Estimate μ_Z(k) and v_Z(k) from off-diagonals (a != b), per direction k
+        diag_mask = torch.eye(r, dtype=torch.bool, device=Z.device).unsqueeze(-1)  # (r,r,1)
+        Z_off = Z.masked_select(~diag_mask).view(r*(r-1), Kc)  # (r*(r-1), Kc)
+        # Unbiased sample mean and variance (per direction)
+        muZ = Z_off.mean(dim=0)                                       # (Kc,)
+        # Use unbiased var; guard tiny negatives from numerical noise
+        if Z_off.size(0) > 1:
+            vZ  = Z_off.var(dim=0, unbiased=True).clamp_min(0.0)     # (Kc,)
+        else:
+            vZ  = torch.zeros_like(muZ)
 
-    # Build numerators/denominators for triples r_{a,b->p}
-    idx = torch.arange(r, device=left_bases_U.device)
-    Z_ap = spectral_reverb_Z[:, idx, :].permute(1, 0, 2).unsqueeze(2)   # (p,a,1,Kc) = Z[a,p,:]
-    Z_pb = spectral_reverb_Z[idx, :, :].unsqueeze(2)                     # (p,1,b,Kc) = Z[p,b,:]
-    numer = Z_ap * Z_pb                                                  # (p,a,b,Kc)
+        # Avoid division by zero in correction factor
+        eps = torch.finfo(Z.dtype).eps
+        muZ_safe = torch.where(muZ.abs() < eps, torch.sign(muZ) * eps + (muZ == 0).float() * eps, muZ)
+        corr = 1.0 + (vZ / (muZ_safe * muZ_safe))                    # (Kc,)
 
-    denom = spectral_reverb_Z.unsqueeze(0)                               # (1,a,b,Kc)
-    sgn = torch.where(denom >= 0, 1.0, -1.0)                             # (1,a,b,Kc)
-    guard = sgn * tau_dir.view(1, 1, 1, Kc)                              # (1,a,b,Kc)
-    need_guard = (denom.abs() < tau_dir.view(1, 1, 1, Kc))
-    denom_safe = torch.where(need_guard, denom + guard, denom)           # (1,a,b,Kc)
+        # --- Form all triple ratios r_{a,b->p,k} without any floors/weights
+        # Use vectorized construction:
+        #   numer[p,a,b,k] = Z[a,p,k] * Z[p,b,k]
+        #   denom[a,b,k]   = Z[a,b,k]
+        idx = torch.arange(r, device=Z.device)
+        Z_ap = Z[:, idx, :].permute(1, 0, 2).unsqueeze(2)   # (p,a,1,Kc) = Z[a,p,k]
+        Z_pb = Z[idx, :, :].unsqueeze(2)                    # (p,1,b,Kc) = Z[p,b,k]
+        numer = Z_ap * Z_pb                                 # (p,a,b,Kc)
+        denom = Z.unsqueeze(0)                              # (1,a,b,Kc)
 
-    # Valid triple mask: a!=b, a!=p, b!=p
-    a_ne_b = idx.view(1, -1, 1) != idx.view(1, 1, -1)                   # (1,a,b)
-    a_ne_p = idx.view(-1, 1, 1) != idx.view(1, -1, 1)                   # (p,a,1)
-    b_ne_p = idx.view(-1, 1, 1) != idx.view(1, 1, -1)                   # (p,1,b)
-    valid = (a_ne_b & a_ne_p & b_ne_p).unsqueeze(-1)                     # (p,a,b,1)
+        # Valid triple mask: a!=b, a!=p, b!=p
+        a_ne_b = idx.view(1, -1, 1) != idx.view(1, 1, -1)   # (1,a,b)
+        a_ne_p = idx.view(-1, 1, 1) != idx.view(1, -1, 1)   # (p,a,1)
+        b_ne_p = idx.view(-1, 1, 1) != idx.view(1, 1, -1)   # (p,1,b)
+        valid  = (a_ne_b & a_ne_p & b_ne_p).unsqueeze(-1)   # (p,a,b,1)
 
-    # Robust weights w_ab = |Z_ab|**weight_power
-    weights = absZ.pow(weight_power).unsqueeze(0)                        # (1,a,b,Kc)
+        # Purely numerical protection against exact zeros (machine-precision only; NOT a tunable floor)
+        tiny = eps
+        denom_safe = torch.where(denom.abs() < tiny,
+                                 denom + torch.sign(denom) * tiny,
+                                 denom)
 
-    # Weighted Triple–OLS over (a,b)
-    triple_vals = torch.where(valid, numer / denom_safe, 0.0)            # (p,a,b,Kc)
-    weighted_sum = (weights * triple_vals).sum(dim=(1, 2))               # (p,Kc)
-    weight_sum   = (weights * valid).sum(dim=(1, 2)).clamp_min(1e-12)    # (p,Kc)
-    s_hat = weighted_sum / weight_sum                                    # (p,Kc) ~ ζ_p^2
+        triples = torch.where(valid, numer / denom_safe, torch.zeros_like(numer))  # (p,a,b,Kc)
 
-    return torch.sqrt(s_hat.clamp_min(0.0))                              # echoes (r,Kc)
+        # Average across valid (a,b) for each pivot p, per direction k
+        valid_f = valid.float()
+        cnt = valid_f.sum(dim=(1, 2)).clamp_min(1.0)       # (p,1)
+        rbar = (triples.sum(dim=(1, 2)) / cnt).squeeze(1)  # (p,Kc)
+
+        # --- Fieller/delta-method debiasing: divide by (1 + vZ / muZ^2)
+        # Broadcast corr (Kc,) over pivots p
+        rtilde = rbar / corr.unsqueeze(0)                  # (p,Kc)
+
+        # --- Echo per pivot: sqrt of positive part
+        echoes = torch.sqrt(rtilde.clamp_min(0.0))         # (p,Kc) == (r,Kc)
+
+        return echoes
