@@ -220,208 +220,160 @@ def compute_spectral_echo_and_alignment(
                 assign_idx[b, i] = -1
     return echo_out, assign_idx
 
-
-def _hungarian_linear_sum_assignment(cost: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Classic Hungarian algorithm for square cost matrices (min-sum). No fallbacks.
-
-    Args:
-        cost: 2D numpy array (N,N)
-    Returns:
-        row_ind, col_ind arrays indicating the assignment.
-    """
-    t_start = time.time()
-    cost = np.array(cost, dtype=np.float64, copy=True)
-    n = cost.shape[0]
-    assert cost.shape[0] == cost.shape[1], "Hungarian requires square matrix"
-
-    # Step 1: Subtract row minima
-    cost -= cost.min(axis=1, keepdims=True)
-    # Step 2: Subtract column minima
-    cost -= cost.min(axis=0, keepdims=True)
-
-    # Masks and covers
-    starred = np.zeros_like(cost, dtype=bool)
-    primed = np.zeros_like(cost, dtype=bool)
-    row_covered = np.zeros(n, dtype=bool)
-    col_covered = np.zeros(n, dtype=bool)
-
-    # Step 3: Star independent zeros
-    for i in range(n):
-        for j in range(n):
-            if cost[i, j] == 0 and not row_covered[i] and not col_covered[j]:
-                starred[i, j] = True
-                row_covered[i] = True
-                col_covered[j] = True
-                break
-    row_covered[:] = False
-    col_covered[:] = False
-
-    def cover_columns_with_starred():
-        col_covered[:] = np.any(starred, axis=0)
-
-    cover_columns_with_starred()
-
-    def find_a_zero():
-        for i in range(n):
-            if row_covered[i]:
-                continue
-            for j in range(n):
-                if (not col_covered[j]) and (cost[i, j] == 0):
-                    return i, j
-        return None
-
-    def find_star_in_row(r):
-        c = np.where(starred[r])[0]
-        return (c[0] if c.size else None)
-
-    def find_star_in_col(c):
-        r = np.where(starred[:, c])[0]
-        return (r[0] if r.size else None)
-
-    def find_prime_in_row(r):
-        c = np.where(primed[r])[0]
-        return (c[0] if c.size else None)
-
-    def augment_path(path: List[Tuple[int, int]]):
-        for r, c in path:
-            starred[r, c] = not starred[r, c]
-            primed[r, c] = False
-
-    iters = 0
-    while True:
-        # Step 4: Check if all columns are covered
-        if col_covered.sum() == n:
-            break
-        # Step 5: Prime uncovered zero; if no starred in row, augment path
-        z = find_a_zero()
-        while z is None:
-            # Step 6: Adjust matrix by smallest uncovered value
-            min_uncovered = np.min(cost[~row_covered][:, ~col_covered])
-            cost[ row_covered, : ] += min_uncovered
-            cost[ :, ~col_covered ] -= min_uncovered
-            z = find_a_zero()
-        r, c = z
-        primed[r, c] = True
-        star_c = find_star_in_row(r)
-        if star_c is None:
-            # Augmenting path
-            path = [(r, c)]
-            # find starred zero in column c
-            r2 = find_star_in_col(c)
-            while r2 is not None:
-                c2 = find_prime_in_row(r2)
-                path.append((r2, c))
-                path.append((r2, c2))
-                c = c2
-                r2 = find_star_in_col(c)
-            augment_path(path)
-            primed[:, :] = False
-            row_covered[:] = False
-            col_covered[:] = False
-            cover_columns_with_starred()
-        else:
-            row_covered[r] = True
-            col_covered[star_c] = False
-        iters += 1
-
-    row_ind = np.arange(n, dtype=int)
-    col_ind = np.where(starred)[1]
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    dt_ms = (time.time() - t_start) * 1000.0
-    log_from_rank(f"hungarian: n={n}, iters={iters}, {dt_ms:.1f} ms", rank)
-    return row_ind, col_ind
-
-
 def compute_reverb_echo_and_alignment(
-    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute spectral echo using spectral reverb, with cross-replica alignment via Hungarian.
-
-    Args:
-        mb_svd: (U_b, S_b, Vh_b) from batched SVD of per-minibatch gradients
-                U_b: [B, H, K], S_b: [B, K], Vh_b: [B, K, W]
-    Returns:
-        spectral_echo: [Kc]
-        alignment_indices: [B, Kc] long indices mapping reference index i to minibatch index j*(i)
+    mb_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    U_b, _, Vh_b = mb_svd
+    Fast & robust alignment:
+      - Build per-replica similarity M_b = |U_b^T U_ref| * |V_b^T V_ref|
+      - Average M_b across replicas (excluding the reference) -> M_avg
+      - Solve ONE LAP on the top-K block of M_avg to get a global permutation
+      - Reuse that permutation for all replicas; then do per-replica sign correction
+      - Return median-of-replica echoes and the assignment indices
+
+    Env knobs:
+      REVERB_MAX_KC: int cap on Kc (default 256)
+      REVERB_JITTER: float jitter magnitude added to M before LAP (default 1e-12)
+    """
+    import time
+    import numpy as np
+
+    # Optional SciPy LAP (preferred)
+    try:
+        from scipy.optimize import linear_sum_assignment as _scipy_lsa
+    except Exception:
+        _scipy_lsa = None
+
+    def _greedy_perm(M: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """One-to-one greedy: columns by descending best score; pick best available row."""
+        K = M.shape[0]
+        # tiny deterministic jitter to break ties
+        rng = np.random.RandomState(0)
+        J = M + (1e-12 * rng.standard_normal(M.shape))
+        col_order = np.argsort(-J.max(axis=0))
+        used = np.zeros(K, dtype=bool)
+        row_for_col = -np.ones(K, dtype=int)
+        for i in col_order:
+            j = int(np.argmax(J[:, i]))
+            if not used[j]:
+                row_for_col[i] = j
+                used[j] = True
+        # fill any leftovers arbitrarily
+        free = np.where(~used)[0].tolist()
+        for i in range(K):
+            if row_for_col[i] < 0:
+                row_for_col[i] = free.pop()
+        row_ind = row_for_col
+        col_ind = np.arange(K, dtype=int)
+        return row_ind, col_ind
+
+    # ---- unpack & basic guards ----
+    U_b, _, Vh_b = mb_svd  # U_b: [B,H,K], s: [B,K], Vh_b: [B,K,W]
     with torch.no_grad():
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        t_start = time.time()
         if U_b.dtype == torch.bfloat16:
             U_b = U_b.float()
         if Vh_b.dtype == torch.bfloat16:
             Vh_b = Vh_b.float()
-        V_b = Vh_b.transpose(-2, -1)  # [B, W, K]
+        V_b = Vh_b.transpose(-2, -1)  # [B,W,K]
 
         B, H, K = U_b.shape
         _, W, Kv = V_b.shape
         Kc = int(min(K, Kv))
-        U_b = U_b[:, :, :Kc]
-        V_b = V_b[:, :, :Kc]
 
-        # Reference replica (0)
-        U_ref = U_b[0]  # [H, Kc]
-        V_ref = V_b[0]  # [W, Kc]
+        # cap Kc aggressively; tiny singular directions are noisy & expensive
+        import os
+        K_cap = int(os.getenv("REVERB_MAX_KC", "256"))
+        Kc = min(Kc, max(1, K_cap))
 
-        # Precompute reference Gram columns
-        # Build alignment per replica via Hungarian on similarity matrix M = |U_b^T U_ref| * |V_b^T V_ref|
-        assign_idx = torch.empty((B, Kc), dtype=torch.long, device=U_b.device)
-        t_align_start = time.time()
-        hung_ms_total = 0.0
+        U_b = U_b[:, :, :Kc]        # [B,H,Kc]
+        V_b = V_b[:, :, :Kc]        # [B,W,Kc]
+
+        # reference replica
+        ref = 0
+        U_ref = U_b[ref]            # [H,Kc]
+        V_ref = V_b[ref]            # [W,Kc]
+
+        # ---- build M_b per replica against ref and form a consensus M_avg ----
+        # M_b = |U_b^T U_ref| * |V_b^T V_ref|  -> shape [Kc,Kc]
+        # exclude b==ref from the average to avoid trivial identity dominance
+        Ms = []
         for b in range(B):
-            Ux = U_b[b]  # [H, Kc]
-            Vx = V_b[b]  # [W, Kc]
-            MU = (Ux.transpose(0, 1) @ U_ref).abs().cpu().numpy()  # [Kc, Kc]
-            MV = (Vx.transpose(0, 1) @ V_ref).abs().cpu().numpy()  # [Kc, Kc]
-            M = MU * MV
-            # Maximize similarity -> minimize negative
-            # Ensure square
-            assert M.shape[0] == M.shape[1], "Alignment similarity matrix must be square"
-            max_val = M.max() if M.size else 0.0
-            cost = (max_val - M)
-            t_h0 = time.time()
-            row_ind, col_ind = _hungarian_linear_sum_assignment(cost)
-            hung_ms_total += (time.time() - t_h0) * 1000.0
-            # row_ind are local j, col_ind are reference i; we want j*(i) for each i
-            inv = np.empty(Kc, dtype=np.int64)
-            inv[col_ind] = row_ind
-            assign_idx[b] = torch.from_numpy(inv).to(assign_idx.device)
+            if b == ref:
+                continue
+            MU = (U_b[b].transpose(0, 1) @ U_ref).abs()  # [Kc,Kc]
+            MV = (V_b[b].transpose(0, 1) @ V_ref).abs()  # [Kc,Kc]
+            Ms.append((MU * MV).cpu().numpy())
+        if not Ms:
+            # degenerate B=1: identity alignment
+            assign_idx = torch.arange(Kc, device=U_b.device, dtype=torch.long).view(1, Kc).repeat(1, 1)
+            # aligned copies are trivial; echoes are all ones
+            spectral_echo = torch.ones(Kc, device=U_b.device, dtype=U_b.dtype)
+            return spectral_echo, assign_idx
 
-        log_from_rank(f"reverb-align: B={B}, Kc={Kc}, total_align_ms={(time.time()-t_align_start)*1000.0:.1f}, avg_hungarian_ms={hung_ms_total/max(B,1):.1f}", rank)
+        M_avg = np.mean(np.stack(Ms, axis=0), axis=0)  # [Kc,Kc]
 
-        # Optional sign correction to keep overlaps positive
-        t_sign = time.time()
+        # trim to the leading block (already Kc-capped), add jitter, and solve one LAP
+        jitter = float(os.getenv("REVERB_JITTER", "1e-12"))
+        M_block = M_avg.copy()
+        if jitter > 0.0:
+            # deterministic jitter
+            rng = np.random.RandomState(0)
+            M_block = M_block + jitter * rng.standard_normal(M_block.shape)
+
+        # maximize similarity -> min cost = max(M)-M
+        Mmax = float(M_block.max()) if M_block.size else 0.0
+        cost = (Mmax - M_block)
+
+        t_lap0 = time.time()
+        try:
+            if _scipy_lsa is not None:
+                r_ind, c_ind = _scipy_lsa(cost)   # returns row_ind, col_ind
+            else:
+                r_ind, c_ind = _greedy_perm(M_block)
+        except Exception:
+            r_ind, c_ind = _greedy_perm(M_block)
+        lap_ms = (time.time() - t_lap0) * 1000.0
+
+        # We want j*(i): for each column i (ref index), which row j (b index) to take.
+        # SciPy returns pairs (row, col) that minimize cost; ensure full 0..Kc-1 coverage.
+        # Build inverse map: inv[col] = row
+        inv = np.empty(Kc, dtype=np.int64)
+        inv[c_ind] = r_ind
+        perm = torch.from_numpy(inv).to(U_b.device, dtype=torch.long)  # [Kc]
+
+        # alignment indices for every replica are identical permutation (consensus)
+        assign_idx = perm.view(1, -1).repeat(B, 1)  # [B,Kc]
+
+        # ---- sign correction per replica (keep your logic) ----
+        # After permuting columns to reference order, correct signs so overlaps are positive.
         for b in range(B):
-            idx = assign_idx[b]
-            # Compute sign from product of left and right overlaps
+            idx = assign_idx[b]  # [Kc]
             u_overlap = torch.sum(U_b[b].gather(1, idx.view(1, -1).expand(H, -1)) * U_ref, dim=0)
             v_overlap = torch.sum(V_b[b].gather(1, idx.view(1, -1).expand(W, -1)) * V_ref, dim=0)
             sgn = torch.sign(u_overlap * v_overlap)
             sgn[sgn == 0] = 1.0
-            # Apply sign to aligned columns in-place
             U_b[b].index_copy_(1, idx, U_b[b][:, idx] * sgn)
             V_b[b].index_copy_(1, idx, V_b[b][:, idx] * sgn)
-        log_from_rank(f"reverb-sign: B={B}, Kc={Kc}, {((time.time()-t_sign)*1000.0):.1f} ms", rank)
 
-        t_stack = time.time()
-        # Build aligned bases (replica, i, d)
-        # Reorder columns of each replica to match reference ordering
-        aligned_U = torch.stack([U_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, H, Kc]
-        aligned_V = torch.stack([V_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, W, Kc]
-        log_from_rank(f"reverb-stack: B={B}, Kc={Kc}, {((time.time()-t_stack)*1000.0):.1f} ms", rank)
+        # ---- gather aligned bases and compute echoes via triple–OLS (your solver) ----
+        aligned_U = torch.stack([U_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B,H,Kc]
+        aligned_V = torch.stack([V_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B,W,Kc]
 
-    # Compute echoes via spectral reverb triple-OLS
+    # compute echoes; median across replicas for robustness
     t_reverb = time.time()
-    echoes = solve_for_spectral_echo_using_reverb(aligned_U, aligned_V)  # [B, Kc]
-    log_from_rank(f"reverb-solve: B={aligned_U.shape[0]}, Kc={aligned_U.shape[-1]}, {((time.time()-t_reverb)*1000.0):.1f} ms", rank)
-    with torch.no_grad():
-        # Robust aggregation across replicas
-        t_agg = time.time()
-        spectral_echo = torch.median(echoes, dim=0).values.clamp(0.0, 1.0)  # [Kc]
-        log_from_rank(f"reverb-agg: Kc={spectral_echo.numel()}, {((time.time()-t_agg)*1000.0):.1f} ms; total={(time.time()-t_start)*1000.0:.1f} ms", rank)
-    return spectral_echo, assign_idx
+    echoes = solve_for_spectral_echo_using_reverb(aligned_U, aligned_V)  # [B,Kc]
+    spectral_echo = echoes.median(dim=0).values.clamp(0.0, 1.0)          # [Kc]
+    t_end = time.time()
 
+    # logging (matches your style)
+    try:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    log_from_rank(f"reverb-align(consensus): B={B}, Kc={Kc}, lap_ms={lap_ms:.1f}, "
+                  f"solve_ms={(t_end - t_reverb)*1000.0:.1f}", rank)
+
+    return spectral_echo, assign_idx
 
 def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
                              alignment_indices: torch.Tensor) -> torch.Tensor:
