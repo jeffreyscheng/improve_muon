@@ -560,8 +560,8 @@ def solve_for_spectral_echo_using_reverb(
     r, d, _ = left_bases_U.shape
 
     # Spectral reverb across replicas and directions: Z[a,b,:] = <U_a,U_b> * <V_a,V_b>  ->  (r,r,d)
-    spectral_reverb_Z = torch.einsum('aik,bik->abd', left_bases_U, left_bases_U) \
-                      * torch.einsum('aik,bik->abd', right_bases_V, right_bases_V)
+    spectral_reverb_Z = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U) \
+                    * torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)
 
     # Per-direction noise floor from lower tail of |Z| (exclude nothing; diag ≈ 1 keeps floor sane)
     absZ = spectral_reverb_Z.abs()                                     # (r,r,d)
