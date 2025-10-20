@@ -565,8 +565,9 @@ def solve_for_spectral_echo_using_reverb(
 
     # Per-direction noise floor from lower tail of |Z| (exclude nothing; diag ≈ 1 keeps floor sane)
     absZ = spectral_reverb_Z.abs()                                     # (r,r,d)
-    absZ_flat = absZ.view(-1, d)                                # ((r*r), d)
+    absZ_flat = absZ.reshape(-1, d)                                      # ((r*r), d)
     tau_dir = tau_mult * torch.quantile(absZ_flat, noise_quantile, dim=0)  # (d,)
+
 
     # Build all r_{a,b->p} numerators and guarded denominators (broadcast to (p,a,b,d))
     idx = torch.arange(r, device=left_bases_U.device)
