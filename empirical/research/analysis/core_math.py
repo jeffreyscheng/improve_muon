@@ -9,6 +9,9 @@ needed, with consistent interfaces.
 import math
 import logging
 from typing import Union, Tuple, Dict, List
+import time
+import torch.distributed as dist
+from empirical.research.analysis.logging_utilities import log_from_rank
 import numpy as np
 try:
     from scipy.optimize import curve_fit as _scipy_curve_fit
@@ -226,6 +229,7 @@ def _hungarian_linear_sum_assignment(cost: np.ndarray) -> Tuple[np.ndarray, np.n
     Returns:
         row_ind, col_ind arrays indicating the assignment.
     """
+    t_start = time.time()
     cost = np.array(cost, dtype=np.float64, copy=True)
     n = cost.shape[0]
     assert cost.shape[0] == cost.shape[1], "Hungarian requires square matrix"
@@ -283,6 +287,7 @@ def _hungarian_linear_sum_assignment(cost: np.ndarray) -> Tuple[np.ndarray, np.n
             starred[r, c] = not starred[r, c]
             primed[r, c] = False
 
+    iters = 0
     while True:
         # Step 4: Check if all columns are covered
         if col_covered.sum() == n:
@@ -317,9 +322,13 @@ def _hungarian_linear_sum_assignment(cost: np.ndarray) -> Tuple[np.ndarray, np.n
         else:
             row_covered[r] = True
             col_covered[star_c] = False
+        iters += 1
 
     row_ind = np.arange(n, dtype=int)
     col_ind = np.where(starred)[1]
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    dt_ms = (time.time() - t_start) * 1000.0
+    log_from_rank(f"hungarian: n={n}, iters={iters}, {dt_ms:.1f} ms", rank)
     return row_ind, col_ind
 
 
@@ -337,6 +346,8 @@ def compute_reverb_echo_and_alignment(
     """
     U_b, _, Vh_b = mb_svd
     with torch.no_grad():
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        t_start = time.time()
         if U_b.dtype == torch.bfloat16:
             U_b = U_b.float()
         if Vh_b.dtype == torch.bfloat16:
@@ -356,6 +367,8 @@ def compute_reverb_echo_and_alignment(
         # Precompute reference Gram columns
         # Build alignment per replica via Hungarian on similarity matrix M = |U_b^T U_ref| * |V_b^T V_ref|
         assign_idx = torch.empty((B, Kc), dtype=torch.long, device=U_b.device)
+        t_align_start = time.time()
+        hung_ms_total = 0.0
         for b in range(B):
             Ux = U_b[b]  # [H, Kc]
             Vx = V_b[b]  # [W, Kc]
@@ -367,13 +380,18 @@ def compute_reverb_echo_and_alignment(
             assert M.shape[0] == M.shape[1], "Alignment similarity matrix must be square"
             max_val = M.max() if M.size else 0.0
             cost = (max_val - M)
+            t_h0 = time.time()
             row_ind, col_ind = _hungarian_linear_sum_assignment(cost)
+            hung_ms_total += (time.time() - t_h0) * 1000.0
             # row_ind are local j, col_ind are reference i; we want j*(i) for each i
             inv = np.empty(Kc, dtype=np.int64)
             inv[col_ind] = row_ind
             assign_idx[b] = torch.from_numpy(inv).to(assign_idx.device)
 
+        log_from_rank(f"reverb-align: B={B}, Kc={Kc}, total_align_ms={(time.time()-t_align_start)*1000.0:.1f}, avg_hungarian_ms={hung_ms_total/max(B,1):.1f}", rank)
+
         # Optional sign correction to keep overlaps positive
+        t_sign = time.time()
         for b in range(B):
             idx = assign_idx[b]
             # Compute sign from product of left and right overlaps
@@ -384,17 +402,24 @@ def compute_reverb_echo_and_alignment(
             # Apply sign to aligned columns in-place
             U_b[b].index_copy_(1, idx, U_b[b][:, idx] * sgn)
             V_b[b].index_copy_(1, idx, V_b[b][:, idx] * sgn)
+        log_from_rank(f"reverb-sign: B={B}, Kc={Kc}, {((time.time()-t_sign)*1000.0):.1f} ms", rank)
 
+        t_stack = time.time()
         # Build aligned bases (replica, i, d)
         # Reorder columns of each replica to match reference ordering
         aligned_U = torch.stack([U_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, H, Kc]
         aligned_V = torch.stack([V_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B, W, Kc]
+        log_from_rank(f"reverb-stack: B={B}, Kc={Kc}, {((time.time()-t_stack)*1000.0):.1f} ms", rank)
 
     # Compute echoes via spectral reverb triple-OLS
+    t_reverb = time.time()
     echoes = solve_for_spectral_echo_using_reverb(aligned_U, aligned_V)  # [B, Kc]
+    log_from_rank(f"reverb-solve: B={aligned_U.shape[0]}, Kc={aligned_U.shape[-1]}, {((time.time()-t_reverb)*1000.0):.1f} ms", rank)
     with torch.no_grad():
         # Robust aggregation across replicas
+        t_agg = time.time()
         spectral_echo = torch.median(echoes, dim=0).values.clamp(0.0, 1.0)  # [Kc]
+        log_from_rank(f"reverb-agg: Kc={spectral_echo.numel()}, {((time.time()-t_agg)*1000.0):.1f} ms; total={(time.time()-t_start)*1000.0:.1f} ms", rank)
     return spectral_echo, assign_idx
 
 

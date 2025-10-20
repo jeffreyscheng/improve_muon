@@ -49,7 +49,7 @@ from empirical.research.analysis.core_visualization import (
     newton_schulz_quintic_function,
     PARAM_TYPES,
 )
-from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint
+from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
 import logging
 
 
@@ -119,8 +119,7 @@ def build_compiled_model(device: torch.device):
 def load_weights_into_model(checkpoint_file: str, model: torch.nn.Module, device: torch.device):
     """Load checkpoint weights into an existing compiled model and broadcast from rank 0."""
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank == 0:
-        print(f"Rank {rank}: Loading checkpoint {checkpoint_file}")
+    log_from_rank(f"Loading checkpoint {checkpoint_file}", rank)
     # Use the unified deserializer; schema expects 'model'
     checkpoint_data = deserialize_model_checkpoint(Path(checkpoint_file))
     state_dict = checkpoint_data['model']
@@ -173,8 +172,7 @@ def compute_analysis_for_step(
         all_param_keys = list(all_weights.keys())
         # Shard parameters across ranks (owners)
         my_param_keys = shard_param_keys(all_param_keys, rank, world_size)
-        if rank == 0:
-            print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total (owners)")
+        log_from_rank(f"Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total (owners)", rank)
 
         # Build owner map deterministically across ranks
         owner_map = {}
@@ -198,8 +196,8 @@ def compute_analysis_for_step(
     pipeline = PropertyPipeline(specs or ANALYSIS_SPECS)
     
     def progress_callback(completed: int, total: int):
-        if rank == 0 and completed % LOG_EVERY == 0:
-            print(f"  Analyzed {completed}/{total} layers")
+        if completed % LOG_EVERY == 0:
+            log_from_rank(f"Analyzed {completed}/{total} layers", rank)
     
     local_results = pipeline.execute_for_all_layers(initial_props, progress_callback)
 
@@ -208,8 +206,7 @@ def compute_analysis_for_step(
 
     if dist.is_initialized():
         dist.barrier()
-    if rank == 0:
-        print(f"Step {step}: Analysis complete (streamed to CSV)")
+    log_from_rank(f"Step {step}: Analysis complete (streamed to CSV)", rank)
     return local_results
 
 
@@ -455,14 +452,12 @@ def main():
     checkpoints = find_all_checkpoints(run_id)
     # Skip step 0 checkpoints (many weights are zero-initialized there)
     checkpoints = [(s, p) for (s, p) in checkpoints if s > 0]
-    if rank == 0:
-        print(f"Filtered checkpoints (skip step 0): {len(checkpoints)} found")
+    log_from_rank(f"Filtered checkpoints (skip step 0): {len(checkpoints)} found", rank)
     # Optional testing flag: only run on first 2 checkpoints
     testing_mode = "--testing" in sys.argv
     if testing_mode:
         checkpoints = checkpoints[:2]
-        if rank == 0:
-            print(f"Testing mode enabled: processing {len(checkpoints)} checkpoints")
+        log_from_rank(f"Testing mode enabled: processing {len(checkpoints)} checkpoints", rank)
     # Collect time series (rank 0 only)
     pred_actual_gptlp_ts: Dict[int, GPTLayerProperty] = {}
     echo_singular_direct_ts: Dict[int, GPTLayerProperty] = {}

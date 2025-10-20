@@ -8,7 +8,11 @@ can separate the "what" (property specifications) from the "how" (execution).
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Any
+from typing import Callable, Dict, List, Any, Tuple
+import time
+import logging
+import torch.distributed as dist
+from empirical.research.analysis.logging_utilities import log_from_rank
 from collections import defaultdict, deque
 
 from empirical.research.analysis.model_utilities import GPTLayerProperty
@@ -106,7 +110,7 @@ class PropertyPipeline:
         }
         return prop_name in external_props
     
-    def execute_for_layer(self, initial_props: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_for_layer(self, initial_props: Dict[str, Any], layer_key: Tuple[str, int] | None = None) -> Dict[str, Any]:
         """Execute all transforms for a single layer.
         
         Args:
@@ -117,6 +121,7 @@ class PropertyPipeline:
         """
         props = initial_props.copy()
         
+        rank = dist.get_rank() if dist.is_initialized() else 0
         for spec in self.specs:
             # Extract inputs for this transform as positional arguments
             try:
@@ -125,7 +130,13 @@ class PropertyPipeline:
                 raise KeyError(f"Property {spec.name} missing input {e}")
             
             # Execute transform with positional arguments
+            t0 = time.time()
             props[spec.name] = spec.transform(*input_values)
+            dt_ms = (time.time() - t0) * 1000.0
+            if layer_key is not None:
+                log_from_rank(f"pipeline: {spec.name} for {layer_key} in {dt_ms:.1f} ms", rank)
+            else:
+                log_from_rank(f"pipeline: {spec.name} in {dt_ms:.1f} ms", rank)
         
         return props
     
@@ -147,7 +158,7 @@ class PropertyPipeline:
         total_layers = len(layer_props)
         
         for i, (layer_key, props) in enumerate(layer_props.items()):
-            results[layer_key] = self.execute_for_layer(props)
+            results[layer_key] = self.execute_for_layer(props, layer_key)
             
             if progress_callback:
                 progress_callback(i + 1, total_layers)

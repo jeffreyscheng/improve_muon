@@ -11,6 +11,7 @@ Consolidates online and offline logging functionality including:
 
 import json
 import time
+import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple
 import numpy as np
@@ -250,3 +251,10 @@ def dummy_logging(
     """
     if rank == 0:
         print(f"Dummy logging at step {step} for run {run_name}")
+
+def log_from_rank(
+    msg: str,
+    rank: int,
+):
+    if rank == 0:
+        logging.info(msg)
