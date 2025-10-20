@@ -245,7 +245,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
 
-    f, writer = open_layer_stats_writer(csv_path, FIELD_NAMES)
+    f, writer = open_layer_stats_writer(csv_path, fieldnames=list(layer_props.keys()))
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
