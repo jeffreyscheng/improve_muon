@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import time
 from torch.nn import Parameter, Module
+from empirical.research.analysis.constants import FIELD_NAMES
 
 # Type alias for layer properties
 GPTLayerProperty: TypeAlias = dict[tuple[str, int], Parameter | np.ndarray | torch.Tensor]
@@ -133,66 +134,38 @@ def _merge_dicts(dicts):
         merged.update(d)
     return merged
 
-def gather_layer_properties_to_rank_zero(local_props: Dict[Tuple[str, int], Dict[str, Any]]
-                                        ) -> Optional[Dict[Tuple[str, int], Dict[str, Any]]]:
+def gather_layer_properties_to_rank_zero(local_props):
     """
-    Gather arbitrary (picklable) Python objects from all ranks to rank 0.
-
-    Rank 0 returns the merged dict. Non-zero ranks return None.
-    All ranks must call this function.
+    Only gather the fields we actually write, and always on CPU.
+    Avoids pulling huge microgradient blobs to rank 0.
     """
-    if not dist.is_initialized():
-        # single process fallback
-        return local_props
-
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world = dist.get_world_size()
 
-    # Fast path: use gather_object when available
-    if hasattr(dist, "gather_object"):
-        obj_list = [None] * world_size if rank == 0 else None
-        # Every rank sends its local_props to dst=0
-        dist.gather_object(local_props, obj_list, dst=0)
-        if rank == 0:
-            return _merge_dicts(obj_list)
-        return None
+    # 1) prune to just the fields the writer will emit
+    slim = _prune_to_fieldnames(local_props)
 
-    # ===== Fallback for very old PyTorch: tensor-based gather =====
-    # Serialize to bytes -> ByteTensor on CPU, gather sizes then payloads.
+    # 2) move tensors to CPU so c10d doesn't coalesce GPU buffers
+    slim_cpu = _to_cpu_tree(slim)
 
-    buf = io.BytesIO()
-    pickle.dump(local_props, buf, protocol=pickle.HIGHEST_PROTOCOL)
-    byte_arr = bytearray(buf.getbuffer())
-    local_len = torch.tensor([len(byte_arr)], dtype=torch.int64, device="cpu")
+    obj_list = [None] * world if rank == 0 else None
+    dist.gather_object(slim_cpu, obj_list, dst=0)
 
-    # Gather lengths to rank 0
     if rank == 0:
-        lens = [torch.empty_like(local_len) for _ in range(world_size)]
+        # Merge per-rank dicts; later ranks can overwrite identical keys if identical
+        merged = {}
+        for part in obj_list:
+            if part is None:
+                continue
+            for k, v in part.items():
+                # If values are dict-like (e.g., GPTLayerProperty dict), merge shallowly
+                if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                    merged[k].update(v)
+                else:
+                    merged[k] = v
+        return merged
     else:
-        lens = None
-    dist.gather(local_len, gather_list=lens, dst=0)
-
-    # Send payloads
-    if rank == 0:
-        recv_bufs = []
-        for i in range(world_size):
-            recv_bufs.append(torch.empty(int(lens[i].item()), dtype=torch.uint8, device="cpu"))
-        # Rank 0 copies its own bytes
-        recv_bufs[0].copy_(torch.tensor(list(byte_arr), dtype=torch.uint8))
-        # Receive from others
-        for src in range(1, world_size):
-            dist.recv(recv_bufs[src], src=src)
-        # Deserialize and merge
-        objs = []
-        for t in recv_bufs:
-            b = bytes(memoryview(t.numpy()))
-            objs.append(pickle.loads(b))
-        return _merge_dicts(objs)
-    else:
-        payload = torch.tensor(list(byte_arr), dtype=torch.uint8, device="cpu")
-        dist.send(payload, dst=0)
         return None
-
 
 def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int], torch.Tensor]) -> Dict[Tuple[str, int], torch.Tensor]:
     """Gather per-layer microgradients across ranks and concatenate along batch dim.
@@ -351,3 +324,23 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     # (debug logs removed)
 
     return result
+
+def _to_cpu_tree(obj):
+    """Recursively clone tensors to CPU so gather_object doesn’t coalesce CUDA buffers."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu_tree(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        t = type(obj)
+        return t(_to_cpu_tree(v) for v in obj)
+    return obj
+
+def _prune_to_fieldnames(d):
+    """
+    Keep only top-level keys that are in FIELD_NAMES.
+    If your structure is {field_name -> GPTLayerProperty/Dict[...]}, this keeps it.
+    """
+    if not isinstance(d, dict):
+        return d
+    return {k: v for k, v in d.items() if k in FIELD_NAMES}

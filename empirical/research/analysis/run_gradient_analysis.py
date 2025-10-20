@@ -10,7 +10,7 @@ the "how" (execution), we achieve dramatically improved readability and maintain
 Usage:
     torchrun --standalone --nproc_per_node=8 -m empirical.research.analysis.compute_gradient_distribution <run_id> [--testing]
 """
-
+import logging
 import os
 import sys
 import re
@@ -50,13 +50,11 @@ from empirical.research.analysis.core_visualization import (
     PARAM_TYPES,
 )
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
-import logging
-
-
-# Small configuration knobs
-NUM_MINIBATCHES = 8
-LOG_EVERY = 5
-
+from empirical.research.analysis.constants import (
+    FIELD_NAMES,
+    NUM_MINIBATCHES,
+    LOG_EVERY
+)
 
 def gradients_stable_rank(grads: torch.Tensor) -> float:
     return stable_rank_from_tensor(grads.view(-1, grads.shape[-1]))
@@ -247,18 +245,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
 
-    fieldnames = [
-        'param_type', 'layer_num', 'weight_stable_rank',
-        'per_minibatch_gradient_singular_values',
-        'gradient_singular_value_standard_deviations',
-        'per_minibatch_gradient_stable_rank',
-        'spectral_echo_from_reverb',
-        'shape',
-        'gradient_noise_sigma2',
-        'empirical_phase_constant_tau2',
-    ]
-
-    f, writer = open_layer_stats_writer(csv_path, fieldnames)
+    f, writer = open_layer_stats_writer(csv_path, FIELD_NAMES)
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
