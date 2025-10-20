@@ -56,8 +56,17 @@ from empirical.research.analysis.constants import (
     LOG_EVERY
 )
 
-def gradients_stable_rank(grads: torch.Tensor) -> float:
-    return stable_rank_from_tensor(grads.view(-1, grads.shape[-1]))
+def gradients_stable_rank_from_svd(mb_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Compute per-microbatch stable rank from the already-computed batched SVD.
+
+    Stable rank per matrix: sum(s^2) / (s_max^2). For batched SVD, returns [B].
+    """
+    _, s, _ = mb_svd  # s: [B, K]
+    with torch.no_grad():
+        s2 = s * s
+        num = torch.sum(s2, dim=1)
+        den = torch.max(s2, dim=1).values.clamp_min(1e-20)
+        return (num / den)
 
 
 def singular_value_std(mb_sv: torch.Tensor, mean_sv: torch.Tensor) -> torch.Tensor:
@@ -68,7 +77,7 @@ ANALYSIS_SPECS = [
     # Stable rank computations
     PropertySpec("weights_stable_rank", ["checkpoint_weights"], 
                 stable_rank_from_tensor),
-    PropertySpec("gradients_stable_rank", ["per_minibatch_gradient"], gradients_stable_rank),
+    PropertySpec("gradients_stable_rank", ["minibatch_gradient_svd"], gradients_stable_rank_from_svd),
     
     # Core gradient analysis
     PropertySpec("mean_gradient", ["per_minibatch_gradient"], 
