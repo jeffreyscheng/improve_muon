@@ -278,6 +278,9 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 loss = model(inputs.to(torch.int32), targets, window_size_blocks)
                 loss.backward()
                 model.eval()  # Back to eval mode
+            # Log after each backward accumulation (A accumulations)
+            if rank == 0:
+                print(f"[rank 0] Backward complete for accumulation {minibatch_idx+1}/{num_minibatches}")
             
             # For each parameter key in model order, gather this minibatch's gradient to the owner
             for name, param in model.named_parameters():
@@ -324,6 +327,12 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 else:
                     key = (param_type, layer_num)
                     handle_key(key, param.grad)
+
+            # Ensure all ranks have finished sharding for this minibatch
+            if dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                print(f"[rank 0] Sharding complete for accumulation {minibatch_idx+1}/{num_minibatches}")
     
     # Stack gradients into batched tensors (owners only)
     result: Dict[Tuple[str, int], torch.Tensor] = {}
@@ -332,6 +341,12 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
             continue
         # Expect exactly (world_size * num_minibatches) entries per key
         result[key] = torch.stack(grad_list, dim=0)
+
+    # Final synchronization and log once all sharing is complete across all minibatches
+    if dist.is_initialized():
+        dist.barrier()
+    if rank == 0:
+        print(f"[rank 0] Completed distributed sharding of microgradients for all {num_minibatches} accumulations")
 
     # (debug logs removed)
 
