@@ -546,51 +546,64 @@ def aspect_ratio_beta(matrix: torch.Tensor) -> float:
     return float(matrix_shape_beta(matrix.shape))
 
 def solve_for_spectral_echo_using_reverb(
-    left_bases_U: torch.Tensor,   # (r, d, d) aligned left singular bases per replica
-    right_bases_V: torch.Tensor,  # (r, d, d) aligned right singular bases per replica
+    left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
+    right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
     noise_quantile: float = 0.10, # lower-tail quantile to set per-direction noise floor
     tau_mult: float = 4.0,        # multiplier on the noise floor for denominator guarding
     weight_power: float = 2.0,    # use |Z_ab|**weight_power as weights
-) -> torch.Tensor:                # returns echoes with shape (r, d)
+) -> torch.Tensor:                # returns echoes with shape (r, Kc)
     """
     Triple–OLS with robust weights and denominator guarding (no NaNs).
     Uses per-direction spectral reverb Z_ab = <U_a,U_b>*<V_a,V_b>, weights w_ab = |Z_ab|^p,
     and divides by Z_ab + sign(Z_ab)*tau_dir to avoid small-denominator blowups.
     """
-    r, d, _ = left_bases_U.shape
+    # Shapes
+    r, _, Kc = left_bases_U.shape
 
-    # Spectral reverb across replicas and directions: Z[a,b,:] = <U_a,U_b> * <V_a,V_b>  ->  (r,r,d)
-    spectral_reverb_Z = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U) \
-                    * torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)
+    # --- small-B guard: need r>=3 for triples; else pairwise fallback
+    if r < 3:
+        ZU = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U)  # (r,r,Kc)
+        ZV = torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)  # (r,r,Kc)
+        Z  = ZU * ZV                                                    # (r,r,Kc)
+        mask = ~torch.eye(r, dtype=torch.bool, device=Z.device)
+        Z_off = Z[mask].reshape(r*(r-1), Kc).abs().clamp_min(0.0)
+        echoes = torch.sqrt(Z_off.median(dim=0).values.clamp_min(0.0))  # (Kc,)
+        return echoes.unsqueeze(0).expand(r, -1)
 
-    # Per-direction noise floor from lower tail of |Z| (exclude nothing; diag ≈ 1 keeps floor sane)
-    absZ = spectral_reverb_Z.abs()                                     # (r,r,d)
-    absZ_flat = absZ.reshape(-1, d)                                      # ((r*r), d)
-    tau_dir = tau_mult * torch.quantile(absZ_flat, noise_quantile, dim=0)  # (d,)
+    # Spectral reverb across replicas and directions: Z[a,b,k] = <U_a,U_b> * <V_a,V_b>
+    ZU = torch.einsum('aik,bik->abk', left_bases_U, left_bases_U)       # (r,r,Kc)
+    ZV = torch.einsum('aik,bik->abk', right_bases_V, right_bases_V)     # (r,r,Kc)
+    spectral_reverb_Z = ZU * ZV                                         # (r,r,Kc)
 
+    absZ = spectral_reverb_Z.abs()                                      # (r,r,Kc)
 
-    # Build all r_{a,b->p} numerators and guarded denominators (broadcast to (p,a,b,d))
+    # Quantile over (a,b) entries for each k; flatten (a,b) first (no contiguity assumptions)
+    absZ_flat = absZ.reshape(-1, Kc)                                    # (r*r, Kc)
+    tau_dir = tau_mult * torch.quantile(absZ_flat, noise_quantile, dim=0)  # (Kc,)
+
+    # Build numerators/denominators for triples r_{a,b->p}
     idx = torch.arange(r, device=left_bases_U.device)
-    Z_ap = spectral_reverb_Z[:, idx, :].permute(1, 0, 2).unsqueeze(2)  # (p,a,1,d) = Z[a,p,:]
-    Z_pb = spectral_reverb_Z[idx, :, :].unsqueeze(2)                    # (p,1,b,d) = Z[p,b,:]
-    numer = Z_ap * Z_pb                                                 # (p,a,b,d)
-    denom = spectral_reverb_Z.unsqueeze(0)                              # (1,a,b,d)
-    sgn = torch.where(denom >= 0, 1.0, -1.0)                            # (1,a,b,d)
-    denom_safe = denom + sgn * tau_dir.view(1,1,1,d)                    # (1,a,b,d)
+    Z_ap = spectral_reverb_Z[:, idx, :].permute(1, 0, 2).unsqueeze(2)   # (p,a,1,Kc) = Z[a,p,:]
+    Z_pb = spectral_reverb_Z[idx, :, :].unsqueeze(2)                     # (p,1,b,Kc) = Z[p,b,:]
+    numer = Z_ap * Z_pb                                                  # (p,a,b,Kc)
+
+    denom = spectral_reverb_Z.unsqueeze(0)                               # (1,a,b,Kc)
+    sgn = torch.where(denom >= 0, 1.0, -1.0)                             # (1,a,b,Kc)
+    denom_safe = denom + sgn * tau_dir.view(1, 1, 1, Kc)                 # (1,a,b,Kc)
 
     # Valid triple mask: a!=b, a!=p, b!=p
-    a_ne_b = idx.view(1,-1,1) != idx.view(1,1,-1)                      # (1,a,b)
-    a_ne_p = idx.view(-1,1,1) != idx.view(1,-1,1)                      # (p,a,1)
-    b_ne_p = idx.view(-1,1,1) != idx.view(1,1,-1)                      # (p,1,b)
-    valid = (a_ne_b & a_ne_p & b_ne_p).unsqueeze(-1)                    # (p,a,b,1)
+    a_ne_b = idx.view(1, -1, 1) != idx.view(1, 1, -1)                   # (1,a,b)
+    a_ne_p = idx.view(-1, 1, 1) != idx.view(1, -1, 1)                   # (p,a,1)
+    b_ne_p = idx.view(-1, 1, 1) != idx.view(1, 1, -1)                   # (p,1,b)
+    valid = (a_ne_b & a_ne_p & b_ne_p).unsqueeze(-1)                     # (p,a,b,1)
 
-    # Robust weights w_ab = |Z_ab|**weight_power (broadcast to (p,a,b,d))
-    weights = absZ.pow(weight_power).unsqueeze(0)                       # (1,a,b,d)
+    # Robust weights w_ab = |Z_ab|**weight_power
+    weights = absZ.pow(weight_power).unsqueeze(0)                        # (1,a,b,Kc)
 
-    # Weighted Triple–OLS: mean over valid (a,b)
-    triple_vals = torch.where(valid, numer / denom_safe, 0.0)           # (p,a,b,d)
-    weighted_sum = (weights * triple_vals).sum(dim=(1,2))               # (p,d)
-    weight_sum   = (weights * valid).sum(dim=(1,2)).clamp_min(1e-12)    # (p,d)
-    s_hat = weighted_sum / weight_sum                                   # (p,d) ~ ζ_p^2
+    # Weighted Triple–OLS over (a,b)
+    triple_vals = torch.where(valid, numer / denom_safe, 0.0)            # (p,a,b,Kc)
+    weighted_sum = (weights * triple_vals).sum(dim=(1, 2))               # (p,Kc)
+    weight_sum   = (weights * valid).sum(dim=(1, 2)).clamp_min(1e-12)    # (p,Kc)
+    s_hat = weighted_sum / weight_sum                                    # (p,Kc) ~ ζ_p^2
 
-    return torch.sqrt(s_hat.clamp_min(0.0))                             # echoes ζ_p ∈ [0,1], (r,d)
+    return torch.sqrt(s_hat.clamp_min(0.0))                              # echoes (r,Kc)
