@@ -231,7 +231,9 @@ def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int]
     return payload[0]
 
 
-def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int, assigned_params: set = None) -> GPTLayerProperty:
+def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int,
+                                      assigned_params: set = None,
+                                      owner_map: Dict[Tuple[str, int], int] | None = None) -> GPTLayerProperty:
     """
     Compute accumulated gradient matrices for analysis.
     
@@ -252,8 +254,8 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
-    # Storage for per-minibatch gradients
-    per_minibatch_grads = {}
+    # Storage for per-minibatch gradients (only for keys owned by this rank)
+    per_minibatch_grads: Dict[Tuple[str, int], list[torch.Tensor]] = {}
     
     # Original behavior: eval mode outside; enable grads only for forward/backward block
     model.eval()  # Set to eval mode for consistent analysis
@@ -277,45 +279,59 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 loss.backward()
                 model.eval()  # Back to eval mode
             
-            # Collect gradients for this minibatch
-            minibatch_grads = {}
+            # For each parameter key in model order, gather this minibatch's gradient to the owner
             for name, param in model.named_parameters():
-                if param.grad is not None and param.ndim >= 2 and "embed" not in name:
-                    # Extract layer info
-                    layer_info = _extract_layer_info(name)
-                    if layer_info is None:
-                        continue
-                    
-                    param_type, layer_num = layer_info
-                    
-                    # Handle attention tensor splitting
-                    if param_type == "Attention" and param.grad.ndim >= 3:
-                        for i, component in enumerate(["Q", "K", "V", "O"]):
-                            key = (f"Attention {component}", layer_num)
-                            # Accumulate for all keys (no sharding during accumulation)
-                            grad_tensor = param.grad[i].clone().detach()
-                            if key not in minibatch_grads:
-                                minibatch_grads[key] = []
-                            minibatch_grads[key].append(grad_tensor)
+                if param.grad is None or param.ndim < 2 or "embed" in name:
+                    continue
+                layer_info = _extract_layer_info(name)
+                if layer_info is None:
+                    continue
+                param_type, layer_num = layer_info
+
+                def handle_key(key: Tuple[str, int], grad_tensor: torch.Tensor):
+                    nonlocal per_minibatch_grads
+                    if owner_map is None:
+                        # Default to assigned_params: owner is self if in assigned_params else skip
+                        owner = rank if (assigned_params is None or key in assigned_params) else -1
                     else:
-                        key = (param_type, layer_num)
-                        # Accumulate for all keys (no sharding during accumulation)
-                        grad_tensor = param.grad.clone().detach()
-                        if key not in minibatch_grads:
-                            minibatch_grads[key] = []
-                        minibatch_grads[key].append(grad_tensor)
-            
-            # Store this minibatch's gradients
-            for key, grad_list in minibatch_grads.items():
-                if key not in per_minibatch_grads:
-                    per_minibatch_grads[key] = []
-                per_minibatch_grads[key].extend(grad_list)
+                        owner = int(owner_map[key])
+
+                    g = grad_tensor.detach()
+                    if dist.is_initialized():
+                        if owner == rank:
+                            # Gather tensors from all ranks for this key
+                            gather_list = [torch.empty_like(g) for _ in range(world_size)]
+                            dist.gather(g, gather_list=gather_list, dst=rank)
+                            # Append all replicas for this minibatch
+                            if key not in per_minibatch_grads:
+                                per_minibatch_grads[key] = []
+                            # Move to CPU for storage to save GPU memory
+                            per_minibatch_grads[key].extend([t.cpu() for t in gather_list])
+                        else:
+                            # Send to owner
+                            dist.gather(g, dst=owner)
+                    else:
+                        # Single-process fallback: just append local tensor
+                        if key not in per_minibatch_grads:
+                            per_minibatch_grads[key] = []
+                        per_minibatch_grads[key].append(g.cpu())
+
+                # Attention split or single matrix
+                if param_type == "Attention" and param.grad.ndim >= 3:
+                    for i, component in enumerate(["Q", "K", "V", "O"]):
+                        key = (f"Attention {component}", layer_num)
+                        handle_key(key, param.grad[i])
+                else:
+                    key = (param_type, layer_num)
+                    handle_key(key, param.grad)
     
-    # Stack gradients into batched tensors
-    result = {}
+    # Stack gradients into batched tensors (owners only)
+    result: Dict[Tuple[str, int], torch.Tensor] = {}
     for key, grad_list in per_minibatch_grads.items():
-        if grad_list:
-            result[key] = torch.stack(grad_list, dim=0)  # Shape: [num_minibatches, ...]
+        if not grad_list:
+            continue
+        # Expect exactly (world_size * num_minibatches) entries per key
+        result[key] = torch.stack(grad_list, dim=0)
 
     # (debug logs removed)
 

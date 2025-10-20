@@ -168,19 +168,26 @@ def compute_analysis_for_step(
     args = Hyperparameters()
     
     if initial_props is None:
-        # Get all parameters (no sharding during accumulation; we want 8xA replicates)
+        # Get all parameters for sharding
         all_weights = get_weight_matrices(model, only_hidden=True)
         all_param_keys = list(all_weights.keys())
+        # Shard parameters across ranks (owners)
+        my_param_keys = shard_param_keys(all_param_keys, rank, world_size)
         if rank == 0:
-            print(f"    Rank {rank}: Accumulating gradients for all {len(all_param_keys)} parameters on every rank")
-        # Accumulate local microgradients for all keys
-        local_gradients = get_accumulated_gradient_matrices(
-            model, args, step, num_minibatches=num_minibatches, assigned_params=None
+            print(f"    Rank {rank}: Processing a shard of {len(my_param_keys)} parameters out of {len(all_param_keys)} total (owners)")
+
+        # Build owner map deterministically across ranks
+        owner_map = {}
+        for r in range(world_size):
+            keys_r = shard_param_keys(all_param_keys, r, world_size)
+            for k in keys_r:
+                owner_map[k] = r
+
+        # Accumulate and gather microgradients per-key to owners only; owners will have 8xA replicates
+        gradients = get_accumulated_gradient_matrices(
+            model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys, owner_map=owner_map
         )
-        # Gather and concatenate microgradients across ranks to form 8xA replicates
-        from empirical.research.analysis.model_utilities import gather_microgradients_across_ranks
-        gradients = gather_microgradients_across_ranks(local_gradients)
-        my_weights = all_weights  # All ranks share the same weights
+        my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
         initial_props = combine_layer_properties(
             lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
             my_weights, gradients
