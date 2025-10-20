@@ -254,7 +254,19 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
 
-    f, writer = open_layer_stats_writer(csv_path, fieldnames=list(layer_props.keys()) + ["param_type", "layer_num"])
+    # CSV columns must match the row keys we write below.
+    csv_fieldnames = [
+        "param_type",
+        "layer_num",
+        "weight_stable_rank",
+        "per_minibatch_gradient_singular_values",
+        "per_minibatch_gradient_stable_rank",
+        "spectral_echo_from_reverb",
+        "shape",
+        "gradient_noise_sigma2",
+        "empirical_phase_constant_tau2",
+    ]
+    f, writer = open_layer_stats_writer(csv_path, fieldnames=csv_fieldnames)
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
@@ -465,10 +477,16 @@ def main():
         local_payload = compute_analysis_for_step(step, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, model=model, run_id=run_id)
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
-        if rank == 0 and aggregated_payload is not None:
-            pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
-            noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
-            echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
+        if rank == 0:
+            layer_count = len(aggregated_payload) if isinstance(aggregated_payload, dict) else 0
+            log_from_rank(f"Rank 0 aggregated payload has {layer_count} layers", rank)
+            if layer_count == 0:
+                import logging as _logging
+                _logging.warning(f"Aggregated payload is empty on step {step}; skipping plotting for this step.")
+            else:
+                pred_actual_gptlp_ts[step] = build_pred_actual_gptlp(aggregated_payload)
+                noise_panel_ts[step] = build_noise_to_phase_gptlp(aggregated_payload)
+                echo_singular_direct_ts[step] = build_spectral_echo_vs_sv_panel(aggregated_payload)
             # Drop GPU-heavy payload immediately after extracting CPU arrays
             aggregated_payload = None
             local_payload = None

@@ -338,9 +338,28 @@ def _to_cpu_tree(obj):
 
 def _prune_to_fieldnames(d):
     """
-    Keep only top-level keys that are in FIELD_NAMES.
-    If your structure is {field_name -> GPTLayerProperty/Dict[...]}, this keeps it.
+    Prune payload to only the fields we need at rank 0.
+
+    Supports two shapes:
+    1) Legacy: {field_name -> GPTLayerProperty/Dict[...]}, keep top-level keys in FIELD_NAMES
+    2) Current: GPTLayerProperty = {(param_type, layer) -> {prop_name -> value}}
+       Keep only a small set of prop_names needed for visualizations/aggregation.
     """
     if not isinstance(d, dict):
         return d
+    # Detect GPTLayerProperty style: tuple keys mapping to per-layer prop dicts
+    if d and isinstance(next(iter(d.keys())), tuple):
+        allowed_props = {
+            'aligned_minibatch_singular_values',
+            'spectral_echo',
+            'empirical_phase_constant_tau2',
+            'gradient_noise_sigma2',
+            'checkpoint_weights',  # only used for shape on CPU later
+        }
+        pruned = {}
+        for layer_key, props in d.items():
+            if isinstance(props, dict):
+                pruned[layer_key] = {k: v for k, v in props.items() if k in allowed_props}
+        return pruned
+    # Legacy top-level {field_name: ...}
     return {k: v for k, v in d.items() if k in FIELD_NAMES}
