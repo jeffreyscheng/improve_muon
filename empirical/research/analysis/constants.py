@@ -4,7 +4,7 @@ FIELD_NAMES = [
     "weights_stable_rank",
     "gradients_stable_rank",
     "mean_gradient_svd",
-    "minibatch_singular_values",
+    "replicate_singular_values",
     "spectral_echo",
     "alignment_indices",
     "empirical_phase_constant_tau2",
@@ -14,5 +14,5 @@ FIELD_NAMES = [
     "m_big",
 ]
 
-NUM_MINIBATCHES = 8
+NUM_ACCUMULATION_STEPS = 8
 LOG_EVERY = 5

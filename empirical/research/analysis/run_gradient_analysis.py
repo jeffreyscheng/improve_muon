@@ -52,16 +52,16 @@ from empirical.research.analysis.core_visualization import (
 from empirical.research.analysis.logging_utilities import deserialize_model_checkpoint, log_from_rank
 from empirical.research.analysis.constants import (
     FIELD_NAMES,
-    NUM_MINIBATCHES,
+    NUM_ACCUMULATION_STEPS,
     LOG_EVERY
 )
 
-def gradients_stable_rank_from_svd(mb_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+def gradients_stable_rank_from_svd(rep_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
     """Compute per-microbatch stable rank from the already-computed batched SVD.
 
     Stable rank per matrix: sum(s^2) / (s_max^2). For batched SVD, returns [B].
     """
-    _, s, _ = mb_svd  # s: [B, K]
+    _, s, _ = rep_svd  # s: [R, K]
     with torch.no_grad():
         s2 = s * s
         num = torch.sum(s2, dim=1)
@@ -69,44 +69,44 @@ def gradients_stable_rank_from_svd(mb_svd: tuple[torch.Tensor, torch.Tensor, tor
         return (num / den)
 
 
-def singular_value_std(mb_sv: torch.Tensor, mean_sv: torch.Tensor) -> torch.Tensor:
-    return torch.std(mb_sv, dim=0)
+def singular_value_std(rep_sv: torch.Tensor, mean_sv: torch.Tensor) -> torch.Tensor:
+    return torch.std(rep_sv, dim=0)
 
 
 ANALYSIS_SPECS = [
     # Stable rank computations
     PropertySpec("weights_stable_rank", ["checkpoint_weights"], 
                 stable_rank_from_tensor),
-    PropertySpec("gradients_stable_rank", ["minibatch_gradient_svd"], gradients_stable_rank_from_svd),
+    PropertySpec("gradients_stable_rank", ["replicate_gradient_svd"], gradients_stable_rank_from_svd),
     
     # Core gradient analysis
-    PropertySpec("mean_gradient", ["per_minibatch_gradient"], 
+    PropertySpec("mean_gradient", ["per_replicate_gradient"], 
                 lambda grads: grads.mean(dim=0)),
-    PropertySpec("minibatch_gradient_svd", ["per_minibatch_gradient"], 
+    PropertySpec("replicate_gradient_svd", ["per_replicate_gradient"], 
                 safe_svd),
     PropertySpec("mean_gradient_svd", ["mean_gradient"], 
                 safe_svd),
     
     # Singular value analysis
-    PropertySpec("minibatch_singular_values", ["minibatch_gradient_svd"], 
+    PropertySpec("replicate_singular_values", ["replicate_gradient_svd"], 
                 lambda svd_tuple: svd_tuple[1]),
     PropertySpec("mean_singular_values", ["mean_gradient_svd"], 
                 lambda svd_tuple: svd_tuple[1]),
-    PropertySpec("singular_value_std", ["minibatch_singular_values", "mean_singular_values"], singular_value_std),
+    PropertySpec("singular_value_std", ["replicate_singular_values", "mean_singular_values"], singular_value_std),
     
     PropertySpec("spectral_echo_and_alignment",
-                ["minibatch_gradient_svd"],
+                ["replicate_gradient_svd"],
                 compute_reverb_echo_and_alignment),
     PropertySpec("spectral_echo", ["spectral_echo_and_alignment"], lambda t: t[0]),
-    PropertySpec("aligned_minibatch_singular_values", ["spectral_echo_and_alignment", "minibatch_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
+    PropertySpec("aligned_replicate_singular_values", ["spectral_echo_and_alignment", "replicate_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
     # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
 
     PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
                 lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
-    PropertySpec("worker_count", ["per_minibatch_gradient"], lambda g: int(g.shape[0])),
+    PropertySpec("worker_count", ["per_replicate_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
-    PropertySpec("gradient_noise_sigma2", ["per_minibatch_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
-    PropertySpec("empirical_phase_constant_tau2", ["aligned_minibatch_singular_values", "spectral_echo"], fit_empirical_phase_constant_tau2),
+    PropertySpec("gradient_noise_sigma2", ["per_replicate_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
+    PropertySpec("empirical_phase_constant_tau2", ["aligned_replicate_singular_values", "spectral_echo"], fit_empirical_phase_constant_tau2),
 ]
 
 
@@ -160,7 +160,7 @@ def shard_param_keys(all_keys: list[Tuple[str, int]], rank: int, world_size: int
 
 def compute_analysis_for_step(
     step: int,
-    num_minibatches: int,
+    num_accumulation_steps: int,
     rank: int,
     world_size: int,
     model: torch.nn.Module,
@@ -190,11 +190,11 @@ def compute_analysis_for_step(
 
         # Accumulate and gather microgradients per-key to owners only; owners will have 8xA replicates
         gradients = get_accumulated_gradient_matrices(
-            model, args, step, num_minibatches=num_minibatches, assigned_params=my_param_keys, owner_map=owner_map
+            model, args, step, num_accumulation_steps=num_accumulation_steps, assigned_params=my_param_keys, owner_map=owner_map
         )
         my_weights = {key: tensor for key, tensor in all_weights.items() if key in my_param_keys}
         initial_props = combine_layer_properties(
-            lambda w, g: {"checkpoint_weights": w, "per_minibatch_gradient": g},
+            lambda w, g: {"checkpoint_weights": w, "per_replicate_gradient": g},
             my_weights, gradients
         )
         # Removed noise_sigma injection from checkpoint; sigma^2 is computed per layer in-pipeline
@@ -259,8 +259,8 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "param_type",
         "layer_num",
         "weight_stable_rank",
-        "per_minibatch_gradient_singular_values",
-        "per_minibatch_gradient_stable_rank",
+        "per_replicate_gradient_singular_values",
+        "per_replicate_gradient_stable_rank",
         "spectral_echo_from_reverb",
         "shape",
         "gradient_noise_sigma2",
@@ -277,9 +277,9 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'param_type': param_type,
                 'layer_num': layer_num,
                 'weight_stable_rank': float(props['weights_stable_rank']),
-                'per_minibatch_gradient_singular_values': json.dumps(to_np16(props['minibatch_singular_values']).tolist()),
+                'per_replicate_gradient_singular_values': json.dumps(to_np16(props['replicate_singular_values']).tolist()),
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
-                'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
+                'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo_from_reverb': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
                 'gradient_noise_sigma2': grad_sigma2_val,
@@ -474,7 +474,7 @@ def main():
     noise_panel_ts: Dict[int, GPTLayerProperty] = {}
     for step, ckpt in checkpoints:
         load_weights_into_model(ckpt, model, device)
-        local_payload = compute_analysis_for_step(step, num_minibatches=NUM_MINIBATCHES, rank=rank, world_size=world_size, model=model, run_id=run_id)
+        local_payload = compute_analysis_for_step(step, num_accumulation_steps=NUM_ACCUMULATION_STEPS, rank=rank, world_size=world_size, model=model, run_id=run_id)
         # Gather layer properties from all ranks to rank 0 so we plot all layers
         aggregated_payload = gather_layer_properties_to_rank_zero(local_payload)
         if rank == 0:
@@ -521,7 +521,7 @@ def main():
 def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
+        sv = props['aligned_replicate_singular_values'].detach().cpu().numpy().flatten()
         actual = props['spectral_echo'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
         n = min(len(sv), len(actual))
@@ -534,7 +534,7 @@ def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerPro
 def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['aligned_minibatch_singular_values'].detach().cpu().numpy().flatten()
+        sv = props['aligned_replicate_singular_values'].detach().cpu().numpy().flatten()
         echo = props['spectral_echo'].detach().cpu().numpy().flatten()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
         n = min(len(sv), len(echo))

@@ -167,7 +167,7 @@ def gather_layer_properties_to_rank_zero(local_props):
     else:
         return None
 
-def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int], torch.Tensor]) -> Dict[Tuple[str, int], torch.Tensor]:
+def gather_microgradients_across_ranks(per_replicate_grads: Dict[Tuple[str, int], torch.Tensor]) -> Dict[Tuple[str, int], torch.Tensor]:
     """Gather per-layer microgradients across ranks and concatenate along batch dim.
 
     - On single process, returns input unchanged.
@@ -175,14 +175,14 @@ def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int]
       and broadcasts the merged dict back to all ranks.
     """
     if not dist.is_initialized():
-        return per_minibatch_grads
+        return per_replicate_grads
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Gather objects to rank 0
     obj_list = [None] * world_size if rank == 0 else None
-    dist.gather_object(per_minibatch_grads, obj_list, dst=0)
+    dist.gather_object(per_replicate_grads, obj_list, dst=0)
 
     if rank == 0:
         # Merge and concatenate along batch dim
@@ -204,36 +204,36 @@ def gather_microgradients_across_ranks(per_minibatch_grads: Dict[Tuple[str, int]
     return payload[0]
 
 
-def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: int,
+def get_accumulated_gradient_matrices(model, args, step: int, num_accumulation_steps: int,
                                       assigned_params: set = None,
                                       owner_map: Dict[Tuple[str, int], int] | None = None) -> GPTLayerProperty:
     """
     Compute accumulated gradient matrices for analysis.
     
     This function runs forward/backward passes to accumulate gradients
-    across multiple minibatches for gradient analysis.
+    across multiple independent replicates for gradient analysis (DDP workers × accumulation steps).
     
     Args:
         model: The model to compute gradients for
         args: Hyperparameters for data loading
         step: Current training step (for logging)
-        num_minibatches: Number of minibatches to accumulate
+        num_accumulation_steps: Number of accumulation steps to build replicates (A)
         
     Returns:
-        GPTLayerProperty containing per-minibatch gradient tensors
+        GPTLayerProperty containing per-replicate gradient tensors
     """
     # Get data generator
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
     
-    # Storage for per-minibatch gradients (only for keys owned by this rank)
-    per_minibatch_grads: Dict[Tuple[str, int], list[torch.Tensor]] = {}
+    # Storage for per-replicate gradients (only for keys owned by this rank)
+    per_replicate_grads: Dict[Tuple[str, int], list[torch.Tensor]] = {}
     
     # Original behavior: eval mode outside; enable grads only for forward/backward block
     model.eval()  # Set to eval mode for consistent analysis
     with torch.no_grad():
-        for minibatch_idx in range(num_minibatches):
+        for accum_idx in range(num_accumulation_steps):
             try:
                 inputs, targets = next(data_generator)
             except StopIteration:
@@ -253,9 +253,9 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 model.eval()  # Back to eval mode
             # Log after each backward accumulation (A accumulations)
             if rank == 0:
-                print(f"[rank 0] Backward complete for accumulation {minibatch_idx+1}/{num_minibatches}")
+                print(f"[rank 0] Backward complete for accumulation {accum_idx+1}/{num_accumulation_steps}")
             
-            # For each parameter key in model order, gather this minibatch's gradient to the owner
+            # For each parameter key in model order, gather this replicate's gradient to the owner
             for name, param in model.named_parameters():
                 if param.grad is None or param.ndim < 2 or "embed" in name:
                     continue
@@ -265,7 +265,7 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                 param_type, layer_num = layer_info
 
                 def handle_key(key: Tuple[str, int], grad_tensor: torch.Tensor):
-                    nonlocal per_minibatch_grads
+                    nonlocal per_replicate_grads
                     if owner_map is None:
                         # Default to assigned_params: owner is self if in assigned_params else skip
                         owner = rank if (assigned_params is None or key in assigned_params) else -1
@@ -278,19 +278,19 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                             # Gather tensors from all ranks for this key
                             gather_list = [torch.empty_like(g) for _ in range(world_size)]
                             dist.gather(g, gather_list=gather_list, dst=rank)
-                            # Append all replicas for this minibatch
-                            if key not in per_minibatch_grads:
-                                per_minibatch_grads[key] = []
+                            # Append all replicas for this accumulation
+                            if key not in per_replicate_grads:
+                                per_replicate_grads[key] = []
                             # Move to CPU for storage to save GPU memory
-                            per_minibatch_grads[key].extend([t.cpu() for t in gather_list])
+                            per_replicate_grads[key].extend([t.cpu() for t in gather_list])
                         else:
                             # Send to owner
                             dist.gather(g, dst=owner)
                     else:
                         # Single-process fallback: just append local tensor
-                        if key not in per_minibatch_grads:
-                            per_minibatch_grads[key] = []
-                        per_minibatch_grads[key].append(g.cpu())
+                        if key not in per_replicate_grads:
+                            per_replicate_grads[key] = []
+                        per_replicate_grads[key].append(g.cpu())
 
                 # Attention split or single matrix
                 if param_type == "Attention" and param.grad.ndim >= 3:
@@ -301,25 +301,25 @@ def get_accumulated_gradient_matrices(model, args, step: int, num_minibatches: i
                     key = (param_type, layer_num)
                     handle_key(key, param.grad)
 
-            # Ensure all ranks have finished sharding for this minibatch
+            # Ensure all ranks have finished sharding for this accumulation
             if dist.is_initialized():
                 dist.barrier()
             if rank == 0:
-                print(f"[rank 0] Sharding complete for accumulation {minibatch_idx+1}/{num_minibatches}")
+                print(f"[rank 0] Sharding complete for accumulation {accum_idx+1}/{num_accumulation_steps}")
     
     # Stack gradients into batched tensors (owners only)
     result: Dict[Tuple[str, int], torch.Tensor] = {}
-    for key, grad_list in per_minibatch_grads.items():
+    for key, grad_list in per_replicate_grads.items():
         if not grad_list:
             continue
-        # Expect exactly (world_size * num_minibatches) entries per key
+        # Expect exactly (world_size * num_accumulation_steps) entries per key
         result[key] = torch.stack(grad_list, dim=0)
 
     # Final synchronization and log once all sharing is complete across all minibatches
     if dist.is_initialized():
         dist.barrier()
     if rank == 0:
-        print(f"[rank 0] Completed distributed sharding of microgradients for all {num_minibatches} accumulations")
+        print(f"[rank 0] Completed distributed sharding of microgradients for all {num_accumulation_steps} accumulations")
 
     # (debug logs removed)
 
@@ -350,7 +350,7 @@ def _prune_to_fieldnames(d):
     # Detect GPTLayerProperty style: tuple keys mapping to per-layer prop dicts
     if d and isinstance(next(iter(d.keys())), tuple):
         allowed_props = {
-            'aligned_minibatch_singular_values',
+            'aligned_replicate_singular_values',
             'spectral_echo',
             'empirical_phase_constant_tau2',
             'gradient_noise_sigma2',

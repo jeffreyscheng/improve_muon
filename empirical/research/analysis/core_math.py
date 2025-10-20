@@ -78,20 +78,31 @@ def matrix_shape_beta(shape: Union[Tuple[int, int], torch.Size]) -> float:
 
 def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute SVD with proper memory management (handles both single and batched).
-    
-    Args:
-        tensor: Input tensor of shape [H, W] or [B, H, W]
-        
-    Returns:
-        U, s, Vh tensors with proper cloning for CUDA graph safety
+    Fast, robust SVD for [H,W] or [B,H,W].
+
+    - Promotes bf16 -> f32 for numerical stability.
+    - Ensures contiguity for linalg kernels.
+    - JIT offloads CPU tensors to CUDA for compute (if available), then
+      returns results on CPU to keep GPU memory footprint low across layers.
     """
     with torch.no_grad():
-        # Cast to float32 if needed for SVD compatibility
-        if tensor.dtype == torch.bfloat16:
-            tensor = tensor.float()
-        U, s, Vh = torch.linalg.svd(tensor, full_matrices=False)
-        return U.clone(), s.clone(), Vh.clone()
+        x = tensor
+        if x.dtype == torch.bfloat16:
+            x = x.float()
+        x = x.contiguous()
+
+        need_offload = (x.device.type != 'cuda') and torch.cuda.is_available()
+        if need_offload:
+            x = x.cuda(non_blocking=True)
+
+        U, s, Vh = torch.linalg.svd(x, full_matrices=False)
+
+        # Move back to CPU if we offloaded to keep memory steady over many layers
+        if need_offload:
+            U = U.cpu()
+            s = s.cpu()
+            Vh = Vh.cpu()
+        return U, s, Vh
 
 
 def compute_spectral_echo_by_permutation_alignment(
@@ -428,11 +439,11 @@ def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
         return compute_stable_rank(s)
 
 
-def compute_innovation_spectrum(per_minibatch_grad: torch.Tensor, mean_grad: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """Compute spectrum of the innovation matrix (per_batch - mean)."""
+def compute_innovation_spectrum(per_replicate_grad: torch.Tensor, mean_grad: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Compute spectrum of the innovation matrix (per_replicate - mean)."""
     
     # Compute innovation matrix directly
-    innovation = per_minibatch_grad - mean_grad.unsqueeze(0)
+    innovation = per_replicate_grad - mean_grad.unsqueeze(0)
     
     with torch.no_grad():
         # Compute singular values of each innovation matrix  
@@ -445,19 +456,19 @@ def compute_innovation_spectrum(per_minibatch_grad: torch.Tensor, mean_grad: tor
         return s.clone()
 
 def estimate_gradient_noise_sigma2(
-    per_minibatch_gradient: torch.Tensor,
+    per_replicate_gradient: torch.Tensor,
     mean_gradient: torch.Tensor
 ) -> float:
-    """Unbiased per-entry variance estimate from per-minibatch gradients.
+    """Unbiased per-entry variance estimate from per-replica gradients.
 
-    sigma^2_hat = (1/((B-1) m n)) * sum_i ||G_i - G_bar||_F^2
+    sigma^2_hat = (1/((R-1) m n)) * sum_i ||G_i - G_bar||_F^2
     """
     with torch.no_grad():
-        B, m, n = per_minibatch_gradient.shape
-        diffs = per_minibatch_gradient - mean_gradient.unsqueeze(0)
-        # Frobenius norm squared per minibatch, then sum over batches
-        frob2_per_mb = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
-        total_frob2 = torch.sum(frob2_per_mb)
+        B, m, n = per_replicate_gradient.shape
+        diffs = per_replicate_gradient - mean_gradient.unsqueeze(0)
+        # Frobenius norm squared per replicate, then sum over replicates
+        frob2_per_rep = torch.sum(diffs * diffs, dim=(-2, -1))  # [B]
+        total_frob2 = torch.sum(frob2_per_rep)
         return float(total_frob2 / max(1, (B - 1) * m * n))
  
 def _logspace_weights_np(s: np.ndarray, nbins: int = 32) -> np.ndarray:
@@ -481,7 +492,7 @@ def fit_empirical_phase_constant_tau2(
 ) -> float:
     """Fit tau^2 in echo(s)=1/(1+tau^2/s^2) with REQUIRED SciPy nonlinear LS.
 
-    - `minibatch_singular_values`: [B, K]
+    - `minibatch_singular_values` (replica singulars): [R, K]
     - `spectral_echo`: [Kc] (per-direction, aggregated across replicas)
     We pair the first Kc singulars per replica with the Kc echoes, tile echoes across B,
     and fit a single tau^2.
