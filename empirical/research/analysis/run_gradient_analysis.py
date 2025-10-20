@@ -254,7 +254,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         base_dir.mkdir(parents=True, exist_ok=True)
     csv_path = base_dir / f"step_{step:06d}_rank{rank}.csv"
 
-    f, writer = open_layer_stats_writer(csv_path, fieldnames=list(layer_props.keys()))
+    f, writer = open_layer_stats_writer(csv_path, fieldnames=list(layer_props.keys()) + ["param_type", "layer_num"])
     try:
         for (param_type, layer_num), props in layer_props.items():
             # Pre-compute scalar extras
@@ -266,7 +266,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'layer_num': layer_num,
                 'weight_stable_rank': float(props['weights_stable_rank']),
                 'per_minibatch_gradient_singular_values': json.dumps(to_np16(props['minibatch_singular_values']).tolist()),
-                'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
+                # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_minibatch_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
                 'spectral_echo_from_reverb': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
