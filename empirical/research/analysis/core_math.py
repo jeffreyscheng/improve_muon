@@ -586,8 +586,8 @@ def aspect_ratio_beta(matrix: torch.Tensor) -> float:
 def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
     right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
-    noise_quantile: float = 0.10, # lower-tail quantile to set per-direction noise floor
-    tau_mult: float = 4.0,        # multiplier on the noise floor for denominator guarding
+    noise_quantile: float = 0.05, # lower-tail quantile to set per-direction noise floor
+    tau_mult: float = 2.0,        # gentler guard multiplier to reduce high-s flattening
     weight_power: float = 2.0,    # use |Z_ab|**weight_power as weights
 ) -> torch.Tensor:                # returns echoes with shape (r, Kc)
     """
@@ -627,7 +627,9 @@ def solve_for_spectral_echo_using_reverb(
 
     denom = spectral_reverb_Z.unsqueeze(0)                               # (1,a,b,Kc)
     sgn = torch.where(denom >= 0, 1.0, -1.0)                             # (1,a,b,Kc)
-    denom_safe = denom + sgn * tau_dir.view(1, 1, 1, Kc)                 # (1,a,b,Kc)
+    guard = sgn * tau_dir.view(1, 1, 1, Kc)                              # (1,a,b,Kc)
+    need_guard = (denom.abs() < tau_dir.view(1, 1, 1, Kc))
+    denom_safe = torch.where(need_guard, denom + guard, denom)           # (1,a,b,Kc)
 
     # Valid triple mask: a!=b, a!=p, b!=p
     a_ne_b = idx.view(1, -1, 1) != idx.view(1, 1, -1)                   # (1,a,b)

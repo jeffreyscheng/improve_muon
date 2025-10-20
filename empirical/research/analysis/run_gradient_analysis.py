@@ -320,8 +320,8 @@ def create_pred_vs_actual_spectral_echo_subplot(ax, prop: GPTLayerProperty, para
             pred, actual = a[0], a[1]
         else:
             pred, actual = a[:, 0], a[:, 1]
-        pred = np.clip(pred.flatten(), 1e-8, 1.0)
-        actual = np.clip(actual.flatten(), 1e-8, 1.0)
+        pred = np.clip(pred, 1e-8, 1.0)
+        actual = np.clip(actual, 1e-8, 1.0)
         color = viridis(layer / denom)
         ax.scatter(pred, actual, s=6, alpha=0.2, c=[color])
     # y=x reference
@@ -343,8 +343,8 @@ def create_spectral_echo_vs_sv_semilog_subplot(ax, panel: GPTLayerProperty, para
         sv = d.get('sv'); echo = d.get('spectral_echo')
         if sv is None or echo is None:
             continue
-        sv = np.asarray(sv, dtype=float).flatten()
-        echo = np.clip(np.asarray(echo, dtype=float).flatten(), 0.0, 1.0)
+        sv = np.asarray(sv, dtype=float)
+        echo = np.clip(np.asarray(echo, dtype=float), 0.0, 1.0)
         if sv.size == 0 or echo.size == 0:
             continue
         m = min(sv.size, echo.size)
@@ -387,8 +387,8 @@ def create_spectral_echo_vs_sv_semilog_normalized_subplot(ax, panel: GPTLayerPro
         sv = d.get('sv'); echo = d.get('spectral_echo')
         if sv is None or echo is None:
             continue
-        sv = np.asarray(sv, dtype=float).flatten()
-        echo = np.clip(np.asarray(echo, dtype=float).flatten(), 0.0, 1.0)
+        sv = np.asarray(sv, dtype=float)
+        echo = np.clip(np.asarray(echo, dtype=float), 0.0, 1.0)
         if sv.size == 0 or echo.size == 0:
             continue
         m = min(sv.size, echo.size)
@@ -519,32 +519,49 @@ def main():
 
 
 def build_pred_actual_gptlp(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    IMPORTANT: Pair per-direction singulars (aggregated across replicas) with per-direction echoes.
+    Avoid flattening [B,Kc] singulars; take median across B to get [Kc].
+    """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['aligned_replicate_singular_values'].detach().cpu().numpy().flatten()
-        actual = props['spectral_echo'].detach().cpu().numpy().flatten()
+        s_rep = props['aligned_replicate_singular_values']  # torch [B,Kc]
+        s_dir = torch.median(s_rep, dim=0).values           # torch [Kc]
+        sv = s_dir.detach().cpu().numpy()
+        actual = props['spectral_echo'].detach().cpu().numpy()
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
-        n = min(len(sv), len(actual))
-        if n:
-            pred = predict_spectral_echo_curve_np(sv[:n], tau2)
-            out[key] = np.vstack([np.clip(pred, 1e-8, 1.0), np.clip(actual[:n], 1e-8, 1.0)])
+        if sv.size and actual.size:
+            n = min(sv.size, actual.size)
+            sv = sv[:n]; actual = actual[:n]
+            pred = predict_spectral_echo_curve_np(sv, tau2)
+            out[key] = np.vstack([
+                np.clip(pred, 1e-8, 1.0),
+                np.clip(actual, 1e-8, 1.0)
+            ])
     return out
 
 
 def build_spectral_echo_vs_sv_panel(aggregated_payload: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Store per-direction singulars (median across replicas) and matched per-direction echoes.
+    """
     out: GPTLayerProperty = {}
     for key, props in aggregated_payload.items():
-        sv = props['aligned_replicate_singular_values'].detach().cpu().numpy().flatten()
-        echo = props['spectral_echo'].detach().cpu().numpy().flatten()
+        s_rep = props['aligned_replicate_singular_values']                 # [B,Kc]
+        s_dir = torch.median(s_rep, dim=0).values.detach().cpu().numpy()  # [Kc]
+        echo = props['spectral_echo'].detach().cpu().numpy()               # [Kc]
         tau2 = float(props.get('empirical_phase_constant_tau2', np.nan))
-        n = min(len(sv), len(echo))
+        n = min(s_dir.size, echo.size)
         if n:
             out[key] = {
-                'sv': sv[:n],
+                'sv': s_dir[:n],
                 'spectral_echo': echo[:n],
                 'tau2': tau2,
                 'shape': tuple(int(x) for x in props['checkpoint_weights'].shape[-2:]),
             }
+            # optional shape guards
+            assert out[key]['sv'].ndim == 1 and out[key]['spectral_echo'].ndim == 1
+            assert out[key]['sv'].shape == out[key]['spectral_echo'].shape
     return out
 
 
