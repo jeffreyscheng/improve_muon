@@ -7,7 +7,7 @@ We previously showed two results:
 
 Therefore, the problem of unbiased steepest descent boils down to estimating $\kappa$.  This can be done with least squares if we had a dataset of empirical gradient SVDs and true gradient SVDs; however, we do not have access to the true gradient.  We can only vary the minibatch size to get empirical gradients with varying amount of minibatch noise.
 
-We will now show how to achieve good spectral echo estimation without ever having access to true gradients.  We will exploit **independence across repeated, equally-sized minibatches** to expose the noise structure and recover the echo via cross-replica *spectral reverb* measurements.
+We will now show how to achieve good spectral echo estimation without ever having access to true gradients.  We will exploit **independence across repeated, equally-sized replicas** (DDP workers × accumulation steps, i.e., disjoint data at the same batch size) to expose the noise structure and recover the echo via cross-replica *spectral reverb* measurements.
 
 ---
 
@@ -32,7 +32,7 @@ $$
 z_i^{(a,b)} := \langle \widehat u_i^{(a)},\widehat u_i^{(b)}\rangle\;\langle \widehat v_i^{(a)},\widehat v_i^{(b)}\rangle\in[-1,1].
 $$
 
-To first order under independent isotropic minibatch noise,
+To first order under independent isotropic minibatch noise (observed across independent replicas),
 $$
 \mathbb{E}\,z_i^{(a,b)} \approx \zeta_i^{(a)}\,\zeta_i^{(b)}\qquad(a\neq b).
 $$

@@ -299,21 +299,13 @@ def compute_reverb_echo_and_alignment(
         U_b = U_b[:, :, :Kc]        # [B,H,Kc]
         V_b = V_b[:, :, :Kc]        # [B,W,Kc]
 
-        # reference replica
-        ref = 0
-        U_ref = U_b[ref]            # [H,Kc]
-        V_ref = V_b[ref]            # [W,Kc]
-
-        # ---- build M_b per replica against ref and form a consensus M_avg ----
-        # M_b = |U_b^T U_ref| * |V_b^T V_ref|  -> shape [Kc,Kc]
-        # exclude b==ref from the average to avoid trivial identity dominance
+        # ---- build symmetric consensus M using all replica pairs (a<b) ----
         Ms = []
-        for b in range(B):
-            if b == ref:
-                continue
-            MU = (U_b[b].transpose(0, 1) @ U_ref).abs()  # [Kc,Kc]
-            MV = (V_b[b].transpose(0, 1) @ V_ref).abs()  # [Kc,Kc]
-            Ms.append((MU * MV).cpu().numpy())
+        for a in range(B):
+            for b in range(a + 1, B):
+                MU = (U_b[a].transpose(0, 1) @ U_b[b]).abs()  # [Kc,Kc]
+                MV = (V_b[a].transpose(0, 1) @ V_b[b]).abs()  # [Kc,Kc]
+                Ms.append((MU * MV).cpu().numpy())
         if not Ms:
             # degenerate B=1: identity alignment
             assign_idx = torch.arange(Kc, device=U_b.device, dtype=torch.long).view(1, Kc).repeat(1, 1)
@@ -345,7 +337,7 @@ def compute_reverb_echo_and_alignment(
             r_ind, c_ind = _greedy_perm(M_block)
         lap_ms = (time.time() - t_lap0) * 1000.0
 
-        # We want j*(i): for each column i (ref index), which row j (b index) to take.
+        # We want a global permutation perm over Kc directions from symmetric consensus.
         # SciPy returns pairs (row, col) that minimize cost; ensure full 0..Kc-1 coverage.
         # Build inverse map: inv[col] = row
         inv = np.empty(Kc, dtype=np.int64)
@@ -356,11 +348,14 @@ def compute_reverb_echo_and_alignment(
         assign_idx = perm.view(1, -1).repeat(B, 1)  # [B,Kc]
 
         # ---- sign correction per replica (keep your logic) ----
-        # After permuting columns to reference order, correct signs so overlaps are positive.
+        # Build consensus bases from replica 0 after permutation
+        U_cons = U_b[0][:, perm]  # [H,Kc]
+        V_cons = V_b[0][:, perm]  # [W,Kc]
+        # After permuting columns to consensus order, correct signs so overlaps are positive.
         for b in range(B):
             idx = assign_idx[b]  # [Kc]
-            u_overlap = torch.sum(U_b[b].gather(1, idx.view(1, -1).expand(H, -1)) * U_ref, dim=0)
-            v_overlap = torch.sum(V_b[b].gather(1, idx.view(1, -1).expand(W, -1)) * V_ref, dim=0)
+            u_overlap = torch.sum(U_b[b].gather(1, idx.view(1, -1).expand(H, -1)) * U_cons, dim=0)
+            v_overlap = torch.sum(V_b[b].gather(1, idx.view(1, -1).expand(W, -1)) * V_cons, dim=0)
             sgn = torch.sign(u_overlap * v_overlap)
             sgn[sgn == 0] = 1.0
             U_b[b].index_copy_(1, idx, U_b[b][:, idx] * sgn)
@@ -381,7 +376,7 @@ def compute_reverb_echo_and_alignment(
         rank = dist.get_rank() if dist.is_initialized() else 0
     except Exception:
         rank = 0
-    log_from_rank(f"reverb-align(consensus): B={B}, Kc={Kc}, lap_ms={lap_ms:.1f}, "
+    log_from_rank(f"reverb-align(sym-consensus): B={B}, Kc={Kc}, lap_ms={lap_ms:.1f}, "
                   f"solve_ms={(t_end - t_reverb)*1000.0:.1f}", rank)
 
     return spectral_echo, assign_idx
@@ -586,8 +581,8 @@ def aspect_ratio_beta(matrix: torch.Tensor) -> float:
 def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
     right_bases_V: torch.Tensor,  # (r, W, Kc)  aligned right singular bases per replica
-    noise_quantile: float = 0.05, # lower-tail quantile to set per-direction noise floor
-    tau_mult: float = 2.0,        # gentler guard multiplier to reduce high-s flattening
+    noise_quantile: float = 0.02, # lower-tail quantile to set per-direction noise floor
+    tau_mult: float = 1.5,        # gentler guard multiplier to reduce high-s flattening
     weight_power: float = 2.0,    # use |Z_ab|**weight_power as weights
 ) -> torch.Tensor:                # returns echoes with shape (r, Kc)
     """
