@@ -479,42 +479,69 @@ def fit_empirical_phase_constant_tau2(
     eps: float = 1e-12,
     nbins: int = 32,
 ) -> float:
-    """Weighted nonlinear LS for tau^2 in spectral_echo(s)=1/(1+tau^2/s^2), with log-space reweighting.
+    """Fit tau^2 in echo(s)=1/(1+tau^2/s^2) with REQUIRED SciPy nonlinear LS.
 
-    Uses SciPy's curve_fit when available. Falls back to median moment if not.
+    - `minibatch_singular_values`: [B, K]
+    - `spectral_echo`: [Kc] (per-direction, aggregated across replicas)
+    We pair the first Kc singulars per replica with the Kc echoes, tile echoes across B,
+    and fit a single tau^2.
+
+    Raises:
+        RuntimeError on any missing SciPy or fitting failure.
+        ValueError on shape mismatch.
     """
+    if _scipy_curve_fit is None:
+        raise RuntimeError("SciPy is required for fit_empirical_phase_constant_tau2 but is not available.")
+
     with torch.no_grad():
-        s = minibatch_singular_values.reshape(-1).detach().cpu().numpy().astype(np.float64)
-        echo = spectral_echo.reshape(-1).detach().cpu().numpy().astype(np.float64)
+        if minibatch_singular_values.ndim != 2:
+            raise ValueError(f"minibatch_singular_values must be [B,K], got {tuple(minibatch_singular_values.shape)}")
+        if spectral_echo.ndim != 1:
+            raise ValueError(f"spectral_echo must be [Kc], got {tuple(spectral_echo.shape)}")
+
+        B, K = minibatch_singular_values.shape
+        Kc = int(spectral_echo.numel())
+        if Kc > K:
+            raise ValueError(f"spectral_echo length Kc={Kc} exceeds K={K}.")
+
+        # Pair only the first Kc directions with the Kc echoes
+        s_use = minibatch_singular_values[:, :Kc]             # [B, Kc]
+        echo_use = spectral_echo.view(1, Kc).expand(B, Kc)    # [B, Kc]
+
+        s = s_use.reshape(-1).detach().cpu().numpy().astype(np.float64)       # [B*Kc]
+        echo = echo_use.reshape(-1).detach().cpu().numpy().astype(np.float64) # [B*Kc]
         if s.size == 0:
-            return 0.0
+            raise RuntimeError("No samples to fit tau^2 (B*Kc == 0).")
+
+        # Guard against zeros to keep the model well-defined
         s = np.clip(s, eps, None)
         echo = np.clip(echo, eps, 1.0 - eps)
 
-        if _scipy_curve_fit is not None:
-            w = _logspace_weights_np(s, nbins=nbins)
-            sigma = 1.0 / np.sqrt(w)
-            tau2_init = float(np.mean((s * s) * (1.0 / echo - 1.0)))
-            tau2_init = max(tau2_init, eps)
-            try:
-                (tau2_hat,), _ = _scipy_curve_fit(
-                    _spectral_echo_model_np,
-                    xdata=s,
-                    ydata=echo,
-                    p0=(tau2_init,),
-                    bounds=(eps, 1e40),
-                    sigma=sigma,
-                    absolute_sigma=False,
-                    maxfev=20000,
-                )
-                return float(max(tau2_hat, 0.0))
-            except Exception:
-                pass
+        # Reweight in log-space to avoid over-emphasizing dense low-s regions
+        w = _logspace_weights_np(s, nbins=nbins)             # length = B*Kc
+        sigma = 1.0 / np.sqrt(np.maximum(w, eps))
 
-        # Fallback: robust per-point estimator (median)
-        y = (s * s) * (1.0 / echo - 1.0)
-        tau2 = float(np.median(y))
-        return float(max(tau2, 0.0))
+        # Moment-based positive initialization
+        tau2_init = float(np.mean((s * s) * (1.0 / echo - 1.0)))
+        tau2_init = max(tau2_init, eps)
+
+        (tau2_hat,), _ = _scipy_curve_fit(
+            _spectral_echo_model_np,
+            xdata=s,
+            ydata=echo,
+            p0=(tau2_init,),
+            bounds=(eps, 1e40),
+            sigma=sigma,
+            absolute_sigma=False,
+            maxfev=20000,
+        )
+
+        tau2_hat = float(tau2_hat)
+        if not np.isfinite(tau2_hat) or tau2_hat < 0.0:
+            raise RuntimeError(f"Invalid tau^2 estimate: {tau2_hat}")
+
+        return tau2_hat
+
 
 def fit_empirical_noise_to_phase_slope_kappa(
     gradient_noise_sigma2: GPTLayerProperty,
