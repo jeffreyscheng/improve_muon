@@ -374,8 +374,10 @@ def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tens
     U_stacked = aligned_U.permute(2, 0, 1)  # (D,R,N)
     V_stacked = aligned_V.permute(2, 0, 1)  # (D,R,M)
 
-    gram_U = torch.einsum('dri,drj->d r r', U_stacked, U_stacked)        # (D,R,R)
-    gram_V = torch.einsum('dri,drj->d r r', V_stacked, V_stacked)        # (D,R,R)
+    # Build replica Gram matrices per direction: G[d] = U[d] @ U[d]^T and V[d] @ V[d]^T
+    # Einsum: sum over feature dimension (i), keep both replica indices (r,s)
+    gram_U = torch.einsum('dri,dsi->drs', U_stacked, U_stacked)        # (D,R,R)
+    gram_V = torch.einsum('dri,dsi->drs', V_stacked, V_stacked)        # (D,R,R)
     reverb_tensor_Z = gram_U * gram_V                                    # (D,R,R)
     reverb_tensor_Z = reverb_tensor_Z * (1 - torch.eye(num_replicates_R, device=reverb_tensor_Z.device, dtype=reverb_tensor_Z.dtype).unsqueeze(0))
 
