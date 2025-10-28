@@ -6,12 +6,8 @@ the analysis pipeline. It provides both numpy and torch implementations where
 needed, with consistent interfaces.
 """
 
-import math
-import logging
+ 
 from typing import Union, Tuple, Dict, List
-import time
-import torch.distributed as dist
-from empirical.research.analysis.logging_utilities import log_from_rank
 import numpy as np
 try:
     from scipy.optimize import curve_fit as _scipy_curve_fit
@@ -105,318 +101,14 @@ def safe_svd(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
         return U, s, Vh
 
 
-def compute_spectral_echo_by_permutation_alignment(
-    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """
-    Compute spectral echo via Procrustes alignment.
-
-    Args:
-        mb_svd: (U_b, S_b, Vh_b) from batched SVD of per-minibatch gradients
-                U_b: [B, H, K], S_b: [B, K], Vh_b: [B, K, W]
-        mean_svd: (U_m, S_m, Vh_m) from SVD of mean gradient
-                U_m: [H, K], S_m: [K], Vh_m: [K, W]
-
-    Returns:
-        spectral_echo tensor [B, K] where each entry corresponds to the product of
-        cosine agreements between matched singular directions (via a
-        permutation alignment) of (U_b,V_b) to (U_m,V_m).
-    """
-    U_b, _, Vh_b = mb_svd
-    U_m, _, Vh_m = mean_svd
-
-    # Truncate to common rank K
-    K = min(U_b.shape[-1], U_m.shape[-1], Vh_b.shape[-2], Vh_m.shape[-2])
-    U_b = U_b[..., :K]            # [B, H, K]
-    U_m = U_m[..., :K]            # [H, K]
-    Vh_b = Vh_b[..., :K, :]       # [B, K, W]
-    Vh_m = Vh_m[..., :K, :]       # [K, W]
-
-    B = U_b.shape[0]
-
-    # Pairwise cosine agreements between singular directions
-    # Left: cosU[b, j, i] = |<u_b_j, u_m_i>|
-    cosU = torch.einsum('bhk,hq->bkq', U_b, U_m).abs()  # [B, K_b, K_m]
-    # Right: cosV[b, j, i] = |<v_b_j, v_m_i>|
-    V_b = Vh_b.transpose(-2, -1)  # [B, W, K_b]
-    V_m = Vh_m.transpose(-2, -1)  # [W, K_m]
-    cosV = torch.einsum('bwk,wq->bkq', V_b, V_m).abs()  # [B, K_b, K_m]
-    # Combined similarity matrix per batch: M[b, j, i]
-    M = cosU * cosV  # [B, K, K]
-
-    B, Kb, Km = M.shape
-    Kc = min(Kb, Km)
-    echo_out = U_b.new_zeros((B, Kc))
-
-    # Greedy permutation alignment per batch: maximize sum of matches
-    for b in range(B):
-        Mb = M[b]
-        # Track available rows (batch directions j)
-        used = torch.zeros(Kb, dtype=torch.bool, device=Mb.device)
-        # Order columns (mean directions i) by their best available match descending
-        best_per_col, _ = Mb.max(dim=0)  # [K]
-        order = torch.argsort(best_per_col, descending=True)
-        assigned = torch.full((Km,), -1, dtype=torch.long, device=Mb.device)
-        for i in order.tolist():
-            scores = Mb[:, i].clone()
-            scores[used] = -1.0  # mask used rows
-            j = int(torch.argmax(scores).item())
-            if scores[j] < 0:
-                continue
-            assigned[i] = j
-            used[j] = True
-        # Build spectral echo vector for first Kc columns of mean
-        for i in range(Kc):
-            j = int(assigned[i].item())
-            if j >= 0:
-                echo_out[b, i] = Mb[j, i]
-            else:
-                echo_out[b, i] = 0.0
-    return echo_out
+########################
+# Removed legacy echo/alignment helpers
+########################
 
 
-def compute_spectral_echo_and_alignment(
-    mb_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    mean_svd: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute spectral echo and the alignment indices j*(i) per batch.
-
-    Returns:
-        echo_out: [B, Kc]
-        assign_idx: [B, Kc] long, where assign_idx[b, i] = j index in minibatch aligning to mean i, or -1.
-    """
-    U_b, _, Vh_b = mb_svd
-    U_m, _, Vh_m = mean_svd
-
-    K = min(U_b.shape[-1], U_m.shape[-1], Vh_b.shape[-2], Vh_m.shape[-2])
-    U_b = U_b[..., :K]
-    U_m = U_m[..., :K]
-    Vh_b = Vh_b[..., :K, :]
-    Vh_m = Vh_m[..., :K, :]
-
-    B = U_b.shape[0]
-    cosU = torch.einsum('bhk,hq->bkq', U_b, U_m).abs()
-    V_b = Vh_b.transpose(-2, -1)
-    V_m = Vh_m.transpose(-2, -1)
-    cosV = torch.einsum('bwk,wq->bkq', V_b, V_m).abs()
-    M = cosU * cosV  # [B, K, K]
-
-    B, Kb, Km = M.shape
-    Kc = min(Kb, Km)
-    echo_out = U_b.new_zeros((B, Kc))
-    assign_idx = torch.full((B, Kc), -1, dtype=torch.long, device=U_b.device)
-
-    for b in range(B):
-        Mb = M[b]
-        used = torch.zeros(Kb, dtype=torch.bool, device=Mb.device)
-        best_per_col, _ = Mb.max(dim=0)
-        order = torch.argsort(best_per_col, descending=True)
-        assigned = torch.full((Km,), -1, dtype=torch.long, device=Mb.device)
-        for i in order.tolist():
-            scores = Mb[:, i].clone()
-            scores[used] = -1.0
-            j = int(torch.argmax(scores).item())
-            if scores[j] < 0:
-                continue
-            assigned[i] = j
-            used[j] = True
-        for i in range(Kc):
-            j = int(assigned[i].item())
-            if j >= 0:
-                echo_out[b, i] = Mb[j, i]
-                assign_idx[b, i] = j
-            else:
-                echo_out[b, i] = 0.0
-                assign_idx[b, i] = -1
-    return echo_out, assign_idx
-
-def compute_reverb_echo_and_alignment(
-    mb_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fast & robust alignment:
-      - Build per-replica similarity M_b = |U_b^T U_ref| * |V_b^T V_ref|
-      - Average M_b across replicas (excluding the reference) -> M_avg
-      - Solve ONE LAP on the top-K block of M_avg to get a global permutation
-      - Reuse that permutation for all replicas; then do per-replica sign correction
-      - Return median-of-replica echoes and the assignment indices
-
-    Env knobs:
-      REVERB_MAX_KC: int cap on Kc (default 256)
-      REVERB_JITTER: float jitter magnitude added to M before LAP (default 1e-12)
-    """
-    import time
-    import numpy as np
-
-    # Optional SciPy LAP (preferred)
-    try:
-        from scipy.optimize import linear_sum_assignment as _scipy_lsa
-    except Exception:
-        _scipy_lsa = None
-
-    def _greedy_perm(M: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """One-to-one greedy: columns by descending best score; pick best available row."""
-        K = M.shape[0]
-        # tiny deterministic jitter to break ties
-        rng = np.random.RandomState(0)
-        J = M + (1e-12 * rng.standard_normal(M.shape))
-        col_order = np.argsort(-J.max(axis=0))
-        used = np.zeros(K, dtype=bool)
-        row_for_col = -np.ones(K, dtype=int)
-        for i in col_order:
-            j = int(np.argmax(J[:, i]))
-            if not used[j]:
-                row_for_col[i] = j
-                used[j] = True
-        # fill any leftovers arbitrarily
-        free = np.where(~used)[0].tolist()
-        for i in range(K):
-            if row_for_col[i] < 0:
-                row_for_col[i] = free.pop()
-        row_ind = row_for_col
-        col_ind = np.arange(K, dtype=int)
-        return row_ind, col_ind
-
-    # ---- unpack & basic guards ----
-    U_b, _, Vh_b = mb_svd  # U_b: [B,H,K], s: [B,K], Vh_b: [B,K,W]
-    with torch.no_grad():
-        if U_b.dtype == torch.bfloat16:
-            U_b = U_b.float()
-        if Vh_b.dtype == torch.bfloat16:
-            Vh_b = Vh_b.float()
-        V_b = Vh_b.transpose(-2, -1)  # [B,W,K]
-
-        B, H, K = U_b.shape
-        _, W, Kv = V_b.shape
-        Kc = int(min(K, Kv))
-
-        # cap Kc aggressively; tiny singular directions are noisy & expensive
-        import os
-        K_cap = int(os.getenv("REVERB_MAX_KC", "256"))
-        Kc = min(Kc, max(1, K_cap))
-
-        U_b = U_b[:, :, :Kc]        # [B,H,Kc]
-        V_b = V_b[:, :, :Kc]        # [B,W,Kc]
-
-        # ---- build symmetric consensus M using all replica pairs (a<b) ----
-        Ms = []
-        for a in range(B):
-            for b in range(a + 1, B):
-                MU = (U_b[a].transpose(0, 1) @ U_b[b]).abs()  # [Kc,Kc]
-                MV = (V_b[a].transpose(0, 1) @ V_b[b]).abs()  # [Kc,Kc]
-                Ms.append((MU * MV).cpu().numpy())
-        if not Ms:
-            # degenerate B=1: identity alignment
-            assign_idx = torch.arange(Kc, device=U_b.device, dtype=torch.long).view(1, Kc).repeat(1, 1)
-            # aligned copies are trivial; echoes are all ones
-            spectral_echo = torch.ones(Kc, device=U_b.device, dtype=U_b.dtype)
-            return spectral_echo, assign_idx
-
-        M_avg = np.mean(np.stack(Ms, axis=0), axis=0)  # [Kc,Kc]
-
-        # trim to the leading block (already Kc-capped), add jitter, and solve one LAP
-        jitter = float(os.getenv("REVERB_JITTER", "1e-12"))
-        M_block = M_avg.copy()
-        if jitter > 0.0:
-            # deterministic jitter
-            rng = np.random.RandomState(0)
-            M_block = M_block + jitter * rng.standard_normal(M_block.shape)
-
-        # maximize similarity -> min cost = max(M)-M
-        Mmax = float(M_block.max()) if M_block.size else 0.0
-        cost = (Mmax - M_block)
-
-        t_lap0 = time.time()
-        try:
-            if _scipy_lsa is not None:
-                r_ind, c_ind = _scipy_lsa(cost)   # returns row_ind, col_ind
-            else:
-                r_ind, c_ind = _greedy_perm(M_block)
-        except Exception:
-            r_ind, c_ind = _greedy_perm(M_block)
-        lap_ms = (time.time() - t_lap0) * 1000.0
-
-        # We want a global permutation perm over Kc directions from symmetric consensus.
-        # SciPy returns pairs (row, col) that minimize cost; ensure full 0..Kc-1 coverage.
-        # Build inverse map: inv[col] = row
-        inv = np.empty(Kc, dtype=np.int64)
-        inv[c_ind] = r_ind
-        perm = torch.from_numpy(inv).to(U_b.device, dtype=torch.long)  # [Kc]
-
-        # alignment indices for every replica are identical permutation (consensus)
-        assign_idx = perm.view(1, -1).repeat(B, 1)  # [B,Kc]
-
-        # ---- sign correction per replica (keep your logic) ----
-        # Build consensus bases from replica 0 after permutation
-        U_cons = U_b[0][:, perm]  # [H,Kc]
-        V_cons = V_b[0][:, perm]  # [W,Kc]
-        # After permuting columns to consensus order, correct signs so overlaps are positive.
-        for b in range(B):
-            idx = assign_idx[b]  # [Kc]
-            u_overlap = torch.sum(U_b[b].gather(1, idx.view(1, -1).expand(H, -1)) * U_cons, dim=0)
-            v_overlap = torch.sum(V_b[b].gather(1, idx.view(1, -1).expand(W, -1)) * V_cons, dim=0)
-            sgn = torch.sign(u_overlap * v_overlap)
-            sgn[sgn == 0] = 1.0
-            U_b[b].index_copy_(1, idx, U_b[b][:, idx] * sgn)
-            V_b[b].index_copy_(1, idx, V_b[b][:, idx] * sgn)
-
-        # ---- gather aligned bases and compute echoes via triple–OLS (your solver) ----
-        aligned_U = torch.stack([U_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B,H,Kc]
-        aligned_V = torch.stack([V_b[b].index_select(1, assign_idx[b]) for b in range(B)], dim=0)  # [B,W,Kc]
-
-    # compute echoes; median across replicas for robustness
-    t_reverb = time.time()
-    echoes = solve_for_spectral_echo_using_reverb(aligned_U, aligned_V)  # [B,Kc]
-    spectral_echo = echoes.median(dim=0).values.clamp(0.0, 1.0)          # [Kc]
-    t_end = time.time()
-
-    # logging (matches your style)
-    try:
-        rank = dist.get_rank() if dist.is_initialized() else 0
-    except Exception:
-        rank = 0
-    log_from_rank(f"reverb-align(sym-consensus): B={B}, Kc={Kc}, lap_ms={lap_ms:.1f}, "
-                  f"solve_ms={(t_end - t_reverb)*1000.0:.1f}", rank)
-
-    return spectral_echo, assign_idx
-
-def gather_aligned_singulars(minibatch_singular_values: torch.Tensor,
-                             alignment_indices: torch.Tensor) -> torch.Tensor:
-    """Gather per-batch singular values aligned to mean indices via alignment indices.
-
-    Args:
-        minibatch_singular_values: [B, K] singulars per batch
-        alignment_indices: [B, Kc] long indices j*(i)
-    Returns:
-        aligned_sv: [B, Kc] with s[b, j*(i)] (zeros where assignment is -1)
-    """
-    with torch.no_grad():
-        if (alignment_indices < 0).any():
-            raise RuntimeError("Negative alignment index encountered; alignment must fully assign columns.")
-        B, K = minibatch_singular_values.shape
-        _, Kc = alignment_indices.shape
-        gather = torch.gather(minibatch_singular_values, dim=1, index=alignment_indices)
-        return gather
-
-
-def trapz_cdf_from_pdf(pdf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Compute CDF from PDF using trapezoid rule.
-    
-    Args:
-        pdf: PDF values [..., G]
-        x: Grid points [G]
-        
-    Returns:
-        CDF values [..., G] starting at 0
-    """
-    dx = torch.diff(x)                               # [G-1]
-    mid = 0.5 * (pdf[..., 1:] + pdf[..., :-1])      # [..., G-1]
-    F = torch.cumsum(mid * dx, dim=-1)              # [..., G-1]
-    F = torch.nn.functional.pad(F, (1, 0))          # [..., G]
-    # Numerical guard to keep within [0,1]
-    return torch.clamp(F, 0.0, 1.0)
+########################
+# Core convenience functions
+########################
 
 
 # Convenience functions for common operations
@@ -434,21 +126,9 @@ def stable_rank_from_tensor(tensor: Union[np.ndarray, torch.Tensor]) -> float:
         return compute_stable_rank(s)
 
 
-def compute_innovation_spectrum(per_replicate_grad: torch.Tensor, mean_grad: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """Compute spectrum of the innovation matrix (per_replicate - mean)."""
-    
-    # Compute innovation matrix directly
-    innovation = per_replicate_grad - mean_grad.unsqueeze(0)
-    
-    with torch.no_grad():
-        # Compute singular values of each innovation matrix  
-        _, s, _ = safe_svd(innovation)
-        
-        # Get matrix shape parameters
-        B, H, W = innovation.shape
-        beta = matrix_shape_beta((H, W))
-        
-        return s.clone()
+########################
+# Noise estimation and tau^2 fitting
+########################
 
 def estimate_gradient_noise_sigma2(
     per_replicate_gradient: torch.Tensor,
@@ -568,15 +248,9 @@ def fit_empirical_noise_to_phase_slope_kappa(
         sol = torch.linalg.lstsq(sigma2s, tau2s).solution  # [1,1]
         return float(sol.squeeze())
 
-def precompute_theoretical_noise_to_phase_slope_kappa(
-    aspect_ratio_beta: float
-) -> float:
-    """
-    """
-    pass
-
-def aspect_ratio_beta(matrix: torch.Tensor) -> float:
-    return float(matrix_shape_beta(matrix.shape))
+########################
+# Spectral reverb solver (tuning-free debiased variant)
+########################
 
 def solve_for_spectral_echo_using_reverb(
     left_bases_U: torch.Tensor,   # (r, H, Kc)  aligned left singular bases per replica
@@ -687,3 +361,106 @@ def solve_for_spectral_echo_using_reverb(
         echoes = torch.sqrt(rtilde.clamp_min(0.0))         # (p,Kc) == (r,Kc)
 
         return echoes
+
+def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        empirical_gradients: (R, N, M) tensor of empirical gradients for R replicates.
+    Returns:
+        echoes_zeta: (R, D) tensor of spectral echoes, where D = min(N, M).
+    """
+    aligned_U, _, aligned_V = get_aligned_svds(empirical_gradients)  # U:(R,N,D), V:(R,M,D)
+    num_replicates_R, _, dim_D = aligned_U.shape
+    U_stacked = aligned_U.permute(2, 0, 1)  # (D,R,N)
+    V_stacked = aligned_V.permute(2, 0, 1)  # (D,R,M)
+
+    gram_U = torch.einsum('dri,drj->d r r', U_stacked, U_stacked)        # (D,R,R)
+    gram_V = torch.einsum('dri,drj->d r r', V_stacked, V_stacked)        # (D,R,R)
+    reverb_tensor_Z = gram_U * gram_V                                    # (D,R,R)
+    reverb_tensor_Z = reverb_tensor_Z * (1 - torch.eye(num_replicates_R, device=reverb_tensor_Z.device, dtype=reverb_tensor_Z.dtype).unsqueeze(0))
+
+    zz = reverb_tensor_Z @ reverb_tensor_Z                               # (D,R,R)
+    numerator = (zz * reverb_tensor_Z.transpose(-1, -2)).sum(dim=-1)     # (D,R)
+    denominator = (reverb_tensor_Z * reverb_tensor_Z).sum(dim=(-2, -1)).clamp_min(torch.finfo(reverb_tensor_Z.dtype).eps)  # (D,)
+    echoes_sq = numerator / denominator.unsqueeze(-1)                     # (D,R)
+    echoes_zeta = torch.sqrt(echoes_sq.clamp_min(0.0)).transpose(0, 1)    # (R,D)
+    return echoes_zeta
+
+def get_aligned_svds(empirical_gradients: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Align SVDs across replicates using a reference-anchored assignment (Hungarian if available, else greedy)
+    and per-replica sign correction. Uses safe_svd for CUDA offload when available.
+
+    Args:
+        empirical_gradients: (R, N, M)
+    Returns:
+        aligned_U: (R, N, D), aligned_S_vals: (R, D), aligned_V: (R, M, D) with D = min(N, M)
+    """
+    # Promote dtype for numerical stability
+    if empirical_gradients.dtype == torch.bfloat16:
+        empirical_gradients = empirical_gradients.float()
+
+    U_all, S_vals, Vh_all = safe_svd(empirical_gradients)   # U:(R,N,D), S:(R,D), Vh:(R,D,M)
+    V_all = Vh_all.transpose(-2, -1)                        # (R,M,D)
+    R, N, D = U_all.shape
+
+    U_ref, V_ref = U_all[0], V_all[0]
+
+    def _hungarian_or_greedy(similarity: torch.Tensor) -> torch.Tensor:
+        # Try Hungarian; fallback to greedy
+        try:
+            from scipy.optimize import linear_sum_assignment as _lsa  # type: ignore
+        except Exception:
+            _lsa = None
+        K = similarity.shape[0]
+        if _lsa is not None:
+            M = similarity.detach().cpu().numpy()
+            Mmax = float(M.max()) if M.size else 0.0
+            row_ind, col_ind = _lsa(Mmax - M)
+            inv = np.empty(K, dtype=np.int64)
+            inv[col_ind] = row_ind
+            return torch.from_numpy(inv).to(similarity.device, dtype=torch.long)
+        # Greedy fallback with tiny deterministic jitter
+        eps = 1e-12 if similarity.dtype in (torch.float64, torch.float32) else 1e-6
+        jitter = eps * torch.linspace(0, 1, steps=similarity.numel(), device=similarity.device, dtype=similarity.dtype).reshape_as(similarity)
+        scores = similarity + jitter
+        col_priority = torch.argsort(scores.max(dim=0).values, descending=True)
+        used_rows = torch.zeros(K, dtype=torch.bool, device=scores.device)
+        row_for_col = torch.full((K,), -1, dtype=torch.long, device=scores.device)
+        for j in col_priority:
+            r = torch.argmax(scores[:, j])
+            if not used_rows[r]:
+                row_for_col[j] = r
+                used_rows[r] = True
+        free_rows = torch.nonzero(~used_rows, as_tuple=False).flatten()
+        for j in range(K):
+            if row_for_col[j] < 0:
+                row_for_col[j] = free_rows[0]
+                free_rows = free_rows[1:]
+        return row_for_col
+
+    aligned_U = torch.empty_like(U_all)
+    aligned_V = torch.empty_like(V_all)
+    aligned_S_vals = torch.empty_like(S_vals)
+    aligned_U[0], aligned_V[0], aligned_S_vals[0] = U_ref, V_ref, S_vals[0]
+
+    for i in range(1, R):
+        sim_U = (U_all[i].transpose(0, 1) @ U_ref).abs()  # (D,D)
+        sim_V = (V_all[i].transpose(0, 1) @ V_ref).abs()  # (D,D)
+        similarity = sim_U * sim_V
+        perm_idx = _hungarian_or_greedy(similarity)
+
+        U_perm = U_all[i][:, perm_idx]
+        V_perm = V_all[i][:, perm_idx]
+        S_perm = S_vals[i][perm_idx]
+
+        u_overlap = (U_perm * U_ref).sum(dim=0)
+        v_overlap = (V_perm * V_ref).sum(dim=0)
+        sgn = torch.sign(u_overlap * v_overlap)
+        sgn[sgn == 0] = 1.0
+
+        aligned_U[i] = U_perm * sgn.unsqueeze(0)
+        aligned_V[i] = V_perm * sgn.unsqueeze(0)
+        aligned_S_vals[i] = S_perm
+
+    return aligned_U, aligned_S_vals, aligned_V

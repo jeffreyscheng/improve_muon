@@ -37,10 +37,11 @@ from empirical.research.analysis.model_utilities import (
 from empirical.research.analysis.property_pipeline import PropertySpec, PropertyPipeline
 from empirical.research.analysis.core_math import (
     matrix_shape_beta,
-    stable_rank_from_tensor, safe_svd,
-    compute_reverb_echo_and_alignment, gather_aligned_singulars,
+    stable_rank_from_tensor,
     estimate_gradient_noise_sigma2,
     fit_empirical_phase_constant_tau2,
+    get_spectral_echoes_from_empirical_gradients,
+    get_aligned_svds,
 )
 from empirical.research.analysis.core_visualization import (
     make_gif_from_layer_property_time_series,
@@ -56,53 +57,41 @@ from empirical.research.analysis.constants import (
     LOG_EVERY
 )
 
-def gradients_stable_rank_from_svd(rep_svd: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
-    """Compute per-microbatch stable rank from the already-computed batched SVD.
-
-    Stable rank per matrix: sum(s^2) / (s_max^2). For batched SVD, returns [B].
-    """
-    _, s, _ = rep_svd  # s: [R, K]
+def gradients_stable_rank_from_singulars(rep_singulars: torch.Tensor) -> torch.Tensor:
+    """Compute per-replica stable rank from singular values [R, K]."""
     with torch.no_grad():
-        s2 = s * s
+        s2 = rep_singulars * rep_singulars
         num = torch.sum(s2, dim=1)
         den = torch.max(s2, dim=1).values.clamp_min(1e-20)
-        return (num / den)
-
-
-def singular_value_std(rep_sv: torch.Tensor, mean_sv: torch.Tensor) -> torch.Tensor:
-    return torch.std(rep_sv, dim=0)
+        return num / den
 
 
 ANALYSIS_SPECS = [
-    # Stable rank computations
-    PropertySpec("weights_stable_rank", ["checkpoint_weights"], 
-                stable_rank_from_tensor),
-    PropertySpec("gradients_stable_rank", ["replicate_gradient_svd"], gradients_stable_rank_from_svd),
-    
-    # Core gradient analysis
-    PropertySpec("mean_gradient", ["per_replicate_gradient"], 
-                lambda grads: grads.mean(dim=0)),
-    PropertySpec("replicate_gradient_svd", ["per_replicate_gradient"], 
-                safe_svd),
-    PropertySpec("mean_gradient_svd", ["mean_gradient"], 
-                safe_svd),
-    
-    # Singular value analysis
-    PropertySpec("replicate_singular_values", ["replicate_gradient_svd"], 
-                lambda svd_tuple: svd_tuple[1]),
-    PropertySpec("mean_singular_values", ["mean_gradient_svd"], 
-                lambda svd_tuple: svd_tuple[1]),
-    PropertySpec("singular_value_std", ["replicate_singular_values", "mean_singular_values"], singular_value_std),
-    
-    PropertySpec("spectral_echo_and_alignment",
-                ["replicate_gradient_svd"],
-                compute_reverb_echo_and_alignment),
-    PropertySpec("spectral_echo", ["spectral_echo_and_alignment"], lambda t: t[0]),
-    PropertySpec("aligned_replicate_singular_values", ["spectral_echo_and_alignment", "replicate_singular_values"], lambda sa, sv: gather_aligned_singulars(sv, sa[1])),
-    # Use mean singular values per mode (constant across minibatches) as the x-axis signal s
+    # Stable rank computations (weights)
+    PropertySpec("weights_stable_rank", ["checkpoint_weights"], stable_rank_from_tensor),
 
-    PropertySpec("aspect_ratio_beta", ["checkpoint_weights"],
-                lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
+    # Core gradient analysis
+    PropertySpec("mean_gradient", ["per_replicate_gradient"], lambda grads: grads.mean(dim=0)),
+
+    # Alignment and SVDs using new logic
+    PropertySpec("aligned_svds", ["per_replicate_gradient"], get_aligned_svds),  # (U,S,V)
+    PropertySpec(
+        "aligned_replicate_singular_values",
+        ["aligned_svds"],
+        lambda aligned: aligned[1],  # already shape [R, D]
+    ),
+    # Also expose as replicate singulars for downstream consumers/CSV
+    PropertySpec("replicate_singular_values", ["aligned_replicate_singular_values"], lambda x: x),
+
+    # Per-replica spectral echoes via new estimator, then aggregate across replicas
+    PropertySpec("spectral_echo_replicates", ["per_replicate_gradient"], get_spectral_echoes_from_empirical_gradients),  # [R,D]
+    PropertySpec("spectral_echo", ["spectral_echo_replicates"], lambda z: torch.median(z, dim=0).values.clamp(0.0, 1.0)),  # [D]
+
+    # Per-replica gradient stable ranks from singulars
+    PropertySpec("gradients_stable_rank", ["aligned_replicate_singular_values"], gradients_stable_rank_from_singulars),
+
+    # Misc annotations and noise/phase relationship
+    PropertySpec("aspect_ratio_beta", ["checkpoint_weights"], lambda w: float(matrix_shape_beta(w.shape[-2:] if hasattr(w, 'shape') else w))),
     PropertySpec("worker_count", ["per_replicate_gradient"], lambda g: int(g.shape[0])),
     PropertySpec("m_big", ["checkpoint_weights"], lambda w: int(max(w.shape[-2], w.shape[-1]))),
     PropertySpec("gradient_noise_sigma2", ["per_replicate_gradient", "mean_gradient"], estimate_gradient_noise_sigma2),
@@ -261,7 +250,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
         "weight_stable_rank",
         "per_replicate_gradient_singular_values",
         "per_replicate_gradient_stable_rank",
-        "spectral_echo_from_reverb",
+        "spectral_echo",
         "shape",
         "gradient_noise_sigma2",
         "empirical_phase_constant_tau2",
@@ -280,7 +269,7 @@ def stream_write_analysis_results(layer_props: GPTLayerProperty, step: int, rank
                 'per_replicate_gradient_singular_values': json.dumps(to_np16(props['replicate_singular_values']).tolist()),
                 # 'gradient_singular_value_standard_deviations': json.dumps(to_np16(props['singular_value_std']).tolist()),
                 'per_replicate_gradient_stable_rank': json.dumps(to_np16(props['gradients_stable_rank']).tolist()),
-                'spectral_echo_from_reverb': json.dumps(to_np16(props['spectral_echo']).tolist()),
+                'spectral_echo': json.dumps(to_np16(props['spectral_echo']).tolist()),
                 'shape': json.dumps(list(props['checkpoint_weights'].shape[-2:])),
                 'gradient_noise_sigma2': grad_sigma2_val,
                 'empirical_phase_constant_tau2': tau2_val,

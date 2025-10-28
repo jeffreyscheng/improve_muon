@@ -53,165 +53,108 @@ $$
 \qquad \zeta_i^{(a)}\ge 0.
 $$
 
-**Identifiability.** If at least three entries of $\zeta_i=(\zeta_i^{(1)},\dots,\zeta_i^{(k)})$ are strictly positive and $k\ge 3$, then $\zeta_i$ is uniquely determined by $Z_i$:
-- For any distinct $a,b,p$ with $\zeta_i^{(a)},\zeta_i^{(b)},\zeta_i^{(p)}>0$,
-  $$
-  \boxed{\ \zeta_i^{(p)2}=\frac{Z_{i,ap}\,Z_{i,bp}}{Z_{i,ab}}\ }\qquad\text{and}\qquad
-  \zeta_i^{(q)}=\frac{Z_{i,qp}}{\zeta_i^{(p)}}\ \ \forall q.
-  $$
-- If the support size is $\le 2$ (or $k=2$), the solution is not identifiable (only products are known).
-
-This algebra will power the estimator below.
-
----
-
-## 3. Triple–OLS: a one-shot estimator (no logs, no scale step)
-
-For a fixed direction $i$ and coordinate $p$, form **triple estimates**
+If at least three entries of $\zeta_i=(\zeta_i^{(1)},\dots,\zeta_i^{(k)})$ are strictly positive and $k\ge 3$, then $\zeta_i$ is uniquely determined by $Z_i$. For any distinct $a,b,p$ with $\zeta_i^{(a)},\zeta_i^{(b)},\zeta_i^{(p)}>0$,
 $$
-r^{(i)}_{ab\to p}:=\frac{Z_{i,ap}\,Z_{i,bp}}{Z_{i,ab}},\qquad a\neq b,\ a,b\neq p.
-$$
-In the noiseless case $r^{(i)}_{ab\to p}=\zeta_i^{(p)2}$. With noise, model
-$$
-r^{(i)}_{ab\to p} = s_i^{(p)} + \eta^{(i)}_{abp},\qquad s_i^{(p)}:=\zeta_i^{(p)2}.
-$$
-
-**Estimator (per $i$).** For each $p$,
-$$
-\boxed{\ 
-\widehat s_i^{(p)}=\arg\min_{s\ge 0}\sum_{a<b:\,a,b\neq p} w^{(i)}_{abp}\,\big(s-r^{(i)}_{ab\to p}\big)^2
-\ =\
-\frac{\sum_{a<b} w^{(i)}_{abp}\,r^{(i)}_{ab\to p}}{\sum_{a<b} w^{(i)}_{abp}},
+\zeta_i^{(p)2}=\frac{Z_{i,ap}\,Z_{i,bp}}{Z_{i,ab}},
 \qquad
-\widehat\zeta_i^{(p)}=\sqrt{\max\{\widehat s_i^{(p)},0\}}.
-}
+\zeta_i^{(q)}=\frac{Z_{i,qp}}{\zeta_i^{(p)}}\ \ \forall q.
 $$
 
-Simple and one-shot: the triples fix **absolute scale** already; no auxiliary scaling step is needed. Weights $w^{(i)}_{abp}$ can down-weight unstable triples (e.g., very small $|Z_{i,ab}|$).
+This algebra underlies the estimator below.
 
 ---
 
-## 4. Bias–variance scaling of Triple–OLS with the number of replicas $k$
+## 3. Triple–OLS: least squares objective, analytic solution, and division-free form
 
-We characterize how the estimator behaves as we increase the number of independent replicas $k$ (same batch size, disjoint data).
+For fixed direction $i$ and target replica $p$, define the per-triple ratio
+$$
+r_{ab\to p} \;:=\; \frac{Z_i(a,p)\,Z_i(b,p)}{Z_i(a,b)}\qquad\text{for } a\neq b,\ a,b\neq p.
+$$
 
-### 4.1 Local expansion for a single triple
+Estimate $s_i^{(p)}:=\zeta_i^{(p)2}$ by minimizing the weighted constant-only least squares objective
+$$
+J_p(s)\;=\;\sum_{\substack{a<b\\a,b\neq p}} w_{ab}\,\big(s-r_{ab\to p}\big)^2.
+$$
 
-Write, for brevity (fixing $i$),
+The analytic minimizer is the weighted mean
 $$
-Z_{ap}=\mu_{ap}+\epsilon_{ap},\quad Z_{bp}=\mu_{bp}+\epsilon_{bp},\quad Z_{ab}=\mu_{ab}+\epsilon_{ab},
+\widehat s_i^{(p)}\;=\;\frac{\sum_{a<b,\ a,b\neq p} w_{ab}\, r_{ab\to p}}{\sum_{a<b,\ a,b\neq p} w_{ab}}.
 $$
-with $\mu_{xy}=\zeta_x\zeta_y$ and centered errors $\mathbb{E}\epsilon_{xy}=0$, variances $\operatorname{Var}(\epsilon_{xy})=\sigma_{xy}^2$, and (to first order) independence across distinct replica pairs. Consider the map
+
+Choosing $w_{ab}=Z_i(a,b)^2$ down-weights noise-dominated pairs and yields a division-free expression in the data
 $$
-f(x,y,z)=\frac{xy}{z},\qquad r_{ab\to p}=f(Z_{ap},Z_{bp},Z_{ab}).
+\widehat s_i^{(p)}\;=\;\frac{\sum_{a,b=1}^k Z_i(a,p)\,Z_i(p,b)\,Z_i(a,b)}{\sum_{a,b=1}^k Z_i(a,b)^2},
+\qquad
+\widehat \zeta_i^{(p)}\;=\;\sqrt{\max\{\widehat s_i^{(p)},0\}}.
 $$
-A second-order delta method around $(\mu_{ap},\mu_{bp},\mu_{ab})$ gives
+
+The vectorized matrix form for all $p$ at once is
 $$
-\mathbb{E}[r_{ab\to p}]
+\widehat{\boldsymbol{s}}_i
 \;=\;
-\underbrace{\frac{\mu_{ap}\mu_{bp}}{\mu_{ab}}}_{=\,\zeta_p^2}
-\;+\;
-\underbrace{\frac{\mu_{bp}}{\mu_{ab}}\,\frac{\operatorname{Cov}(\epsilon_{ap},\epsilon_{ap})}{\mu_{ap}}
-+
-\frac{\mu_{ap}}{\mu_{ab}}\,\frac{\operatorname{Cov}(\epsilon_{bp},\epsilon_{bp})}{\mu_{bp}}
-+
-\frac{\mu_{ap}\mu_{bp}}{\mu_{ab}^3}\,\operatorname{Var}(\epsilon_{ab})
-}_{\text{bias term } B_{abp}}
-\;+\; O\big(\|\epsilon\|^3\big).
+\frac{\big((Z_i Z_i)\odot Z_i^\top\big)\,\mathbf{1}_k}{\|Z_i\|_F^2}\in\mathbb{R}^k,
+\qquad
+\widehat{\boldsymbol{\zeta}}_i\;=\;\sqrt{\max\{\widehat{\boldsymbol{s}}_i,0\}}\in\mathbb{R}^k,
 $$
-Thus each triple is **unbiased to first order**, with a second-order bias
-$$
-B_{abp}
-\ =\
-\frac{\sigma_{ap}^2}{\mu_{ab}}
-+
-\frac{\sigma_{bp}^2}{\mu_{ab}}
-+
-\frac{\mu_{ap}\mu_{bp}}{\mu_{ab}^3}\,\sigma_{ab}^2
-\ =\
-O\!\left(\frac{\sigma^2}{\zeta_a\zeta_b}\right)
-+ O\!\left(\frac{\sigma^2\,\zeta_a\zeta_b}{(\zeta_a\zeta_b)^3}\right)
-\ =\
-O\!\left(\frac{\sigma^2}{\zeta_a\zeta_b}\right),
-$$
-where $\sigma^2$ is a common noise scale (e.g., $\propto 1/\text{batch}$) and we suppress mild aspect-ratio constants. Intuitively: triples involving very small $\mu_{ab}=\zeta_a\zeta_b$ are bias-prone; this motivates trimming or down-weighting such pairs.
+where $\mathbf{1}_k$ is the all-ones vector and $\odot$ is the Hadamard product. The diagonal of $Z_i$ is zero, so no masking is needed.
 
-Similarly, the variance (first-order) is
-$$
-\operatorname{Var}(r_{ab\to p})
-\;=\;
-\left(\frac{\mu_{bp}}{\mu_{ab}}\right)^2 \sigma_{ap}^2
-+
-\left(\frac{\mu_{ap}}{\mu_{ab}}\right)^2 \sigma_{bp}^2
-+
-\left(\frac{\mu_{ap}\mu_{bp}}{\mu_{ab}^2}\right)^2 \sigma_{ab}^2
-\ +\ O\big(\|\epsilon\|^3\big),
-$$
-again dominated by terms with small $\mu_{ab}$.
+---
 
-### 4.2 Averaging across triples is a U-statistic (variance $\sim 1/k$)
+## 4. Implementation with explicit shapes and matrix multiplications
 
-For fixed $p$, the Triple–OLS estimator is the **weighted average** of $r_{ab\to p}$ over all $\binom{k-1}{2}$ pairs $a<b$ drawn from the $k-1$ replicas excluding $p$. This is a symmetric **U-statistic of order 2** in the index set $\{1,\dots,k\}\setminus\{p\}$ with kernel $h(a,b)=r_{ab\to p}$.
-
-By the Hoeffding decomposition for U-statistics,
+Assume $n<m$ and full rank $r=n$. For each replica $b\in\{1,\dots,k\}$, the SVD bases are
 $$
-\operatorname{Var}\big(\widehat s^{(p)}\big)
-\;=\;
-\frac{4}{k-1}\,\operatorname{Var}\!\big(\phi_p(A)\big)
-\;+\;
-O\!\left(\frac{1}{(k-1)(k-2)}\right),
-$$
-where $A$ denotes a single replica index (excluding $p$) and $\phi_p$ is the first-order projection of the kernel (its explicit form is not needed for the scaling). **Consequently,**
-$$
-\boxed{\ \operatorname{Var}\big(\widehat s^{(p)}\big) = \Theta\!\left(\frac{1}{k}\right)\quad\text{as } k\to\infty, }
-$$
-provided the per-triple variances are finite (ensured by trimming small $\mu_{ab}$). Taking square roots and propagating through $\widehat\zeta^{(p)}=\sqrt{\widehat s^{(p)}}$ via the delta method yields
-$$
-\operatorname{sd}\big(\widehat\zeta^{(p)}\big)
-\;=\;
-\frac{1}{2\,\zeta^{(p)}}\,\operatorname{sd}\big(\widehat s^{(p)}\big)
-\;=\;
-\Theta\!\left(\frac{1}{\zeta^{(p)}\sqrt{k}}\right).
+U_b\in\mathbb{R}^{n\times n},\qquad V_b\in\mathbb{R}^{m\times n}.
 $$
 
-**Interpretation.** With more independent replicas (same batch), Triple–OLS variance decays like $1/k$ for $s$ and like $1/\sqrt{k}$ for $\zeta$. Directions with very small $\zeta^{(p)}$ are inherently harder to estimate (the knee region); robust weighting mitigates the constant but not the $1/\sqrt{k}$ rate.
-
-### 4.3 Bias behavior under averaging (bias does **not** shrink with $k$)
-
-Averaging triples reduces variance but **does not** reduce the second-order bias $B_{abp}$, whose expectation is set by the noise level and geometry:
+Alignment is performed once per replica. Select a reference replica $r$. For each $b$, build
 $$
-\mathbb{E}\big[\widehat s^{(p)}\big]
+M_b \;=\; \big|U_b^\top U_r\big|\odot\big|V_b^\top V_r\big|\in\mathbb{R}^{n\times n},
+$$
+which uses two matrix multiplications $(n\times n)^\top(n\times n)$ and $(m\times n)^\top(m\times n)$, then solve a linear assignment to obtain a permutation matrix $\Pi_b\in\{0,1\}^{n\times n}$. Apply the permutation by updating $U_b\leftarrow U_b\Pi_b$ and $V_b\leftarrow V_b\Pi_b$. Fix signs using $t_{b,i}=\mathrm{sign}(\langle U_b[:,i],U_r[:,i]\rangle\langle V_b[:,i],V_r[:,i]\rangle)$ and update $U_b[:,i]\leftarrow t_{b,i}U_b[:,i]$, $V_b[:,i]\leftarrow t_{b,i}V_b[:,i]$.
+
+For a fixed direction $i\in\{1,\dots,n\}$, stack the $i$-th columns across replicas as
+$$
+U^{(i)}=\big[U_1[:,i]\ \cdots\ U_k[:,i]\big]\in\mathbb{R}^{n\times k},\qquad
+V^{(i)}=\big[V_1[:,i]\ \cdots\ V_k[:,i]\big]\in\mathbb{R}^{m\times k}.
+$$
+
+Form the replica-Gram matrices with two matrix multiplications
+$$
+G_U^{(i)}=(U^{(i)})^\top U^{(i)}\in\mathbb{R}^{k\times k},\qquad
+G_V^{(i)}=(V^{(i)})^\top V^{(i)}\in\mathbb{R}^{k\times k}.
+$$
+
+Define the reverb matrix
+$$
+Z_i \;=\; G_U^{(i)}\odot G_V^{(i)}\in\mathbb{R}^{k\times k},
+\qquad \mathrm{diag}(Z_i)\leftarrow 0.
+$$
+
+Compute $Y_i=Z_i Z_i\in\mathbb{R}^{k\times k}$ with one more matrix multiplication. The numerator vector is the column-sum of $(Y_i\odot Z_i^\top)$ and the denominator is $\|Z_i\|_F^2$. The echo vector is obtained by elementwise division and taking the nonnegative square root:
+$$
+\widehat{\boldsymbol{s}}_i
 =
-\zeta^{(p)2}
-\;+\;
-\underbrace{\mathbb{E}\big[B_{abp}\big]}_{\text{size } O(\sigma^2)}.
+\frac{\big((Z_i Z_i)\odot Z_i^\top\big)\,\mathbf{1}_k}{\|Z_i\|_F^2},\qquad
+\widehat{\boldsymbol{\zeta}}_i=\sqrt{\max\{\widehat{\boldsymbol{s}}_i,0\}}.
 $$
-Hence
-$$
-\boxed{\ \text{Bias}\big(\widehat s^{(p)}\big)=\Theta(\sigma^2),\qquad
-\text{Bias}\big(\widehat\zeta^{(p)}\big)=\Theta\!\left(\frac{\sigma^2}{\zeta^{(p)}}\right), }
-$$
-up to mild aspect-ratio and weighting constants. This is the **right order**: it matches the intrinsic second-order perturbation bias of the reverb measurements themselves. In practice, down-weighting triples with tiny $|Z_{ab}|$ controls the constant without changing the asymptotic order.
 
-### 4.4 Summary of $k$-scaling
-
-Let $k$ be the number of independent replicas (same batch size), and assume standard trimming/weights so that per-triple moments are finite. Then, for each coordinate $p$ of a fixed singular direction $i$,
-$$
-\begin{aligned}
-\operatorname{Var}\big(\widehat s^{(p)}\big) &= \Theta\!\left(\frac{1}{k}\right),\\[2pt]
-\operatorname{sd}\big(\widehat\zeta^{(p)}\big) &= \Theta\!\left(\frac{1}{\zeta^{(p)}\sqrt{k}}\right),\\[2pt]
-\text{Bias}\big(\widehat s^{(p)}\big) &= \Theta(\sigma^2),\\[2pt]
-\text{Bias}\big(\widehat\zeta^{(p)}\big) &= \Theta\!\left(\frac{\sigma^2}{\zeta^{(p)}}\right).
-\end{aligned}
-$$
-Variance improves with more replicas; bias is governed by the noise level, not by $k$. This is precisely the behavior one expects from a second-order-correct algebraic estimator aggregated as a U-statistic.
+This sequence uses, per direction $i$, two $k\times k$ Gram matrix multiplications and one $k\times k$ product $Z_i Z_i$, plus elementwise operations and reductions. With $k$ in the tens or low hundreds, the Gram multiplications dominate the cost; the echo solve is negligible by comparison.
 
 ---
 
-## 5. Practical weighting (short guidance)
+## 5. Statistical scaling with the number of replicas
 
-- **Trim small denominators.** Discard triples with $|Z_{ab}|<\tau$ (e.g., $\tau$ a small quantile), which dominate both bias and variance.
-- **Huber/Tukey weights.** Apply robust weights $w_{abp}$ to suppress outlying triples.
-- **Subsample triples.** You do not need all $\binom{k-1}{2}$ triples; a linear number $O(k)$ per $p$ retains the same $1/k$ variance rate with better wall-clock.
-
-With these guards, Triple–OLS remains a one-shot, log-free, scale-free path to accurate echo estimation across replicas—exact in the noiseless limit, and statistically well-behaved as $k$ grows under realistic minibatch noise.
+Write $Z_i(a,b)=\zeta_i^{(a)}\zeta_i^{(b)}+\epsilon_{ab}$ with $\mathbb{E}\epsilon_{ab}=0$ and independent replicas. The weighted Triple–OLS estimator with $w_{ab}=Z_i(a,b)^2$ is first-order unbiased,
+$$
+\mathbb{E}\,\widehat s_i^{(p)}=\zeta_i^{(p)2}+O(\sigma^2),
+$$
+and has variance that decays at rate $\Theta(1/k)$,
+$$
+\mathrm{Var}\big(\widehat s_i^{(p)}\big)=\Theta\!\left(\frac{1}{k}\right).
+$$
+Propagating through the square root gives
+$$
+\mathrm{sd}\big(\widehat\zeta_i^{(p)}\big)=\Theta\!\left(\frac{1}{\zeta_i^{(p)}\sqrt{k}}\right).
+$$
+The constants depend on aspect ratio and noise level but the rates are robust. The division-free form automatically suppresses pairs with tiny $|Z_i(a,b)|$ through the weights, so no per-pair thresholds are required.

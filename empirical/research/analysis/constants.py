@@ -3,10 +3,8 @@ FIELD_NAMES = [
     # Examples (replace with your real keys):
     "weights_stable_rank",
     "gradients_stable_rank",
-    "mean_gradient_svd",
     "replicate_singular_values",
     "spectral_echo",
-    "alignment_indices",
     "empirical_phase_constant_tau2",
     "gradient_noise_sigma2",
     "aspect_ratio_beta",

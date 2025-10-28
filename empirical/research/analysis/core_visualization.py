@@ -13,9 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import imageio.v2 as imageio
-import pandas as pd
 import json
-from matplotlib.ticker import LogLocator, LogFormatterMathtext, NullLocator
 from empirical.research.training.zeropower import NEWTON_SCHULZ_QUINTIC_COEFFICIENTS
 from empirical.research.analysis.model_utilities import GPTLayerProperty
 
