@@ -1,0 +1,12 @@
+I want to improve Muon, the best LLM optimizer in 2025.  I have left detailed notes on deriving Muon and my proposed improvements in the theoretical/ folder.
+
+The nanoGPT speedrun is the canonical way to test new optimizers these days; we see how long it takes to train a GPT-2 level model with a given architecture and optimizer, measured in wall-clock time.  The original script lives at empirical/official_nanogpt_speedrun/train_gpt_medium.py.
+
+The speedrun is very accessible since all of the code is in one script.  However, its structure makes modular iteration somewhat annoying when doing research, so I have refactored its components to be more modular so that I can hotswap components more easily.  These components live at empirical/research/training.  When I want to train a new model, I run one of the scripts in empirical/research/training.
+
+My model-training scripts save model checkpoints so I can do math on their checkpoint parameterizations.  The code for doing so lives at empirical/research/analysis.  The main runnable script is empirical/research/analysis/run_gradient_analysis.py.  The GPT-medium architecture is 16 serial blocks, each with a softmax attention layer and a 2-layer MLP.  We want to analyze the propert of each $n\times m$ gradient matrix (where $n\times m$ is $1024\times 1024$ for all attention matrices and $1024\times 4096, 4096\times 1024$ for the MLP layers).  We implement a functional approach where we specify our desired computations on each gradient matrix as a tree of functions, then map that tree over each of the $16\times n_{\text{parameter matrices per layer}}$ matrices.  All of our visualizations are $2\times 3$ subplot grids (for the 6 kinds of layers) with 16 lines on each subplot representing the layer behavior in a specific block-depth.
+- the mapping machinery lives at empirical/research/analysis/property_pipeline.py
+- the nodes in the function tree are math operations that live in empirical/research/analysis/core_math.py
+- the visualization helper functions live in empirical/research/analysis/core_visualization.py
+
+We run both model-training and checkpoint analysis on an 8xH100 cluster.  You are an AI assistant running on my laptop.  So we do not have the ability to test locally.

@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+Unified model parameter processing utilities.
+
+Consolidates model parameter extraction, layer property management,
+and distributed communication functions from the original map.py.
+"""
+
+from pathlib import Path
+from typing import Tuple, Iterator, TypeAlias, Callable, Iterable, List
+import numpy as np
+import torch
+import torch.distributed as dist
+import time
+from torch.nn import Parameter, Module
+from empirical.research.analysis.constants import FIELD_NAMES
+
+# Type alias for layer properties
+GPTLayerProperty: TypeAlias = dict[tuple[str, int], Parameter | np.ndarray | torch.Tensor]
+
+
+def _split_attention_tensor(tensor: torch.Tensor, layer_num: int) -> Iterator[tuple[tuple[str, int], torch.Tensor]]:
+    """Split qkvo_w tensor into Q, K, V, O components."""
+    for i, component in enumerate(["Q", "K", "V", "O"]):
+        yield (f"Attention {component}", layer_num), tensor[i]
+
+
+def _extract_layer_info(name: str) -> tuple[str, int] | None:
+    """Extract param type and layer number from parameter name."""
+    # Handle compiled model names that have _orig_mod prefix
+    if name.startswith("_orig_mod."):
+        name = name[10:]  # Remove "_orig_mod." prefix
+    
+    if not name.startswith("blocks."):
+        return None
+    
+    parts = name.split('.')
+    layer_num = int(parts[1])
+    
+    param_type_map = {
+        "attn.qkvo_w": "Attention",  # Will be split later
+        "mlp.fc_w": "MLP Input", 
+        "mlp.proj_w": "MLP Output"
+    }
+    
+    for pattern, param_type in param_type_map.items():
+        if pattern in name:
+            return param_type, layer_num
+    
+    return None
+
+
+def process_model_parameters(model, only_hidden: bool, tensor_extractor, result_processor) -> GPTLayerProperty:
+    """Process model parameters using functional approach with generators."""
+    
+    def filtered_params():
+        """Generator of filtered parameters."""
+        for name, param in model.named_parameters():
+            if only_hidden and not ("blocks." in name and param.ndim >= 2 and "embed" not in name):
+                continue
+            tensor = tensor_extractor(name, param)
+            if tensor is not None:
+                yield name, param, tensor
+                
+    
+    def parameter_entries():
+        """Generator of (key, tensor) pairs."""
+        for name, param, tensor in filtered_params():
+            layer_info = _extract_layer_info(name)
+            if layer_info is None:
+                continue
+            
+            param_type, layer_num = layer_info
+            
+            # Handle attention tensor splitting
+            if param_type == "Attention" and tensor.ndim >= 3:
+                yield from _split_attention_tensor(tensor, layer_num)
+            else:
+                yield (param_type, layer_num), tensor
+    
+    return result_processor(parameter_entries())
+
+
+def get_weight_matrices(model, only_hidden: bool = True) -> GPTLayerProperty:
+    """Extract weight matrices from model."""
+    return process_model_parameters(
+        model, 
+        only_hidden,
+        tensor_extractor=lambda name, param: param.data,
+        result_processor=lambda entries: dict(entries)
+    )
+
+
+def combine_layer_properties(fn: Callable, *layer_properties: GPTLayerProperty) -> GPTLayerProperty:
+    """
+    Combine multiple layer properties using a function.
+    
+    Args:
+        fn: Function that takes (*tensors) and returns a tensor
+        *layer_properties: Variable number of layer property dicts
+        
+    Returns:
+        Combined layer properties
+    """
+    if not layer_properties:
+        return {}
+        
+    # Get common keys
+    common_keys = set(layer_properties[0].keys())
+    for props in layer_properties[1:]:
+        common_keys &= set(props.keys())
+    
+    result = {}
+    for key in common_keys:
+        tensors = [props[key] for props in layer_properties]
+        result[key] = fn(*tensors)
+    
+    return result
+
+
+# empirical/research/analysis/model_utilities.py
+
+from typing import Dict, Tuple, Any, Optional
+import torch.distributed as dist
+from empirical.research.training.training_core import distributed_data_generator, get_window_size_blocks
+import io, pickle
+
+def _merge_dicts(dicts):
+    merged = {}
+    for d in dicts:
+        if not d:
+            continue
+        # later ranks overwrite on duplicate keys (your sharding should prevent conflicts)
+        merged.update(d)
+    return merged
+
+def gather_layer_properties_to_rank_zero(local_props):
+    """
+    Only gather the fields we actually write, and always on CPU.
+    Avoids pulling huge microgradient blobs to rank 0.
+    """
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+
+    # 1) prune to just the fields the writer will emit
+    slim = _prune_to_fieldnames(local_props)
+
+    # 2) move tensors to CPU so c10d doesn't coalesce GPU buffers
+    slim_cpu = _to_cpu_tree(slim)
+
+    obj_list = [None] * world if rank == 0 else None
+    dist.gather_object(slim_cpu, obj_list, dst=0)
+
+    if rank == 0:
+        # Merge per-rank dicts; later ranks can overwrite identical keys if identical
+        merged = {}
+        for part in obj_list:
+            if part is None:
+                continue
+            for k, v in part.items():
+                # If values are dict-like (e.g., GPTLayerProperty dict), merge shallowly
+                if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                    merged[k].update(v)
+                else:
+                    merged[k] = v
+        return merged
+    else:
+        return None
+
+def gather_microgradients_across_ranks(per_replicate_grads: Dict[Tuple[str, int], torch.Tensor]) -> Dict[Tuple[str, int], torch.Tensor]:
+    """Gather per-layer microgradients across ranks and concatenate along batch dim.
+
+    - On single process, returns input unchanged.
+    - With distributed, gathers dicts to rank 0, concatenates along dim 0 for each key,
+      and broadcasts the merged dict back to all ranks.
+    """
+    if not dist.is_initialized():
+        return per_replicate_grads
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Gather objects to rank 0
+    obj_list = [None] * world_size if rank == 0 else None
+    dist.gather_object(per_replicate_grads, obj_list, dst=0)
+
+    if rank == 0:
+        # Merge and concatenate along batch dim
+        merged: Dict[Tuple[str, int], List[torch.Tensor]] = {}
+        for d in obj_list:
+            for k, t in d.items():
+                merged.setdefault(k, []).append(t)
+        concat: Dict[Tuple[str, int], torch.Tensor] = {}
+        for k, tensors in merged.items():
+            # Ensure tensors are on same device (move to CPU for broadcast)
+            tensors_cpu = [ti.detach().cpu() for ti in tensors]
+            concat[k] = torch.cat(tensors_cpu, dim=0)
+        payload = [concat]
+    else:
+        payload = [None]
+
+    # Broadcast merged dict to all ranks
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def get_accumulated_gradient_matrices(model, args, step: int, num_accumulation_steps: int,
+                                      assigned_params: set = None,
+                                      owner_map: Dict[Tuple[str, int], int] | None = None) -> GPTLayerProperty:
+    """
+    Compute accumulated gradient matrices for analysis.
+    
+    This function runs forward/backward passes to accumulate gradients
+    across multiple independent replicates for gradient analysis (DDP workers × accumulation steps).
+    
+    Args:
+        model: The model to compute gradients for
+        args: Hyperparameters for data loading
+        step: Current training step (for logging)
+        num_accumulation_steps: Number of accumulation steps to build replicates (A)
+        
+    Returns:
+        GPTLayerProperty containing per-replicate gradient tensors
+    """
+    # Get data generator
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+    
+    # Storage for per-replicate gradients (only for keys owned by this rank)
+    per_replicate_grads: Dict[Tuple[str, int], list[torch.Tensor]] = {}
+    
+    # Original behavior: eval mode outside; enable grads only for forward/backward block
+    model.eval()  # Set to eval mode for consistent analysis
+    with torch.no_grad():
+        for accum_idx in range(num_accumulation_steps):
+            try:
+                inputs, targets = next(data_generator)
+            except StopIteration:
+                # Re-initialize data generator if exhausted
+                data_generator = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+                inputs, targets = next(data_generator)
+            
+            # Zero gradients
+            model.zero_grad()
+            
+            # Forward pass with grads enabled in a tight scope
+            with torch.enable_grad():
+                model.train()  # Briefly switch to train for grad computation
+                window_size_blocks = get_window_size_blocks(step, args.num_iterations).to(inputs.device)
+                loss = model(inputs.to(torch.int32), targets, window_size_blocks)
+                loss.backward()
+                model.eval()  # Back to eval mode
+            # Log after each backward accumulation (A accumulations)
+            if rank == 0:
+                print(f"[rank 0] Backward complete for accumulation {accum_idx+1}/{num_accumulation_steps}")
+            
+            # For each parameter key in model order, gather this replicate's gradient to the owner
+            for name, param in model.named_parameters():
+                if param.grad is None or param.ndim < 2 or "embed" in name:
+                    continue
+                layer_info = _extract_layer_info(name)
+                if layer_info is None:
+                    continue
+                param_type, layer_num = layer_info
+
+                def handle_key(key: Tuple[str, int], grad_tensor: torch.Tensor):
+                    nonlocal per_replicate_grads
+                    if owner_map is None:
+                        # Default to assigned_params: owner is self if in assigned_params else skip
+                        owner = rank if (assigned_params is None or key in assigned_params) else -1
+                    else:
+                        owner = int(owner_map[key])
+
+                    g = grad_tensor.detach()
+                    if dist.is_initialized():
+                        if owner == rank:
+                            # Gather tensors from all ranks for this key
+                            gather_list = [torch.empty_like(g) for _ in range(world_size)]
+                            dist.gather(g, gather_list=gather_list, dst=rank)
+                            # Append all replicas for this accumulation
+                            if key not in per_replicate_grads:
+                                per_replicate_grads[key] = []
+                            # Move to CPU for storage to save GPU memory
+                            per_replicate_grads[key].extend([t.cpu() for t in gather_list])
+                        else:
+                            # Send to owner
+                            dist.gather(g, dst=owner)
+                    else:
+                        # Single-process fallback: just append local tensor
+                        if key not in per_replicate_grads:
+                            per_replicate_grads[key] = []
+                        per_replicate_grads[key].append(g.cpu())
+
+                # Attention split or single matrix
+                if param_type == "Attention" and param.grad.ndim >= 3:
+                    for i, component in enumerate(["Q", "K", "V", "O"]):
+                        key = (f"Attention {component}", layer_num)
+                        handle_key(key, param.grad[i])
+                else:
+                    key = (param_type, layer_num)
+                    handle_key(key, param.grad)
+
+            # Ensure all ranks have finished sharding for this accumulation
+            if dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                print(f"[rank 0] Sharding complete for accumulation {accum_idx+1}/{num_accumulation_steps}")
+    
+    # Stack gradients into batched tensors (owners only)
+    result: Dict[Tuple[str, int], torch.Tensor] = {}
+    for key, grad_list in per_replicate_grads.items():
+        if not grad_list:
+            continue
+        # Expect exactly (world_size * num_accumulation_steps) entries per key
+        result[key] = torch.stack(grad_list, dim=0)
+
+    # Final synchronization and log once all sharing is complete across all minibatches
+    if dist.is_initialized():
+        dist.barrier()
+    if rank == 0:
+        print(f"[rank 0] Completed distributed sharding of microgradients for all {num_accumulation_steps} accumulations")
+
+    # (debug logs removed)
+
+    return result
+
+def _to_cpu_tree(obj):
+    """Recursively clone tensors to CPU so gather_object doesn’t coalesce CUDA buffers."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu_tree(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        t = type(obj)
+        return t(_to_cpu_tree(v) for v in obj)
+    return obj
+
+def _prune_to_fieldnames(d):
+    """
+    Prune payload to only the fields we need at rank 0.
+
+    Supports two shapes:
+    1) Legacy: {field_name -> GPTLayerProperty/Dict[...]}, keep top-level keys in FIELD_NAMES
+    2) Current: GPTLayerProperty = {(param_type, layer) -> {prop_name -> value}}
+       Keep only a small set of prop_names needed for visualizations/aggregation.
+    """
+    if not isinstance(d, dict):
+        return d
+    # Detect GPTLayerProperty style: tuple keys mapping to per-layer prop dicts
+    if d and isinstance(next(iter(d.keys())), tuple):
+        allowed_props = {
+            'aligned_replicate_singular_values',
+            'spectral_echo',
+            'empirical_phase_constant_tau2',
+            'gradient_noise_sigma2',
+            'checkpoint_weights',  # only used for shape on CPU later
+        }
+        pruned = {}
+        for layer_key, props in d.items():
+            if isinstance(props, dict):
+                pruned[layer_key] = {k: v for k, v in props.items() if k in allowed_props}
+        return pruned
+    # Legacy top-level {field_name: ...}
+    return {k: v for k, v in d.items() if k in FIELD_NAMES}
