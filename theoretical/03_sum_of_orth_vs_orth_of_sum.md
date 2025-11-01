@@ -35,7 +35,7 @@ One of these is both theoretically and empirically better than the other.
 
 # Shampoo, the Preconditioner
 
-We have previously motivated Muon (and its equivalents like Shampoo and SOAP) as the unique steepest descent optimizer under the spectral norm.  For this analysis, we will need to take a different perspective on why these work: preconditioning.
+We have previously motivated Muon (and its equivalents like Shampoo and SOAP) as the unique steepest descent optimizer under the spectral norm, ignoring accumulation.  For this analysis, we will need to take a different perspective on why these work: preconditioning.
 
 Typically, gradients are not well-conditioned, so if we apply naive SGD, most of the updates at each minibatch are dominated by a single direction in parameter space.  This is a shame since each parameter matrix contains multitudes.
 

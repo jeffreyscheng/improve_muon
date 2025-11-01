@@ -1,11 +1,6 @@
 # How to hear the echo without the true gradient
 
-We previously showed two results:
-
-1. the empirical msign is biased and that replacing the empirical spectrum with the spectral echo is the best way to project onto msign of the true gradient using the empirical singular bases
-2. the spectral echo's definition invokes the true gradient, but under certain regularity conditions, its expectation can be estimated from the empirical singular value, the Frobenius norm of the noise, and a function $\kappa(s, \beta)$ for aspect ratio $\beta$.  The noise level can be estimated from between-worker variations in the DDP framework, and the function $\kappa$ approaches a limiting function that only depends on the aspect ratio $\beta$ for high-dimensional matrices.
-
-Therefore, the problem of unbiased steepest descent boils down to estimating $\kappa$.  This can be done with least squares if we had a dataset of empirical gradient SVDs and true gradient SVDs; however, we do not have access to the true gradient.  We can only vary the minibatch size to get empirical gradients with varying amount of minibatch noise.
+We previously showed that the empirical msign is biased and that replacing the empirical spectrum with the spectral echo is the best way to project onto msign of the true gradient using the empirical singular bases; however, calculating the spectral echo from its definition requires access to the true gradient, and our entire motivation comes from only having access to empirical gradients.
 
 We will now show how to achieve good spectral echo estimation without ever having access to true gradients.  We will exploit **independence across repeated, equally-sized replicas** (DDP workers × accumulation steps, i.e., disjoint data at the same batch size) to expose the noise structure and recover the echo via cross-replica *spectral reverb* measurements.
 
@@ -17,7 +12,7 @@ Fix a layer with gradient shape $m\times n$ and $r=\min(m,n)$. Let
 $$
 G=\sum_{i=1}^r s_i\,u_i v_i^\top,\qquad \|u_i\|=\|v_i\|=1,
 $$
-and let $\{\widehat G^{(a)}\}_{a=1}^k$ be $k$ **independent** empirical gradients (same batch size, disjoint data), with SVD
+and let $\{\widehat G^{(a)}\}_{a=1}^k$ be $k$ **independent** empirical gradients (same batch size, disjoint data) evaluated on the same model checkpoint, with SVDs
 $$
 \widehat G^{(a)}=\widehat U^{(a)} \widehat S^{(a)} \widehat V^{(a)\top}.
 $$

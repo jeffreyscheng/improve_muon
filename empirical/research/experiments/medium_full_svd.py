@@ -1,7 +1,7 @@
 # medium_full_svd.py - Medium experiment with full SVD polar backend and serialization
 from empirical.research.training.training_core import (
     Hyperparameters, create_gpt_with_optimizer, create_train_loader,
-    should_validate, validate_and_log, train_step, optimize_step, _global_print0
+    should_validate, validate_and_log, train_step, optimize_step, _global_print0, run_loggers
 )
 from empirical.research.training.zeropower import get_zeropower_function, make_update_function
 from empirical.research.training.muon import Muon
@@ -12,7 +12,7 @@ from functools import partial
 from datetime import date
 import torch
 
-args = Hyperparameters(); args.max_minibatches = 1000
+args = Hyperparameters()
 
 def build_hidden_optimizer_muon(params, *, model, param_to_name, device, rank, world_size, lr, weight_decay, momentum):
     update_fn = make_update_function(get_zeropower_function("svd_polar", {}))
@@ -21,7 +21,7 @@ def build_hidden_optimizer_muon(params, *, model, param_to_name, device, rank, w
 model, optimizers = create_gpt_with_optimizer(args=args, build_hidden_optimizer_fn=build_hidden_optimizer_muon)
 train_loader = create_train_loader(args)
 
-checkpoint_dir = Path("logs")
+checkpoint_dir = Path("research_logs/checkpoints")
 run_name = f"medium_full_svd_{date.today().strftime('%Y%m%d')}"
 loggers = [partial(serialize_model_checkpoint, run_name=run_name, checkpoint_dir=checkpoint_dir)]
 

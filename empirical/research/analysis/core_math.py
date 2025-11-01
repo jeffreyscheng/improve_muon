@@ -390,55 +390,44 @@ def get_spectral_echoes_from_empirical_gradients(empirical_gradients: torch.Tens
 
 def get_aligned_svds(empirical_gradients: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Align SVDs across replicates using a reference-anchored assignment (Hungarian if available, else greedy)
-    and per-replica sign correction. Uses safe_svd for CUDA offload when available.
+    Greedy-only alignment of SVDs across replicates to a fixed reference (replica 0).
+    No Hungarian, no SciPy. Uses safe_svd.
 
     Args:
-        empirical_gradients: (R, N, M)
+        empirical_gradients: (R, N, M) bf16/fp32
     Returns:
-        aligned_U: (R, N, D), aligned_S_vals: (R, D), aligned_V: (R, M, D) with D = min(N, M)
+        aligned_U: (R, N, D)
+        aligned_S_vals: (R, D)
+        aligned_V: (R, M, D)
     """
-    # Promote dtype for numerical stability
-    if empirical_gradients.dtype == torch.bfloat16:
-        empirical_gradients = empirical_gradients.float()
-
-    U_all, S_vals, Vh_all = safe_svd(empirical_gradients)   # U:(R,N,D), S:(R,D), Vh:(R,D,M)
-    V_all = Vh_all.transpose(-2, -1)                        # (R,M,D)
+    # Promote dtype; compute batched SVDs
+    X = empirical_gradients.float() if empirical_gradients.dtype == torch.bfloat16 else empirical_gradients
+    U_all, S_vals, Vh_all = safe_svd(X)              # U:(R,N,D), S:(R,D), Vh:(R,D,M)
+    V_all = Vh_all.transpose(-2, -1)                 # (R,M,D)
     R, N, D = U_all.shape
 
     U_ref, V_ref = U_all[0], V_all[0]
 
-    def _hungarian_or_greedy(similarity: torch.Tensor) -> torch.Tensor:
-        # Try Hungarian; fallback to greedy
-        try:
-            from scipy.optimize import linear_sum_assignment as _lsa  # type: ignore
-        except Exception:
-            _lsa = None
-        K = similarity.shape[0]
-        if _lsa is not None:
-            M = similarity.detach().cpu().numpy()
-            Mmax = float(M.max()) if M.size else 0.0
-            row_ind, col_ind = _lsa(Mmax - M)
-            inv = np.empty(K, dtype=np.int64)
-            inv[col_ind] = row_ind
-            return torch.from_numpy(inv).to(similarity.device, dtype=torch.long)
-        # Greedy fallback with tiny deterministic jitter
-        eps = 1e-12 if similarity.dtype in (torch.float64, torch.float32) else 1e-6
-        jitter = eps * torch.linspace(0, 1, steps=similarity.numel(), device=similarity.device, dtype=similarity.dtype).reshape_as(similarity)
-        scores = similarity + jitter
-        col_priority = torch.argsort(scores.max(dim=0).values, descending=True)
-        used_rows = torch.zeros(K, dtype=torch.bool, device=scores.device)
-        row_for_col = torch.full((K,), -1, dtype=torch.long, device=scores.device)
-        for j in col_priority:
-            r = torch.argmax(scores[:, j])
-            if not used_rows[r]:
-                row_for_col[j] = r
-                used_rows[r] = True
-        free_rows = torch.nonzero(~used_rows, as_tuple=False).flatten()
+    def _greedy_perm(sim: torch.Tensor) -> torch.Tensor:
+        """sim: (D,D) >=0; returns perm idx p s.t. columns map j->row p[j]."""
+        K = sim.shape[0]
+        # tiny deterministic jitter to avoid exact ties
+        eps = 1e-12 if sim.dtype in (torch.float32, torch.float64) else 1e-6
+        jitter = eps * torch.linspace(0, 1, steps=sim.numel(), device=sim.device, dtype=sim.dtype).reshape_as(sim)
+        scores = sim + jitter
+        col_order = torch.argsort(scores.max(dim=0).values, descending=True)
+        used = torch.zeros(K, dtype=torch.bool, device=sim.device)
+        row_for_col = torch.full((K,), -1, dtype=torch.long, device=sim.device)
+        for j in col_order:
+            i = torch.argmax(scores[:, j])
+            if not used[i]:
+                row_for_col[j] = i
+                used[i] = True
+        free = torch.nonzero(~used, as_tuple=False).flatten()
+        kf = 0
         for j in range(K):
             if row_for_col[j] < 0:
-                row_for_col[j] = free_rows[0]
-                free_rows = free_rows[1:]
+                row_for_col[j] = free[kf]; kf += 1
         return row_for_col
 
     aligned_U = torch.empty_like(U_all)
@@ -447,15 +436,17 @@ def get_aligned_svds(empirical_gradients: torch.Tensor) -> tuple[torch.Tensor, t
     aligned_U[0], aligned_V[0], aligned_S_vals[0] = U_ref, V_ref, S_vals[0]
 
     for i in range(1, R):
-        sim_U = (U_all[i].transpose(0, 1) @ U_ref).abs()  # (D,D)
-        sim_V = (V_all[i].transpose(0, 1) @ V_ref).abs()  # (D,D)
-        similarity = sim_U * sim_V
-        perm_idx = _hungarian_or_greedy(similarity)
+        # similarity per column = |<u_i,u_ref>|*|<v_i,v_ref>|
+        sim_U = (U_all[i].transpose(0, 1) @ U_ref).abs()    # (D,D)
+        sim_V = (V_all[i].transpose(0, 1) @ V_ref).abs()    # (D,D)
+        sim = sim_U * sim_V
+        perm = _greedy_perm(sim)
 
-        U_perm = U_all[i][:, perm_idx]
-        V_perm = V_all[i][:, perm_idx]
-        S_perm = S_vals[i][perm_idx]
+        U_perm = U_all[i][:, perm]
+        V_perm = V_all[i][:, perm]
+        S_perm = S_vals[i][perm]
 
+        # joint sign fix
         u_overlap = (U_perm * U_ref).sum(dim=0)
         v_overlap = (V_perm * V_ref).sum(dim=0)
         sgn = torch.sign(u_overlap * v_overlap)
